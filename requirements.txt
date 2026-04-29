@@ -1,0 +1,8 @@
+# Non-Isaac dependencies — install after Isaac Sim is set up
+# See README.md for the Isaac Sim install command.
+
+torch>=2.1.0
+numpy>=1.26.0
+pyyaml>=6.0
+tqdm>=4.66.0
+matplotlib>=3.8.0
