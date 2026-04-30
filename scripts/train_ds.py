@@ -74,7 +74,7 @@ def main():
     # ── Normalisation per joint ───────────────────────────────────────────────
     state_mean = states.mean(0)
     state_std  = states.std(0) + 1e-6
-    vel_scale  = max(np.abs(velocities).max(), 1e-3)
+    vel_scale  = np.maximum(np.abs(velocities).max(axis=0), 1e-3)  # shape (7,)
 
     states_n     = (states - state_mean) / state_std
     velocities_n = velocities / vel_scale

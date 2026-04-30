@@ -18,6 +18,23 @@ import numpy as np
 
 PRIMITIVE_ORDER = ["reach", "grasp", "lift", "transport", "place"]
 
+# Gripper pointing straight down, no Z rotation (w,x,y,z Isaac Sim convention)
+DEFAULT_DOWN_QUAT = np.array([0.0, 1.0, 0.0, 0.0])
+
+
+def grasp_quat_from_block(block_quat):
+    """Gripper orientation that matches the block's yaw and points straight down.
+
+    Extracts the block's Z-rotation, snaps to the nearest 90° (square block
+    symmetry), then composes with DEFAULT_DOWN_QUAT.  Result is always pointing
+    straight down — only the in-plane finger alignment changes.
+    """
+    w, x, y, z = block_quat
+    yaw = np.arctan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+    yaw_snap = np.round(yaw / (np.pi / 2.0)) * (np.pi / 2.0)
+    # q_yaw ⊗ q_down with q_down = (0,1,0,0) reduces to (0, cos(θ/2), sin(θ/2), 0)
+    return np.array([0.0, np.cos(yaw_snap / 2.0), np.sin(yaw_snap / 2.0), 0.0])
+
 
 def primitive_target(primitive, block_pos, goal_xy, goal_z,
                      hover_h, lift_h, grasp_h):

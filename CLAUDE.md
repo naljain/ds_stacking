@@ -122,3 +122,34 @@ Ablations available via flags: `--no_modulation` (FSM-free, naive parallel), `--
 - Prefer adding a new ablation flag over removing existing behaviour. The whole point of having both `--no_modulation` and `--use_safe` is that the writeup needs them.
 - The user is a robotics student, not an Isaac Sim expert. When something fails because of an Isaac Sim version quirk, explain the quirk briefly, don't just patch silently.
 - When debugging Isaac Sim runtime issues, the fastest signal is usually the warning *before* the error in the log — the actual exception is often a downstream symptom.
+
+
+## The project proposal
+
+Reactive Dual-Arm Cube Stacking in Isaac Gym with Learned DS Motion Primitives
+Nalini Jain, Shivank Gupta, Thomas Stephen Felix
+MEAM 6230 Final Project Proposal
+
+Motivation:
+Fast manipulation tasks like cube stacking demand more than nominal trajectory replay, they require online adaptation to correct pose error, timing mismatch, and inter-arm interference. This project explores whether DS-based motion primitives can make dual-arm manipulation both fast and robust under perturbations.
+
+Goal:
+Our goal is to build a dual-arm robotic system in simulation that can stack cubes quickly while remaining stable, reactive, and collision-aware. We specifically want to test learned DS-based pick-and-place primitives from teleoperated demonstrations and deploy them under a shared coordination layer that handles task sequencing, synchronization, and inter-arm collision avoidance.
+
+Approach:
+We will first create a lightweight teleoperation interface in Isaac Gym to collect demonstrations of single-arm pick-and-place motions such as reaching, grasping, lifting, transporting, and placing. From these demonstrations, we will fit DS-based motion primitives for each arm, then deploy them in a dual-arm setup where a shared task-level coordination layer handles synchronization, task sequencing, and inter-arm collision avoidance. This allows us to learn local manipulation skills from demonstration while preserving the reactive DS structure needed for online adaptation.
+
+Evaluation Plan:
+We will evaluate the method entirely in simulation in Isaac Gym. Metrics will include stack completion rate, average time per cube, grasp failure rate, collision count, and recovery success after perturbations such as object displacement, timing mismatch, or temporary blocking of one arm. 
+
+
+
+Anticipated Challenges:
+One challenge will be collecting demonstrations that are simple enough to learn from but still representative of successful pick-and-place behavior. Another difficulty will be coordinating two arms in a shared workspace without sacrificing speed or safety, especially during simultaneous motions near the stack. A final challenge will be ensuring that the learned primitives remain stable and precise enough for repeated stacking rather than just producing approximate reaching behavior.
+
+Implementation Details: 
+The project will be implemented in Python using Isaac Gym for simulation. DS fitting will be done by learning a neural parameterization of the motion vector field from demonstrations. The teleoperation interface, task sequencer, and coordination layer will be developed from scratch. Development will be divided into four stages: (1) teleoperated demonstration collection, (2) DS primitive fitting and single-arm, (3) dual-arm coordinated stacking, (4) perturbation recovery and collision modulation.
+
+
+
+

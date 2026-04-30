@@ -6,15 +6,18 @@ Controls:
   A/D       — move EE in -X / +X
   Q/E       — move EE in +Z / -Z
   F         — toggle gripper
-  R         — start/stop recording the current demo
-  P         — push current demo into the buffer (then start a new one)
-  Backspace — discard current demo
+  R         — start recording a primitive segment
+  P         — commit segment: labels q_goal = current joint config (retroactive,
+              same as collect_ik.py) then starts a fresh segment
+  Backspace — discard current segment
   ESC       — save all demos to disk and quit
 
-Recorded format matches collect_ik.py so downstream training is identical.
+Each P-commit produces one primitive segment with q, q_dot, q_goal in joint
+space — the same format train_ds.py expects. Label the primitive name with
+--primitive when launching; run once per primitive type.
 
 Usage:
-  python scripts/teleop.py --arm left
+  python scripts/teleop.py --arm left --primitive reach
 """
 
 import os
@@ -32,9 +35,11 @@ os.environ["CARB_LOG_LEVEL"] = "error"
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--arm",    type=str, default="left", choices=["left", "right"])
-    parser.add_argument("--config", type=str, default="configs/default.yaml")
-    parser.add_argument("--step",   type=float, default=0.005, help="metres per key tick")
+    parser.add_argument("--arm",       type=str, default="left", choices=["left", "right"])
+    parser.add_argument("--primitive", type=str, default="reach",
+                        choices=["reach", "grasp", "lift", "transport", "place"])
+    parser.add_argument("--config",    type=str, default="configs/default.yaml")
+    parser.add_argument("--step",      type=float, default=0.005, help="metres per key tick")
     args = parser.parse_args()
 
     from isaacsim import SimulationApp
@@ -55,15 +60,17 @@ def main():
     out_dir = Path(cfg["paths"]["demos"])
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"{args.arm}_teleop_demos.pkl"
+    physics_dt = cfg["sim"]["physics_dt"]
 
     # Mutable state — needs nonlocal-style sharing with key callback
     state = {
         "gripper_open": True,
         "recording":    False,
-        "current_demo": [],
+        "current_seg":  [],   # steps for the current primitive segment
         "all_demos":    [],
         "keys_held":    set(),
         "should_quit":  False,
+        "prev_q":       None,
     }
 
     KEY_DELTAS = {
@@ -87,27 +94,36 @@ def main():
             elif event.input == carb.input.KeyboardInput.R:
                 state["recording"] = not state["recording"]
                 if state["recording"]:
-                    state["current_demo"] = []
+                    state["current_seg"] = []
+                    state["prev_q"]      = None
                     print("[TELEOP] Recording started")
                 else:
-                    print(f"[TELEOP] Recording paused — {len(state['current_demo'])} steps so far")
+                    print(f"[TELEOP] Recording paused — {len(state['current_seg'])} steps so far")
 
             elif event.input == carb.input.KeyboardInput.P:
-                if state["current_demo"]:
+                if state["current_seg"]:
+                    # Retroactive q_goal: where the arm settled at end of segment
+                    q_goal = franka.get_joint_positions()[:7].copy()
+                    for step in state["current_seg"]:
+                        step["q_goal"] = q_goal
                     state["all_demos"].append({
-                        "arm": args.arm,
-                        "demo_idx": len(state["all_demos"]),
-                        "trajectory": state["current_demo"],
-                        "success": True,
+                        "arm":        args.arm,
+                        "demo_idx":   len(state["all_demos"]),
+                        "trajectory": state["current_seg"],
+                        "success":    True,
                     })
-                    print(f"[TELEOP] Demo committed — total: {len(state['all_demos'])}")
-                state["current_demo"] = []
-                state["recording"] = False
+                    print(f"[TELEOP] Segment committed ({args.primitive}, "
+                          f"{len(state['current_seg'])} steps) — "
+                          f"total segments: {len(state['all_demos'])}")
+                state["current_seg"] = []
+                state["recording"]   = False
+                state["prev_q"]      = None
 
             elif event.input == carb.input.KeyboardInput.BACKSPACE:
-                state["current_demo"] = []
-                state["recording"]    = False
-                print("[TELEOP] Current demo discarded")
+                state["current_seg"] = []
+                state["recording"]   = False
+                state["prev_q"]      = None
+                print("[TELEOP] Current segment discarded")
 
             elif event.input == carb.input.KeyboardInput.ESCAPE:
                 state["should_quit"] = True
@@ -120,36 +136,34 @@ def main():
     appwindow.get_keyboard().subscribe_to_keyboard_events(on_key)
 
     target_pos = franka.end_effector.get_world_pose()[0].copy()
-    prev_ee_pos = target_pos.copy()
 
-    print("\n[TELEOP] Controls: WASD + QE move | F gripper | R record | P commit | BkSp drop | ESC quit\n")
+    print(f"\n[TELEOP] arm={args.arm}  primitive={args.primitive}")
+    print("[TELEOP] WASD+QE move | F gripper | R record | P commit segment | BkSp drop | ESC quit\n")
 
     while simulation_app.is_running() and not state["should_quit"]:
-        # Apply held-key deltas to target
         for key, direction in KEY_DELTAS.items():
             if key in state["keys_held"]:
                 target_pos = target_pos + direction * args.step
 
-        ee_pos, ee_rot = franka.end_effector.get_world_pose()
-
-        if state["recording"]:
-            ee_vel = (ee_pos - prev_ee_pos) * (1.0 / cfg["sim"]["physics_dt"])
-            state["current_demo"].append({
-                "ee_pos":    ee_pos.copy(),
-                "ee_vel":    ee_vel.copy(),
-                "ee_rot":    ee_rot.copy(),
-                "joints":    franka.get_joint_positions().copy(),
-                "block_pos": np.zeros(3),    # teleop sequences don't have a single "active block" — caller can post-label
-                "goal_pos":  target_pos.copy(),
-                "primitive": "teleop",
-                "block":     "unknown",
-                "arm":       args.arm,
-                "gripper":   0.04 if state["gripper_open"] else 0.0,
-            })
-        prev_ee_pos = ee_pos.copy()
-
         ik.step_to(target_pos)
         env.step(render=True)
+
+        if state["recording"]:
+            q = franka.get_joint_positions()[:7].copy()
+            if state["prev_q"] is None:
+                state["prev_q"] = q.copy()
+            q_dot = (q - state["prev_q"]) / physics_dt
+            state["current_seg"].append({
+                "q":         q,
+                "q_dot":     q_dot,
+                "ee_pos":    franka.end_effector.get_world_pose()[0].copy(),
+                "primitive": args.primitive,
+                "block":     "unknown",
+                "arm":       args.arm,
+                "target":    target_pos.copy(),
+                # q_goal filled in retroactively when P is pressed
+            })
+            state["prev_q"] = q
 
     with open(out_path, "wb") as f:
         pickle.dump(state["all_demos"], f)

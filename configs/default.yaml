@@ -9,7 +9,7 @@ table:
   centre: [0.0, 0.45, 0.0]
 
 block:
-  size: 0.045
+  size: 0.05
   mass: 0.05
 
 arms:
@@ -19,23 +19,23 @@ arms:
 
 # ── Initial block layout ───────────────────────────────────────────────────────
 left_blocks:
-  - {name: block_red,    pos: [-0.40,  0.30, 0.7635], color: [1.0, 0.1, 0.1]}
-  - {name: block_orange, pos: [-0.40,  0.50, 0.7635], color: [1.0, 0.5, 0.0]}
-  - {name: block_pink,   pos: [-0.25,  0.40, 0.7635], color: [1.0, 0.4, 0.7]}
+  - {name: block_red,    pos: [-0.40,  0.30, 0.765], color: [1.0, 0.1, 0.1]}
+  - {name: block_orange, pos: [-0.40,  0.50, 0.765], color: [1.0, 0.5, 0.0]}
+  - {name: block_pink,   pos: [-0.25,  0.40, 0.765], color: [1.0, 0.4, 0.7]}
 
 right_blocks:
-  - {name: block_blue,   pos: [0.40,  0.30, 0.7635], color: [0.1, 0.3, 1.0]}
-  - {name: block_green,  pos: [0.40,  0.50, 0.7635], color: [0.1, 0.8, 0.1]}
-  - {name: block_yellow, pos: [0.25,  0.40, 0.7635], color: [1.0, 0.85, 0.0]}
+  - {name: block_blue,   pos: [0.40,  0.30, 0.765], color: [0.1, 0.3, 1.0]}
+  - {name: block_green,  pos: [0.40,  0.50, 0.765], color: [0.1, 0.8, 0.1]}
+  - {name: block_yellow, pos: [0.25,  0.40, 0.765], color: [1.0, 0.85, 0.0]}
 
 goals:
-  left:  [-0.30, 0.65]
-  right: [ 0.30, 0.65]
+  left:  [0.0, 0.65]   # single shared stack — both arms transport to centre
+  right: [0.0, 0.65]
 
 # ── Motion primitive heights ──────────────────────────────────────────────────
 heights:
   hover:  0.89    # table_height + 0.15 — pre-grasp hover
-  grasp:  0.75    # table_height + 0.01 — at block level
+  grasp:  0.77    # table_height + 0.03 — fingertips at mid-block
   lift:   0.99    # table_height + 0.25 — transport altitude
 
 # ── Simulation ────────────────────────────────────────────────────────────────
@@ -62,6 +62,7 @@ training:
   batch_size:       256
   epochs:           500
   device:           cuda
+  max_joint_vel:    1.5      # rad/s clamp applied at deployment (per joint)
 
 # ── Coordination ──────────────────────────────────────────────────────────────
 coordination:

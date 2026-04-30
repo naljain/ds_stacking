@@ -38,7 +38,7 @@ def load_ds_set(ckpt_dir, ckpt_arm, device):
     primitives = ["reach", "grasp", "lift", "transport", "place"]
     out = {}
     for p in primitives:
-        ckpt = torch.load(ckpt_dir / f"{ckpt_arm}_{p}.pt", map_location=device)
+        ckpt = torch.load(ckpt_dir / f"{ckpt_arm}_{p}.pt", map_location=device, weights_only=False)
         cfg = ckpt["config"]
         model = StableNeuralDS(
             n_joints    = N_JOINTS,
@@ -110,7 +110,8 @@ def main():
         if cart is None:
             return None
         q_seed = franka[arm].get_joint_positions()[:7].copy()
-        q_goal, _ = ik_kin[arm].solve(cart, q_seed=q_seed)
+        ee_quat = seq.ee_orientation(arm)
+        q_goal, _ = ik_kin[arm].solve(cart, target_quat=ee_quat, q_seed=q_seed)
         seq.tasks[arm].q_goal = q_goal
         return q_goal
 
@@ -118,6 +119,9 @@ def main():
         update_q_goal(arm)
 
     last_prim = {arm: seq.tasks[arm].current_primitive for arm in ("left", "right")}
+    prim_steps = {"left": 0, "right": 0}
+    prim_timeout = {p: s * 4
+                    for p, s in cfg["sim"]["steps_per_primitive"].items()}
 
     print(f"[DEPLOY] Dual-arm joint-space DS — safe={args.use_safe}, "
           f"modulation={'OFF' if args.no_modulation else 'ON'}")
@@ -140,6 +144,9 @@ def main():
             if task.current_primitive != last_prim[arm]:
                 update_q_goal(arm)
                 last_prim[arm] = task.current_primitive
+                prim_steps[arm] = 0
+
+            prim_steps[arm] += 1
 
             q = franka[arm].get_joint_positions()[:7].copy()
             ds = ds_set[task.current_primitive]
@@ -153,6 +160,8 @@ def main():
                 with torch.no_grad():
                     qd_n = ds["model"](x_t)
             q_dots[arm] = qd_n.cpu().numpy().squeeze(0) * ds["vel_scale"]
+            q_dots[arm] = np.clip(q_dots[arm], -cfg["training"]["max_joint_vel"],
+                                               cfg["training"]["max_joint_vel"])
 
         # Apply modulation between the two arms
         if not args.no_modulation:
@@ -185,7 +194,13 @@ def main():
             if task.is_done():
                 continue
             q = franka[arm].get_joint_positions()[:7]
-            if np.linalg.norm(q - task.q_goal) < args.done_tol:
+            timed_out = prim_steps[arm] >= prim_timeout[task.current_primitive]
+            converged = np.linalg.norm(q - task.q_goal) < args.done_tol
+            if converged or timed_out:
+                if timed_out and not converged:
+                    print(f"[WARN] {arm}/{task.current_primitive} timed out "
+                          f"after {prim_steps[arm]} steps "
+                          f"(||q-q*||={np.linalg.norm(q - task.q_goal):.3f})")
                 grip = gripper_action_for_primitive(task.current_primitive)
                 if grip == "close":
                     franka[arm].gripper.apply_action(
@@ -200,6 +215,7 @@ def main():
                     for _ in range(cfg["sim"]["gripper_steps"]):
                         env.step(render=not args.headless)
                 seq.primitive_complete(arm)
+                prim_steps[arm] = 0
 
         if all(seq.tasks[a].is_done() for a in ("left", "right")):
             print("[DEPLOY] Both arms finished stacking.")

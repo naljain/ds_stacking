@@ -164,6 +164,10 @@ class DualArmEnv:
     def get_block_positions(self):
         return {name: obj.get_world_pose()[0] for name, obj in self.blocks.items()}
 
+    def get_block_poses(self):
+        """Returns {name: (position, orientation_wxyz)} for all blocks."""
+        return {name: obj.get_world_pose() for name, obj in self.blocks.items()}
+
     def get_ee_pose(self, arm):
         return self.frankas[arm].end_effector.get_world_pose()
 

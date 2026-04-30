@@ -60,6 +60,6 @@ class IKController:
         call it each step with the current ee pose so a trajectory can be logged."""
         for _ in range(steps):
             self.step_to(target_pos, target_quat)
+            world.step(render=render)
             if record_callback is not None:
                 record_callback()
-            world.step(render=render)

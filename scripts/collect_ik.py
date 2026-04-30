@@ -7,7 +7,8 @@ For each demo, scripts the arm through the full pick-and-stack sequence on its
     q       (7,)   joint positions  (excludes finger joints)
     q_dot   (7,)   joint velocities (finite-diff)
     q_goal  (7,)   target joint configuration for the active primitive
-                   (computed once per primitive via Lula IK)
+                   (the joint config where RMPflow actually settled — sampled
+                    after move_to completes so labels are consistent with q_dot)
 
 Also recorded for bookkeeping:
     primitive   str   one of {reach, grasp, lift, transport, place}
@@ -53,15 +54,14 @@ def main():
 
     from src.env import DualArmEnv
     from src.ik_controller import IKController
-    from src.franka_ik import FrankaIK
-    from src.primitives import primitive_target, PRIMITIVE_ORDER
+    from src.primitives import (primitive_target, PRIMITIVE_ORDER,
+                                grasp_quat_from_block)
 
     env = DualArmEnv(config_path=args.config, arms=(args.arm,))
     cfg = env.cfg
     franka = env.frankas[args.arm]
 
-    ik_motion = IKController(franka)             # RMPflow for smooth motion
-    ik_kin    = FrankaIK(franka)                 # Lula for q* lookup
+    ik_motion = IKController(franka)
 
     block_names = [b["name"] for b in cfg[f"{args.arm}_blocks"]]
     goal_xy     = tuple(cfg["goals"][args.arm])
@@ -94,10 +94,14 @@ def main():
 
         goal_z = base_z
         for block_idx, block_name in enumerate(block_names):
-            block_pos = env.get_block_positions()[block_name].copy()
+            block_pos, block_quat = env.get_block_poses()[block_name]
+            block_pos = block_pos.copy()
             xy_noise  = rng.uniform(-args.noise, args.noise, size=2)
             noisy_pos = block_pos.copy()
             noisy_pos[:2] += xy_noise
+
+            # Orientation aligned to the block's yaw, used for reach + grasp.
+            aligned_quat = grasp_quat_from_block(block_quat)
 
             for primitive in PRIMITIVE_ORDER:
                 # Cartesian target for RMPflow
@@ -111,37 +115,45 @@ def main():
                     grasp_h=grasp_h,
                 )
 
-                # Joint-space target — Lula IK once per primitive
-                q_seed = franka.get_joint_positions()[:7].copy()
-                q_goal, ok = ik_kin.solve(target_cart, q_seed=q_seed)
-                if not ok:
-                    print(f"    [WARN] IK failed for {primitive} block={block_name}, "
-                          f"using seed as q_goal")
+                # Use block-aligned orientation when approaching; straight down
+                # for lift / transport / place (block orientation no longer matters).
+                target_quat = aligned_quat if primitive in ("reach", "grasp") else None
 
-                # Record callback: capture (q, q_dot, q_goal) every tick
+                # Buffer this primitive's steps; q_goal is filled in retroactively
+                # below once we know where RMPflow actually settled.
+                prim_buf = []
+
                 def record():
                     nonlocal prev_q
                     q = franka.get_joint_positions()[:7].copy()
                     q_dot = (q - prev_q) / physics_dt
-                    demo_traj.append({
-                        "q":          q,
-                        "q_dot":      q_dot,
-                        "q_goal":     q_goal.copy(),
-                        "ee_pos":     franka.end_effector.get_world_pose()[0].copy(),
-                        "primitive":  primitive,
-                        "block":      block_name,
-                        "arm":        args.arm,
-                        "target":     target_cart.copy(),
+                    prim_buf.append({
+                        "q":         q,
+                        "q_dot":     q_dot,
+                        "ee_pos":    franka.end_effector.get_world_pose()[0].copy(),
+                        "primitive": primitive,
+                        "block":     block_name,
+                        "arm":       args.arm,
+                        "target":    target_cart.copy(),
                     })
                     prev_q = q
 
                 ik_motion.move_to(
                     world=env.world,
                     target_pos=target_cart,
+                    target_quat=target_quat,
                     steps=steps[primitive],
                     record_callback=record,
                     render=not args.headless,
                 )
+
+                # Label q_goal with where the arm actually settled — this is
+                # the joint config that q_dot was pointing toward throughout
+                # the primitive, so the DS training target is self-consistent.
+                q_goal = franka.get_joint_positions()[:7].copy()
+                for step in prim_buf:
+                    step["q_goal"] = q_goal
+                demo_traj.extend(prim_buf)
 
                 if primitive == "grasp":
                     ik_motion.set_gripper(open=False)

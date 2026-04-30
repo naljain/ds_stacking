@@ -18,7 +18,9 @@ import numpy as np
 
 from .primitives import (
     PRIMITIVE_ORDER,
+    DEFAULT_DOWN_QUAT,
     primitive_target,
+    grasp_quat_from_block,
     gripper_action_for_primitive,
 )
 
@@ -68,7 +70,7 @@ class TaskSequencer:
 
         block_h = cfg["block"]["size"]
         base_z  = cfg["table"]["height"] + block_h / 2
-        self.goal_z = {arm: base_z for arm in env.arms_active}
+        self.goal_z = base_z   # shared across both arms — single stack
         self.block_h = block_h + 0.002
 
     def cartesian_target(self, arm):
@@ -81,16 +83,28 @@ class TaskSequencer:
             primitive=task.current_primitive,
             block_pos=block_pos,
             goal_xy=task.goal_xy,
-            goal_z=self.goal_z[arm],
+            goal_z=self.goal_z,
             hover_h=self.cfg["heights"]["hover"],
             lift_h =self.cfg["heights"]["lift"],
             grasp_h=self.cfg["heights"]["grasp"],
         )
 
+    def ee_orientation(self, arm):
+        """EE quaternion (w,x,y,z) for the current primitive.
+
+        Reach and grasp align to the block's yaw so fingers don't hit rotated
+        faces.  All other primitives use the default straight-down orientation.
+        """
+        task = self.tasks[arm]
+        if not task.is_done() and task.current_primitive in ("reach", "grasp"):
+            _, block_quat = self.env.get_block_poses()[task.current_block]
+            return grasp_quat_from_block(block_quat)
+        return DEFAULT_DOWN_QUAT
+
     def primitive_complete(self, arm):
         task = self.tasks[arm]
         if task.current_primitive == "place":
-            self.goal_z[arm] += self.block_h
+            self.goal_z += self.block_h
         task.advance_primitive()
 
     def gripper_action(self, arm):

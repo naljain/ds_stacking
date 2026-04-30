@@ -47,7 +47,7 @@ CONDITIONS = ["nominal", "block_displacement", "ee_disturbance",
 def run_one_trial(env, ds_set, seq, ik_kin, mod, franka, cfg,
                   condition, rng, perturbations,
                   use_modulation=True, use_safe=False,
-                  max_steps=8000, render=True):
+                  done_tol=0.05, max_steps=8000, render=True):
     """Run one full trial. Returns metrics dict."""
     from omni.isaac.core.utils.types import ArticulationAction
     from src.modulation import jacobian_finite_difference
@@ -82,13 +82,19 @@ def run_one_trial(env, ds_set, seq, ik_kin, mod, franka, cfg,
                         [b["name"] for b in cfg["right_blocks"]]
         perturb_block = rng.choice(all_blocks)
 
+    prim_timeout = {p: s * 4
+                    for p, s in cfg["sim"]["steps_per_primitive"].items()}
+    prim_steps   = {"left": 0, "right": 0}
+    max_joint_vel = cfg["training"]["max_joint_vel"]
+
     # Init q_goals
     def update_q_goal(arm):
         cart = seq.cartesian_target(arm)
         if cart is None:
             return
-        q_seed = franka[arm].get_joint_positions()[:7].copy()
-        q_goal, _ = ik_kin[arm].solve(cart, q_seed=q_seed)
+        q_seed  = franka[arm].get_joint_positions()[:7].copy()
+        ee_quat = seq.ee_orientation(arm)
+        q_goal, _ = ik_kin[arm].solve(cart, target_quat=ee_quat, q_seed=q_seed)
         seq.tasks[arm].q_goal = q_goal
 
     for arm in ("left", "right"):
@@ -125,7 +131,9 @@ def run_one_trial(env, ds_set, seq, ik_kin, mod, franka, cfg,
             if task.current_primitive != last_prim[arm]:
                 update_q_goal(arm)
                 last_prim[arm] = task.current_primitive
+                prim_steps[arm] = 0
 
+            prim_steps[arm] += 1
             q = franka[arm].get_joint_positions()[:7].copy()
             ds = ds_set[task.current_primitive]
             x = np.concatenate([q, task.q_goal])
@@ -138,6 +146,7 @@ def run_one_trial(env, ds_set, seq, ik_kin, mod, franka, cfg,
                 with torch.no_grad():
                     qd_n = ds["model"](x_t)
             q_dots[arm] = qd_n.cpu().numpy().squeeze(0) * ds["vel_scale"]
+            q_dots[arm] = np.clip(q_dots[arm], -max_joint_vel, max_joint_vel)
 
         # Modulation
         if use_modulation:
@@ -184,7 +193,8 @@ def run_one_trial(env, ds_set, seq, ik_kin, mod, franka, cfg,
             if task.is_done():
                 continue
             q = franka[arm].get_joint_positions()[:7]
-            if np.linalg.norm(q - task.q_goal) < 0.05:
+            timed_out = prim_steps[arm] >= prim_timeout[task.current_primitive]
+            if np.linalg.norm(q - task.q_goal) < done_tol or timed_out:
                 grip = gripper_action_for_primitive(task.current_primitive)
                 if task.current_primitive == "grasp":
                     metrics["grasp_attempts"] += 1
@@ -206,6 +216,7 @@ def run_one_trial(env, ds_set, seq, ik_kin, mod, franka, cfg,
                     if bp[2] < cfg["table"]["height"] + cfg["block"]["size"]:
                         metrics["grasp_failures"] += 1
                 seq.primitive_complete(arm)
+                prim_steps[arm] = 0
 
         if all(seq.tasks[a].is_done() for a in ("left", "right")):
             metrics["completed"] = True
@@ -225,6 +236,7 @@ def main():
     parser.add_argument("--no_modulation", action="store_true")
     parser.add_argument("--use_safe", action="store_true")
     parser.add_argument("--headless", action="store_true")
+    parser.add_argument("--done_tol", type=float, default=0.05)
     args = parser.parse_args()
 
     from isaacsim import SimulationApp
@@ -278,6 +290,7 @@ def main():
                                     cond, rng, perturbations,
                                     use_modulation=not args.no_modulation,
                                     use_safe=args.use_safe,
+                                    done_tol=args.done_tol,
                                     render=not args.headless)
             results[cond].append(m)
             diag_log[cond].append(diag)

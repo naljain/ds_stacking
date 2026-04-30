@@ -29,7 +29,7 @@ os.environ["CARB_LOG_LEVEL"] = "error"
 
 def load_ds(ckpt_path, device):
     from src.neural_ds import StableNeuralDS, N_JOINTS
-    ckpt = torch.load(ckpt_path, map_location=device)
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     cfg = ckpt["config"]
     model = StableNeuralDS(
         n_joints    = N_JOINTS,
@@ -91,7 +91,8 @@ def main():
         if cart is None:
             return None
         q_seed = franka.get_joint_positions()[:7].copy()
-        q_goal, _ = ik_kin.solve(cart, q_seed=q_seed)
+        ee_quat = seq.ee_orientation(arm)
+        q_goal, _ = ik_kin.solve(cart, target_quat=ee_quat, q_seed=q_seed)
         seq.tasks[arm].q_goal = q_goal
         return q_goal
 
@@ -100,7 +101,11 @@ def main():
     print(f"[DEPLOY] Joint-space DS on {args.arm} arm — safe={args.use_safe}")
 
     last_primitive = seq.tasks[args.arm].current_primitive
-    open_gripper = True
+    prim_steps = 0
+    # 4× the collection budget per primitive before we give up and advance
+    prim_timeout = {p: s * 4
+                    for p, s in cfg["sim"]["steps_per_primitive"].items()}
+
     franka.gripper.apply_action(
         ArticulationAction(joint_positions=np.array([0.04, 0.04]))
     )
@@ -117,6 +122,9 @@ def main():
         if task.current_primitive != last_primitive:
             update_q_goal(args.arm)
             last_primitive = task.current_primitive
+            prim_steps = 0
+
+        prim_steps += 1
 
         q      = franka.get_joint_positions()[:7].copy()
         q_goal = task.q_goal
@@ -132,6 +140,8 @@ def main():
             with torch.no_grad():
                 qd_n = ds["model"](x_t)
         q_dot = qd_n.cpu().numpy().squeeze(0) * ds["vel_scale"]
+        q_dot = np.clip(q_dot, -cfg["training"]["max_joint_vel"],
+                                cfg["training"]["max_joint_vel"])
 
         # Integrate to get joint position command
         q_cmd = q + q_dot * physics_dt
@@ -141,8 +151,14 @@ def main():
 
         env.step(render=not args.headless)
 
-        # Primitive completion check (joint-space distance)
-        if np.linalg.norm(q - q_goal) < args.done_tol:
+        # Primitive completion: joint-space convergence OR per-primitive timeout
+        timed_out = prim_steps >= prim_timeout[task.current_primitive]
+        converged = np.linalg.norm(q - q_goal) < args.done_tol
+        if converged or timed_out:
+            if timed_out and not converged:
+                print(f"[WARN] {task.current_primitive} timed out after "
+                      f"{prim_steps} steps (||q-q*||="
+                      f"{np.linalg.norm(q - q_goal):.3f})")
             grip = gripper_action_for_primitive(task.current_primitive)
             if grip == "close":
                 franka.gripper.apply_action(
@@ -157,6 +173,7 @@ def main():
                 for _ in range(cfg["sim"]["gripper_steps"]):
                     env.step(render=not args.headless)
             seq.primitive_complete(args.arm)
+            prim_steps = 0
 
     print(f"[DEPLOY] Finished after {step + 1} steps.")
     simulation_app.close()
