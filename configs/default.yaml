@@ -17,6 +17,11 @@ arms:
   y:       0.0      # Y position of arm bases
   face_table_quat: [0.7071, 0.0, 0.0, 0.7071]   # 90° around Z
 
+# Optional local asset override. Isaac Sim's Franka helper otherwise resolves
+# the robot USD through the configured Isaac assets root.
+assets:
+  franka_usd: null
+
 # ── Initial block layout ───────────────────────────────────────────────────────
 left_blocks:
   - {name: block_red,    pos: [-0.40,  0.30, 0.765], color: [1.0, 0.1, 0.1]}
@@ -69,6 +74,7 @@ coordination:
   ee_safety_radius:    0.15    # arms back off if EE distance < this
   hold_threshold:      0.20    # wait if other arm is closer than this to my goal
   collision_check_hz:  60
+  start_stagger_steps: 30      # initial right-arm delay (~0.25s at 120 Hz)
 
 # ── Perturbations ─────────────────────────────────────────────────────────────
 perturbations:

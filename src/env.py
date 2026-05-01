@@ -15,6 +15,7 @@ this module — the imports below depend on it being live.
 import numpy as np
 import yaml
 from pathlib import Path
+from pxr import Gf, UsdGeom, UsdLux
 
 from isaacsim.core.api import World
 from isaacsim.core.api.objects import FixedCuboid, DynamicCuboid
@@ -33,13 +34,15 @@ class DualArmEnv:
             physics_dt=self.cfg["sim"]["physics_dt"],
             rendering_dt=self.cfg["sim"]["rendering_dt"],
         )
-        self.world.scene.add_default_ground_plane()
 
         self.frankas    = {}  # arm_name -> Franka object
         self.blocks     = {}  # block_name -> DynamicCuboid object
         self.block_init = {}  # block_name -> initial position (np.array)
         self.goals      = {}  # arm_name -> (x, y) goal location
 
+        self._build_lighting()
+        self._build_camera()
+        self._build_ground()
         self._build_table()
         self._build_arms()
         self._build_blocks()
@@ -54,6 +57,42 @@ class DualArmEnv:
             return yaml.safe_load(f)
 
     # ── Scene construction ────────────────────────────────────────────────────
+    def _build_lighting(self):
+        stage = self.world.stage
+        dome = UsdLux.DomeLight.Define(stage, "/World/DomeLight")
+        dome.CreateIntensityAttr(650.0)
+
+        sun = UsdLux.DistantLight.Define(stage, "/World/KeyLight")
+        sun.CreateIntensityAttr(2200.0)
+        sun.CreateAngleAttr(0.35)
+        sun_xform = UsdGeom.Xformable(sun.GetPrim())
+        sun_xform.AddRotateXYZOp().Set(Gf.Vec3f(-55.0, 0.0, 35.0))
+
+    def _build_camera(self):
+        stage = self.world.stage
+        camera = UsdGeom.Camera.Define(stage, "/World/Camera")
+        camera.CreateFocalLengthAttr(24.0)
+        camera.CreateClippingRangeAttr(Gf.Vec2f(0.01, 1000.0))
+        xform = UsdGeom.Xformable(camera.GetPrim())
+        xform.AddTranslateOp().Set(Gf.Vec3d(0.0, -1.45, 1.55))
+        xform.AddRotateXYZOp().Set(Gf.Vec3f(62.0, 0.0, 0.0))
+        stage.SetDefaultPrim(stage.GetPrimAtPath("/World"))
+
+    def _build_ground(self):
+        """Local ground collider.
+
+        Isaac's add_default_ground_plane() resolves a material/asset through
+        the Isaac assets root. On offline installs that can fail before the
+        scene is even built, so keep the ground entirely local.
+        """
+        self.world.scene.add(FixedCuboid(
+            prim_path="/World/Ground",
+            name="ground",
+            position=np.array([0.0, 0.45, -0.015]),
+            scale=np.array([3.0, 3.0, 0.02]),
+            color=np.array([0.28, 0.28, 0.28]),
+        ))
+
     def _build_table(self):
         t = self.cfg["table"]
         centre = np.array(t["centre"])
@@ -88,6 +127,9 @@ class DualArmEnv:
         a = self.cfg["arms"]
         t = self.cfg["table"]
         face_quat = np.array(a["face_table_quat"])
+        franka_usd = self.cfg.get("assets", {}).get("franka_usd")
+        if franka_usd:
+            franka_usd = str(Path(franka_usd).expanduser().resolve())
 
         arm_x = {
             "left":  -a["spacing"] / 2,
@@ -107,12 +149,23 @@ class DualArmEnv:
             ))
 
             # Robot
-            franka = self.world.scene.add(Franka(
-                prim_path=f"/World/Franka_{name}",
-                name=f"franka_{name}",
-                position=np.array([x, a["y"], t["height"]]),
-                orientation=face_quat,
-            ))
+            try:
+                franka = self.world.scene.add(Franka(
+                    prim_path=f"/World/Franka_{name}",
+                    name=f"franka_{name}",
+                    usd_path=franka_usd,
+                    position=np.array([x, a["y"], t["height"]]),
+                    orientation=face_quat,
+                ))
+            except RuntimeError as exc:
+                if "assets root" in str(exc):
+                    raise RuntimeError(
+                        "Could not locate Isaac Sim robot assets for Franka. "
+                        "Make the Isaac assets root reachable, or set "
+                        "`assets.franka_usd` in configs/default.yaml to a "
+                        "local FrankaPanda/franka.usd file."
+                    ) from exc
+                raise
             self.frankas[name] = franka
 
             # Goal location for this arm

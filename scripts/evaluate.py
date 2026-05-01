@@ -47,7 +47,9 @@ CONDITIONS = ["nominal", "block_displacement", "ee_disturbance",
 def run_one_trial(env, ds_set, seq, ik_kin, mod, franka, cfg,
                   condition, rng, perturbations,
                   use_modulation=True, use_safe=False,
-                  done_tol=0.05, max_steps=8000, render=True):
+                  done_tol=0.05, max_steps=8000, render=True,
+                  stagger_steps=None, goal_gain=0.0, ds_scale=1.0,
+                  max_joint_vel=None):
     """Run one full trial. Returns metrics dict."""
     from omni.isaac.core.utils.types import ArticulationAction
     from src.modulation import jacobian_finite_difference
@@ -55,6 +57,9 @@ def run_one_trial(env, ds_set, seq, ik_kin, mod, franka, cfg,
 
     physics_dt = cfg["sim"]["physics_dt"]
     device = next(ds_set["reach"]["model"].parameters()).device
+    if stagger_steps is None:
+        stagger_steps = cfg["coordination"].get("start_stagger_steps", 0)
+    arm_start_step = {"left": 0, "right": max(0, stagger_steps)}
 
     metrics = {
         "completed":      False,
@@ -86,7 +91,7 @@ def run_one_trial(env, ds_set, seq, ik_kin, mod, franka, cfg,
     prim_timeout = {p: s * 30
                     for p, s in cfg["sim"]["steps_per_primitive"].items()}
     prim_steps   = {"left": 0, "right": 0}
-    max_joint_vel = cfg["training"]["max_joint_vel"]
+    max_joint_vel = cfg["training"]["max_joint_vel"] if max_joint_vel is None else max_joint_vel
 
     # Init q_goals
     def update_q_goal(arm):
@@ -126,7 +131,7 @@ def run_one_trial(env, ds_set, seq, ik_kin, mod, franka, cfg,
         q_dots = {}
         for arm in ("left", "right"):
             task = seq.tasks[arm]
-            if task.is_done():
+            if task.is_done() or step < arm_start_step[arm]:
                 q_dots[arm] = None
                 continue
             if task.current_primitive != last_prim[arm]:
@@ -149,7 +154,9 @@ def run_one_trial(env, ds_set, seq, ik_kin, mod, franka, cfg,
             else:
                 with torch.no_grad():
                     qd_n = ds["model"](x_t)
-            q_dots[arm] = qd_n.cpu().numpy().squeeze(0) * ds["vel_scale"]
+            q_dots[arm] = ds_scale * qd_n.cpu().numpy().squeeze(0) * ds["vel_scale"]
+            if goal_gain > 0:
+                q_dots[arm] = q_dots[arm] - goal_gain * x
             q_dots[arm] = np.clip(q_dots[arm], -max_joint_vel, max_joint_vel)
 
         # Modulation
@@ -239,6 +246,19 @@ def main():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--no_modulation", action="store_true")
     parser.add_argument("--use_safe", action="store_true")
+    parser.add_argument("--goal_gain", type=float, default=0.0,
+                        help="Add q_goal attraction term -gain*(q-q_goal) to "
+                             "the learned DS during evaluation.")
+    parser.add_argument("--ds_scale", type=float, default=1.0,
+                        help="Scale learned DS velocity. Use 0 with "
+                             "--goal_gain for a pure joint-space attractor "
+                             "sanity check.")
+    parser.add_argument("--max_joint_vel", type=float, default=None,
+                        help="Deployment/evaluation joint velocity clamp in "
+                             "rad/s. Defaults to training.max_joint_vel.")
+    parser.add_argument("--stagger_steps", type=int, default=None,
+                        help="Initial right-arm launch delay in physics steps. "
+                             "Defaults to coordination.start_stagger_steps.")
     parser.add_argument("--headless", action="store_true")
     parser.add_argument("--done_tol", type=float, default=0.05)
     args = parser.parse_args()
@@ -297,6 +317,10 @@ def main():
                                     use_modulation=not args.no_modulation,
                                     use_safe=args.use_safe,
                                     done_tol=args.done_tol,
+                                    stagger_steps=args.stagger_steps,
+                                    goal_gain=args.goal_gain,
+                                    ds_scale=args.ds_scale,
+                                    max_joint_vel=args.max_joint_vel,
                                     render=not args.headless)
             results[cond].append(m)
             diag_log[cond].append(diag)
@@ -326,7 +350,16 @@ def main():
     with open(out_path, "w") as f:
         json.dump({"summary": summary,
                    "config":  {"no_modulation": args.no_modulation,
-                               "use_safe":      args.use_safe},
+                               "use_safe":      args.use_safe,
+                               "stagger_steps": args.stagger_steps
+                                                if args.stagger_steps is not None
+                                                else cfg["coordination"].get(
+                                                    "start_stagger_steps", 0),
+                               "goal_gain":     args.goal_gain,
+                               "ds_scale":      args.ds_scale,
+                               "max_joint_vel": args.max_joint_vel
+                                                if args.max_joint_vel is not None
+                                                else cfg["training"]["max_joint_vel"]},
                    "trials":  results},
                   f, indent=2, default=str)
     print(f"\n[EVAL] Saved results to {out_path}")

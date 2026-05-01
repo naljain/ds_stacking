@@ -55,11 +55,26 @@ class IKController:
 
     # ── Convenience: full move with stepping owned by caller ─────────────────
     def move_to(self, world, target_pos, target_quat=None, steps=120,
-                record_callback=None, render=True):
+                record_callback=None, render=True, stop_tolerance=None,
+                max_extra_steps=0, post_step_callback=None):
         """Step toward target_pos for `steps` ticks. If record_callback is given,
         call it each step with the current ee pose so a trajectory can be logged."""
         for _ in range(steps):
             self.step_to(target_pos, target_quat)
             world.step(render=render)
+            if post_step_callback is not None:
+                post_step_callback()
+            if record_callback is not None:
+                record_callback()
+        if stop_tolerance is None or max_extra_steps <= 0:
+            return
+        for _ in range(max_extra_steps):
+            ee_pos = self.franka.end_effector.get_world_pose()[0]
+            if np.linalg.norm(ee_pos - target_pos) <= stop_tolerance:
+                break
+            self.step_to(target_pos, target_quat)
+            world.step(render=render)
+            if post_step_callback is not None:
+                post_step_callback()
             if record_callback is not None:
                 record_callback()

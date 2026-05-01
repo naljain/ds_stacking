@@ -44,12 +44,32 @@ def main():
     parser.add_argument("--n_demos",  type=int, default=50)
     parser.add_argument("--config",   type=str, default="configs/default.yaml")
     parser.add_argument("--headless", action="store_true")
-    parser.add_argument("--noise",    type=float, default=0.05,
-                        help="Max XY noise added to block-target positions per demo.")
+    parser.add_argument("--noise",    type=float, default=0.0,
+                        help="Legacy target XY noise in metres. Keep this at "
+                             "0 for reliable grasp demos; nonzero values aim "
+                             "beside the observed block.")
+    parser.add_argument("--block_xy_jitter", type=float, default=0.0,
+                        help="Max XY jitter applied to the physical block "
+                             "positions per demo. This widens the data without "
+                             "commanding grasps away from the block.")
     parser.add_argument("--start_jitter", type=float, default=0.15,
                         help="Per-joint random start-pose perturbation (rad). "
                              "Widens the demonstrated trajectory manifold so "
                              "the DS doesn't overfit to one path.")
+    parser.add_argument("--settle_tol", type=float, default=0.01,
+                        help="Extra RMPflow settling tolerance in Cartesian EE "
+                             "position before switching primitives.")
+    parser.add_argument("--settle_extra_steps", type=int, default=60,
+                        help="Max extra controller steps used to settle at each "
+                             "primitive target.")
+    parser.add_argument("--lift_check_margin", type=float, default=0.01,
+                        help="Block must rise above table + block size + this "
+                             "margin after lift, otherwise the demo is retried.")
+    parser.add_argument("--physical_grasp", action="store_true",
+                        help="Require Isaac gripper contact to lift the block. "
+                             "Default collection kinematically carries the "
+                             "active block after grasp so DS demos are not "
+                             "discarded due contact-grasp flakiness.")
     args = parser.parse_args()
 
     from isaacsim import SimulationApp
@@ -92,12 +112,42 @@ def main():
     print(f"\n[INFO] Collecting {args.n_demos} demos ({args.arm} arm).")
 
     home_q = franka.get_joint_positions().copy()
+    if args.block_xy_jitter <= 0 and args.noise <= 0:
+        print("[INFO] Collecting conservative demos: no block jitter, no target noise.")
+    if not args.physical_grasp:
+        print("[INFO] Kinematic block carry is ON for collection "
+              "(use --physical_grasp to require contact grasps).")
 
-    for demo_idx in range(args.n_demos):
-        print(f"  Demo {demo_idx + 1}/{args.n_demos}")
-        env.reset_blocks(render=not args.headless)
+    def reset_arm_to_start():
+        franka.set_joint_positions(home_q)
+        if hasattr(franka, "set_joint_velocities"):
+            franka.set_joint_velocities(np.zeros_like(home_q))
         ik_motion.reset()
         ik_motion.set_gripper(open=True)
+        for _ in range(30):
+            env.world.step(render=not args.headless)
+
+    max_attempts = max(args.n_demos * 5, args.n_demos)
+    attempts = 0
+    while len(all_demos) < args.n_demos and attempts < max_attempts:
+        attempts += 1
+        demo_idx = len(all_demos)
+        print(f"  Demo {demo_idx + 1}/{args.n_demos} (attempt {attempts})")
+        env.reset_blocks(render=not args.headless)
+        reset_arm_to_start()
+
+        if args.block_xy_jitter > 0:
+            for block_name in block_names:
+                pos, quat = env.get_block_poses()[block_name]
+                pos = pos.copy()
+                pos[:2] += rng.uniform(-args.block_xy_jitter,
+                                       args.block_xy_jitter, size=2)
+                obj = env.get_block_obj(block_name)
+                obj.set_world_pose(position=pos, orientation=quat)
+                obj.set_linear_velocity(np.zeros(3))
+                obj.set_angular_velocity(np.zeros(3))
+            for _ in range(30):
+                env.world.step(render=not args.headless)
 
         # Randomise the starting joint pose so each demo's first reach starts
         # from a different config. Without this, every demo's RMPflow path
@@ -108,11 +158,27 @@ def main():
             jittered = home_q.copy()
             jittered[:7] += jitter
             franka.set_joint_positions(jittered)
+            if hasattr(franka, "set_joint_velocities"):
+                franka.set_joint_velocities(np.zeros_like(jittered))
             for _ in range(20):
                 env.world.step(render=not args.headless)
+            ik_motion.reset()
 
         demo_traj = []
         prev_q = franka.get_joint_positions()[:7].copy()
+        demo_failed = False
+        held_block = None
+        held_offset = np.zeros(3)
+
+        def carry_held_block():
+            if held_block is None:
+                return
+            ee_pos = franka.end_effector.get_world_pose()[0].copy()
+            obj = env.get_block_obj(held_block)
+            obj.set_world_pose(position=ee_pos + held_offset,
+                               orientation=np.array([1.0, 0.0, 0.0, 0.0]))
+            obj.set_linear_velocity(np.zeros(3))
+            obj.set_angular_velocity(np.zeros(3))
 
         goal_z = base_z
         for block_idx, block_name in enumerate(block_names):
@@ -172,6 +238,9 @@ def main():
                     steps=steps[primitive],
                     record_callback=record,
                     render=not args.headless,
+                    stop_tolerance=args.settle_tol,
+                    max_extra_steps=args.settle_extra_steps,
+                    post_step_callback=carry_held_block,
                 )
 
                 # Compute q_goal via Lula IK seeded from the settled config.
@@ -188,27 +257,62 @@ def main():
                 demo_traj.extend(prim_buf)
 
                 if primitive == "grasp":
+                    for _ in range(10):
+                        env.world.step(render=not args.headless)
                     ik_motion.set_gripper(open=False)
                     for _ in range(cfg["sim"]["gripper_steps"]):
                         env.world.step(render=not args.headless)
+                    if not args.physical_grasp:
+                        ee_pos = franka.end_effector.get_world_pose()[0].copy()
+                        held_block = block_name
+                        held_offset = block_pos - ee_pos
+                        carry_held_block()
                 elif primitive == "place":
+                    held_block = None
                     ik_motion.set_gripper(open=True)
                     for _ in range(cfg["sim"]["gripper_steps"]):
                         env.world.step(render=not args.headless)
+
+                if primitive == "lift" and args.physical_grasp:
+                    lifted_pos = env.get_block_positions()[block_name]
+                    min_lift_z = (cfg["table"]["height"]
+                                  + cfg["block"]["size"]
+                                  + args.lift_check_margin)
+                    if lifted_pos[2] < min_lift_z:
+                        ee_pos = franka.end_effector.get_world_pose()[0].copy()
+                        print(f"    [WARN] missed grasp on {block_name}; "
+                              "discarding this demo attempt")
+                        print(f"           block_z={lifted_pos[2]:.3f}, "
+                              f"needed>{min_lift_z:.3f}, "
+                              f"ee={ee_pos.round(3)}, "
+                              f"block={lifted_pos.round(3)}")
+                        demo_failed = True
+                        break
+
+            if demo_failed:
+                break
 
             # Retract before next block (not recorded)
             retract_cart = np.array([goal_xy[0], goal_xy[1], lift_h])
             ik_motion.move_to(env.world, retract_cart, steps=60,
                               record_callback=None,
-                              render=not args.headless)
+                              render=not args.headless,
+                              stop_tolerance=args.settle_tol,
+                              max_extra_steps=args.settle_extra_steps,
+                              post_step_callback=carry_held_block)
             goal_z += cfg["block"]["size"] + 0.002
 
-        all_demos.append({
-            "arm":        args.arm,
-            "demo_idx":   demo_idx,
-            "trajectory": demo_traj,
-            "success":    True,
-        })
+        if not demo_failed:
+            all_demos.append({
+                "arm":        args.arm,
+                "demo_idx":   demo_idx,
+                "trajectory": demo_traj,
+                "success":    True,
+            })
+
+    if len(all_demos) < args.n_demos:
+        print(f"\n[WARN] Collected only {len(all_demos)}/{args.n_demos} "
+              f"successful demos after {attempts} attempts.")
 
     with open(out_path, "wb") as f:
         pickle.dump(all_demos, f)

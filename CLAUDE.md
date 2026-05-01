@@ -67,6 +67,9 @@ data/results/              Eval JSON + diagnostic pickles + figures
 7. python scripts/plot_modulation.py all --diag data/results/diag_<ts>.pkl
 ```
 
+If `collect_ik.py` behaviour changes, rerun from step 2 onward. Do not retrain
+from old demos that may contain missed grasps or target-noise artifacts.
+
 ## Environment
 
 - Conda env: `franka_isaac` (Python 3.11)
@@ -75,6 +78,11 @@ data/results/              Eval JSON + diagnostic pickles + figures
 
 Always activate the conda env before running anything: `conda activate franka_isaac`.
 
+Isaac Sim's Franka helper needs the Isaac robot assets. If the default assets
+root is unreachable, set `assets.franka_usd` in `configs/default.yaml` to a
+local `FrankaPanda/franka.usd`. `env.py` uses a local cuboid ground plane to
+avoid `add_default_ground_plane()` pulling from the remote asset root.
+
 ## Important conventions
 
 - **Never put omni / isaacsim imports at the top of a script.** They must come AFTER `SimulationApp(...)` is instantiated, otherwise omniverse complains about modules loaded too early. The pattern is: argparse → SimulationApp → imports → main logic.
@@ -82,6 +90,8 @@ Always activate the conda env before running anything: `conda activate franka_is
 - **`render=not args.headless`** — every `world.step()` and `env.step()` call needs this so headless mode actually skips rendering.
 - **Configs over magic numbers** — table dimensions, primitive heights, training hyperparams etc. all live in `configs/default.yaml`, not as constants in code. If something needs tuning, check the config first.
 - **One IK call per primitive transition.** The DS handles smooth motion within a primitive; Lula IK is only called when the primitive switches and a new `q*` is needed. Don't put IK in the inner loop.
+- **Coordinator stays slim.** It owns block order, primitive order, stack-slot reservation, and the initial arm phase offset. It should not implement close-range hold/release collision logic; that belongs to modulation or an explicit ablation.
+- **Dual-arm start is intentionally staggered.** `coordination.start_stagger_steps` delays the right arm slightly so both arms do not hit the shared stack in perfect synchrony. This is phase scheduling, not collision arbitration.
 
 ## Known footguns
 
@@ -93,7 +103,17 @@ Always activate the conda env before running anything: `conda activate franka_is
 
 4. **Recording in collect_ik.py uses a closure over `prev_q`.** When refactoring, preserve the `nonlocal prev_q` pattern — losing it silently breaks finite-difference velocities.
 
-5. **Jacobian via finite differences is slow.** `jacobian_finite_difference()` does 7 set-and-restore operations per call. Fine for evaluation but if it becomes a bottleneck, swap to Isaac Sim's analytical Jacobian (`articulation.get_jacobians()` — exact field/indexing has shifted between versions, check what works on the install).
+5. **Target noise in collection can cause missed grasps.** `collect_ik.py --noise` is legacy target noise and should normally stay at 0. Default collection is conservative: no target noise and no block jitter. Once the base grasp is reliable, use `--block_xy_jitter` to move the physical blocks and widen the data distribution without commanding the gripper beside the cube.
+
+6. **Collection separates motion demos from contact grasp validation.** By default `collect_ik.py` kinematically carries the active block after `grasp` so RMPflow joint-space demos are not discarded due Isaac contact flakiness. Pass `--physical_grasp` to require the gripper/contact setup to actually lift the cube; in that mode failed lifts are discarded.
+
+7. **RMPflow settling affects jerk and labels.** `collect_ik.py` allows extra settling steps before primitive transitions. Abruptly switching targets before the controller reaches the previous target creates jerky finite-difference `q_dot` labels.
+
+8. **Shared stack slots are reserved before transport/place.** The coordinator reserves stack heights when an arm asks for a transport/place target, not only after placement completes. Otherwise two arms can target the same stack layer.
+
+9. **Kinematic-carry release must use the reserved stack slot.** In debug deployment with `--kinematic_carry`, the carried cube follows the EE during motion, then snaps to `TaskSequencer.stack_target_position(arm)` when `place` opens the gripper. Do not release at the raw EE-plus-offset pose, or every block can appear to land near the same table-height pose even though the coordinator reserved increasing stack heights.
+
+10. **Jacobian via finite differences is slow.** `jacobian_finite_difference()` does 7 set-and-restore operations per call. Fine for evaluation but if it becomes a bottleneck, swap to Isaac Sim's analytical Jacobian (`articulation.get_jacobians()` — exact field/indexing has shifted between versions, check what works on the install).
 
 ## Evaluation conditions
 
@@ -106,6 +126,9 @@ combined             all of the above
 ```
 
 Ablations available via flags: `--no_modulation` (FSM-free, naive parallel), `--use_safe` (Lyapunov projection on).
+`--goal_gain` is a stabilizing deployment ablation: it adds `-gain*(q-q*)` to
+the learned velocity when the raw DS points away from the attractor. Do not
+present this as the pure learned-DS baseline.
 
 ## Metrics (evaluate.py)
 
@@ -149,7 +172,3 @@ One challenge will be collecting demonstrations that are simple enough to learn 
 
 Implementation Details: 
 The project will be implemented in Python using Isaac Gym for simulation. DS fitting will be done by learning a neural parameterization of the motion vector field from demonstrations. The teleoperation interface, task sequencer, and coordination layer will be developed from scratch. Development will be divided into four stages: (1) teleoperated demonstration collection, (2) DS primitive fitting and single-arm, (3) dual-arm coordinated stacking, (4) perturbation recovery and collision modulation.
-
-
-
-

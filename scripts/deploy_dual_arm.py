@@ -66,8 +66,26 @@ def main():
     parser.add_argument("--alpha", type=float, default=None,
                         help="Override Lyapunov decay rate at deployment "
                              "(higher = more aggressive projection).")
+    parser.add_argument("--goal_gain", type=float, default=0.0,
+                        help="Add q_goal attraction term -gain*(q-q_goal) to "
+                             "the learned DS before modulation. Use as a "
+                             "stabilizing ablation when raw DS convergence is poor.")
+    parser.add_argument("--ds_scale", type=float, default=1.0,
+                        help="Scale learned DS velocity. Use 0 with "
+                             "--goal_gain for a pure joint-space attractor "
+                             "sanity check.")
+    parser.add_argument("--max_joint_vel", type=float, default=None,
+                        help="Deployment joint velocity clamp in rad/s. "
+                             "Defaults to training.max_joint_vel from config.")
     parser.add_argument("--no_modulation", action="store_true",
                         help="Disable DS modulation (ablation).")
+    parser.add_argument("--stagger_steps", type=int, default=None,
+                        help="Initial right-arm launch delay in physics steps. "
+                             "Defaults to coordination.start_stagger_steps.")
+    parser.add_argument("--kinematic_carry", action="store_true",
+                        help="After grasp, attach each active block to its EE "
+                             "kinematically until place. Use this to debug the "
+                             "DS/task pipeline separately from gripper contact.")
     parser.add_argument("--headless", action="store_true")
     parser.add_argument("--done_tol", type=float, default=0.05)
     args = parser.parse_args()
@@ -108,6 +126,11 @@ def main():
     )
 
     physics_dt = cfg["sim"]["physics_dt"]
+    max_joint_vel = (cfg["training"]["max_joint_vel"]
+                     if args.max_joint_vel is None else args.max_joint_vel)
+    stagger_steps = (cfg["coordination"].get("start_stagger_steps", 0)
+                     if args.stagger_steps is None else args.stagger_steps)
+    arm_start_step = {"left": 0, "right": max(0, stagger_steps)}
 
     # Open both grippers
     for arm in franka:
@@ -140,7 +163,35 @@ def main():
                     for p, s in cfg["sim"]["steps_per_primitive"].items()}
 
     print(f"[DEPLOY] Dual-arm joint-space DS — safe={args.use_safe}, "
-          f"modulation={'OFF' if args.no_modulation else 'ON'}")
+          f"modulation={'OFF' if args.no_modulation else 'ON'}, "
+          f"goal_gain={args.goal_gain}, ds_scale={args.ds_scale}, "
+          f"max_joint_vel={max_joint_vel}")
+    if stagger_steps > 0:
+        print(f"[DEPLOY] Initial stagger: right arm starts after "
+              f"{stagger_steps} steps ({stagger_steps * physics_dt:.2f}s)")
+
+    held_block = {"left": None, "right": None}
+    held_offset = {"left": np.zeros(3), "right": np.zeros(3)}
+
+    def carry_held_blocks():
+        for arm in ("left", "right"):
+            if held_block[arm] is None:
+                continue
+            ee = env.get_ee_pose(arm)[0].copy()
+            obj = env.get_block_obj(held_block[arm])
+            obj.set_world_pose(position=ee + held_offset[arm],
+                               orientation=np.array([1.0, 0.0, 0.0, 0.0]))
+            obj.set_linear_velocity(np.zeros(3))
+            obj.set_angular_velocity(np.zeros(3))
+
+    def snap_held_block_to_stack(arm):
+        if held_block[arm] is None:
+            return
+        obj = env.get_block_obj(held_block[arm])
+        obj.set_world_pose(position=seq.stack_target_position(arm),
+                           orientation=np.array([1.0, 0.0, 0.0, 0.0]))
+        obj.set_linear_velocity(np.zeros(3))
+        obj.set_angular_velocity(np.zeros(3))
 
     for step in range(args.max_steps):
         if not simulation_app.is_running():
@@ -153,7 +204,7 @@ def main():
         q_dots = {}
         for arm in ("left", "right"):
             task = seq.tasks[arm]
-            if task.is_done():
+            if task.is_done() or step < arm_start_step[arm]:
                 q_dots[arm] = None
                 continue
 
@@ -178,9 +229,10 @@ def main():
             else:
                 with torch.no_grad():
                     qd_n = ds["model"](x_t)
-            q_dots[arm] = qd_n.cpu().numpy().squeeze(0) * ds["vel_scale"]
-            q_dots[arm] = np.clip(q_dots[arm], -cfg["training"]["max_joint_vel"],
-                                               cfg["training"]["max_joint_vel"])
+            q_dots[arm] = args.ds_scale * qd_n.cpu().numpy().squeeze(0) * ds["vel_scale"]
+            if args.goal_gain > 0:
+                q_dots[arm] = q_dots[arm] - args.goal_gain * x
+            q_dots[arm] = np.clip(q_dots[arm], -max_joint_vel, max_joint_vel)
 
         # Apply modulation between the two arms
         if not args.no_modulation:
@@ -206,6 +258,7 @@ def main():
             franka[arm].apply_action(ArticulationAction(joint_positions=q_cmd_full))
 
         env.step(render=not args.headless)
+        carry_held_blocks()
 
         # Per-arm primitive completion checks
         for arm in ("left", "right"):
@@ -227,7 +280,16 @@ def main():
                     )
                     for _ in range(cfg["sim"]["gripper_steps"]):
                         env.step(render=not args.headless)
+                    if args.kinematic_carry:
+                        ee = env.get_ee_pose(arm)[0].copy()
+                        block_pos = env.get_block_positions()[task.current_block].copy()
+                        held_block[arm] = task.current_block
+                        held_offset[arm] = block_pos - ee
+                        carry_held_blocks()
                 elif grip == "open":
+                    if args.kinematic_carry:
+                        snap_held_block_to_stack(arm)
+                    held_block[arm] = None
                     franka[arm].gripper.apply_action(
                         ArticulationAction(joint_positions=np.array([0.04, 0.04]))
                     )

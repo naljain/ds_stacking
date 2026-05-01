@@ -36,6 +36,7 @@ class ArmTaskState:
         self.current_primitive = "reach"
         self.gripper_open      = True
         self.q_goal = None    # set by the deployment loop after IK
+        self.reserved_goal_z = None
 
     @property
     def current_block(self):
@@ -75,6 +76,7 @@ class TaskSequencer:
         # double-increment race when both arms complete "place" in the same
         # physics step (which the old `self.goal_z += block_h` had).
         self.placed_per_arm = {arm: 0 for arm in env.arms_active}
+        self._next_stack_slot = 0
 
     def cartesian_target(self, arm):
         """Cartesian target for the current primitive on the given arm."""
@@ -82,11 +84,12 @@ class TaskSequencer:
         if task.is_done():
             return None
         block_pos = self.env.get_block_positions()[task.current_block]
+        goal_z = self._goal_z_for_task(task)
         return primitive_target(
             primitive=task.current_primitive,
             block_pos=block_pos,
             goal_xy=task.goal_xy,
-            goal_z=self.goal_z,
+            goal_z=goal_z,
             hover_h=self.cfg["heights"]["hover"],
             lift_h =self.cfg["heights"]["lift"],
             grasp_h=self.cfg["heights"]["grasp"],
@@ -106,13 +109,35 @@ class TaskSequencer:
 
     @property
     def goal_z(self):
-        n_total = sum(self.placed_per_arm.values())
+        n_total = self._next_stack_slot
         return self.base_z + n_total * self.block_h
+
+    def stack_target_position(self, arm):
+        """Center position for the active block's reserved stack slot."""
+        task = self.tasks[arm]
+        z = task.reserved_goal_z if task.reserved_goal_z is not None else self.goal_z
+        return np.array([task.goal_xy[0], task.goal_xy[1], z])
+
+    def _goal_z_for_task(self, task):
+        """Reserve a unique shared-stack slot before the place primitive.
+
+        Both arms may run transport/place concurrently. If goal height is based
+        only on completed placements, two arms can target the same stack layer.
+        Reserving at target-generation time keeps the sequencing deterministic
+        without adding collision/hold logic to the coordinator.
+        """
+        if task.current_primitive in ("transport", "place"):
+            if task.reserved_goal_z is None:
+                task.reserved_goal_z = self.goal_z
+                self._next_stack_slot += 1
+            return task.reserved_goal_z
+        return self.goal_z
 
     def primitive_complete(self, arm):
         task = self.tasks[arm]
         if task.current_primitive == "place":
             self.placed_per_arm[arm] += 1
+            task.reserved_goal_z = None
         task.advance_primitive()
 
     def gripper_action(self, arm):

@@ -116,6 +116,10 @@ python scripts/evaluate.py --no_modulation                # collision-avoidance 
 python scripts/evaluate.py --use_safe                     # Lyapunov projection
 ```
 
+If collection settings change, rerun from step 2 onward. The trained DS is only
+as good as the saved demonstrations, so demos with missed grasps, target-noise
+artifacts, or jerky primitive transitions should not be reused.
+
 ## Setup
 
 ```bash
@@ -124,6 +128,37 @@ conda activate franka_isaac
 pip install isaacsim[all,extscache]==5.1.0 --extra-index-url https://pypi.nvidia.com
 pip install torch numpy pyyaml tqdm matplotlib
 ```
+
+Isaac Sim's Franka helper resolves the robot USD through the configured Isaac
+assets root. If your install cannot reach the default assets root, set a local
+Franka USD in `configs/default.yaml`:
+
+```yaml
+assets:
+  franka_usd: /path/to/Assets/Isaac/Robots/FrankaRobotics/FrankaPanda/franka.usd
+```
+
+The ground plane is built from a local cuboid, so it does not require the Isaac
+asset server.
+
+## Data Collection Notes
+
+`collect_ik.py` uses RMPflow only for demonstration collection. The default
+collection path is conservative: it targets the observed block pose directly,
+uses no block jitter, and uses no target noise. Keep legacy target noise
+`--noise` at `0` for reliable grasp demos; nonzero target noise commands the
+gripper beside the observed block and can produce failed grasps.
+
+After the base grasp is reliable, `--block_xy_jitter` can be used to move the
+physical blocks and widen the data distribution without commanding grasps away
+from the cube.
+
+Collection adds extra RMPflow settling steps before switching primitives. By
+default, after `grasp` it kinematically carries the active block with the EE so
+clean joint-space demos are not discarded because Isaac contact grasping is
+flaky. Use `--physical_grasp` when you explicitly want to test whether the
+parallel gripper/contact setup can lift the cube; in that mode failed lifts are
+discarded.
 
 ## Primitives
 
@@ -140,6 +175,32 @@ Each pick-and-stack sequence decomposes into 5 learned primitives:
 Each primitive has its own `f_theta` and `V_phi` networks. At a primitive
 transition, Lula IK is queried once to compute the new `q*`; the DS then
 drives `q -> q*` smoothly until the next transition.
+
+## Dual-Arm Coordination
+
+The coordinator remains deliberately slim: it chooses block order, primitive
+order, and stack slots. It does not perform close-range hold/release collision
+logic. Inter-arm collision avoidance remains the responsibility of continuous
+DS modulation.
+
+Dual-arm deployment uses a small initial phase offset by default:
+`coordination.start_stagger_steps: 30`, roughly 0.25 s at 120 Hz. The left arm
+starts immediately and the right arm starts after the stagger. This avoids a
+perfectly symmetric race into the shared stack while preserving the DS +
+modulation framing. Override it with `--stagger_steps`.
+
+Shared stack layers are reserved before `transport/place`, so both arms cannot
+target the same stack height when they arrive at the goal area concurrently.
+The reserved height is the desired block center height. During kinematic-carry
+debug deployment, the carried block is snapped to that reserved stack slot when
+`place` opens the gripper; otherwise the visual block pose can reflect the EE
+carry offset instead of the coordinator's stack layer.
+
+If a newly trained DS does not converge at deployment, inspect
+`cos→goal` in `deploy_single_arm.py`. Negative values mean the learned vector
+field is pointing away from `q_goal`. For debugging or a stabilizing ablation,
+run with `--goal_gain 1.0`, which adds a linear attraction term toward `q_goal`
+while still evaluating the learned DS velocity.
 
 ## Stability
 

@@ -58,6 +58,18 @@ def main():
     parser.add_argument("--alpha", type=float, default=None,
                         help="Override Lyapunov decay rate at deployment "
                              "(higher = more aggressive projection / faster convergence).")
+    parser.add_argument("--goal_gain", type=float, default=0.0,
+                        help="Add q_goal attraction term -gain*(q-q_goal) to "
+                             "the learned DS at deployment. Use this as a "
+                             "stabilizing ablation if the learned field points "
+                             "away from the attractor.")
+    parser.add_argument("--ds_scale", type=float, default=1.0,
+                        help="Scale learned DS velocity. Use 0 with "
+                             "--goal_gain for a pure joint-space attractor "
+                             "sanity check.")
+    parser.add_argument("--max_joint_vel", type=float, default=None,
+                        help="Deployment joint velocity clamp in rad/s. "
+                             "Defaults to training.max_joint_vel from config.")
     parser.add_argument("--headless", action="store_true")
     parser.add_argument("--done_tol", type=float, default=0.05,
                         help="L2 tolerance in joint space to declare primitive done.")
@@ -66,6 +78,13 @@ def main():
                              "for post-mortem plotting.")
     parser.add_argument("--print_every", type=int, default=50,
                         help="Print diagnostic line every N steps (0 = off).")
+    parser.add_argument("--debug_ik", action="store_true",
+                        help="Print IK target, success flag, and resulting "
+                             "joint goal at each primitive transition.")
+    parser.add_argument("--kinematic_carry", action="store_true",
+                        help="After grasp, attach the active block to the EE "
+                             "kinematically until place. Use this to debug the "
+                             "DS/task pipeline separately from gripper contact.")
     args = parser.parse_args()
 
     from isaacsim import SimulationApp
@@ -100,6 +119,8 @@ def main():
 
     seq = TaskSequencer(env, cfg)
     physics_dt = cfg["sim"]["physics_dt"]
+    max_joint_vel = (cfg["training"]["max_joint_vel"]
+                     if args.max_joint_vel is None else args.max_joint_vel)
 
     # Compute initial q_goal for the first primitive
     def update_q_goal(arm):
@@ -108,13 +129,20 @@ def main():
             return None
         q_seed = franka.get_joint_positions()[:7].copy()
         ee_quat = seq.ee_orientation(arm)
-        q_goal, _ = ik_kin.solve(cart, target_quat=ee_quat, q_seed=q_seed)
+        q_goal, ok = ik_kin.solve(cart, target_quat=ee_quat, q_seed=q_seed)
+        if args.debug_ik:
+            print(f"[IK] {seq.tasks[arm].current_primitive:9s} ok={ok} "
+                  f"cart={cart.round(3)} seed={q_seed.round(3)} "
+                  f"q_goal={q_goal.round(3)} "
+                  f"||seed-goal||={np.linalg.norm(q_seed - q_goal):.3f}")
         seq.tasks[arm].q_goal = q_goal
         return q_goal
 
     update_q_goal(args.arm)
 
-    print(f"[DEPLOY] Joint-space DS on {args.arm} arm — safe={args.use_safe}")
+    print(f"[DEPLOY] Joint-space DS on {args.arm} arm — safe={args.use_safe}, "
+          f"goal_gain={args.goal_gain}, ds_scale={args.ds_scale}, "
+          f"max_joint_vel={max_joint_vel}")
 
     last_primitive = seq.tasks[args.arm].current_primitive
     prim_steps = 0
@@ -138,6 +166,28 @@ def main():
         csv_log.write("step,primitive,prim_step,e_norm,V,"
                       "qd_raw_norm,qd_norm,proj_delta,cos_to_goal\n")
         print(f"[DEPLOY] Logging to {args.log_csv}")
+
+    held_block = None
+    held_offset = np.zeros(3)
+
+    def carry_held_block():
+        if held_block is None:
+            return
+        ee_pos = env.get_ee_pose(args.arm)[0].copy()
+        obj = env.get_block_obj(held_block)
+        obj.set_world_pose(position=ee_pos + held_offset,
+                           orientation=np.array([1.0, 0.0, 0.0, 0.0]))
+        obj.set_linear_velocity(np.zeros(3))
+        obj.set_angular_velocity(np.zeros(3))
+
+    def snap_held_block_to_stack():
+        if held_block is None:
+            return
+        obj = env.get_block_obj(held_block)
+        obj.set_world_pose(position=seq.stack_target_position(args.arm),
+                           orientation=np.array([1.0, 0.0, 0.0, 0.0]))
+        obj.set_linear_velocity(np.zeros(3))
+        obj.set_angular_velocity(np.zeros(3))
 
     for step in range(args.max_steps):
         if not simulation_app.is_running():
@@ -181,9 +231,10 @@ def main():
             qd_n = qd_n_raw
 
         q_dot_raw = qd_n_raw.cpu().numpy().squeeze(0) * ds["vel_scale"]
-        q_dot     = qd_n.cpu().numpy().squeeze(0) * ds["vel_scale"]
-        q_dot_clipped = np.clip(q_dot, -cfg["training"]["max_joint_vel"],
-                                        cfg["training"]["max_joint_vel"])
+        q_dot     = args.ds_scale * qd_n.cpu().numpy().squeeze(0) * ds["vel_scale"]
+        if args.goal_gain > 0:
+            q_dot = q_dot - args.goal_gain * x
+        q_dot_clipped = np.clip(q_dot, -max_joint_vel, max_joint_vel)
 
         # V value, useful for tracking convergence
         with torch.no_grad():
@@ -201,12 +252,14 @@ def main():
         proj_correction = float(np.linalg.norm(q_dot - q_dot_raw))
 
         if args.print_every and step % args.print_every == 0:
+            q_cmd_preview = q + q_dot_clipped * physics_dt
             print(f"  step {step:5d} | {task.current_primitive:9s} | "
                   f"||e||={e_norm:.3f}  V={V_val:7.3f}  "
                   f"||qd_raw||={np.linalg.norm(q_dot_raw):.2f}  "
                   f"||qd||={qd_norm:.2f}  "
                   f"proj_Δ={proj_correction:.2f}  "
-                  f"cos→goal={cos_to_goal:+.2f}")
+                  f"cos→goal={cos_to_goal:+.2f}  "
+                  f"max|Δqcmd|={np.max(np.abs(q_cmd_preview - q)):.4f}")
 
         if args.log_csv is not None:
             csv_log.write(
@@ -226,6 +279,7 @@ def main():
         franka.apply_action(ArticulationAction(joint_positions=full_cmd))
 
         env.step(render=not args.headless)
+        carry_held_block()
 
         # Primitive completion: joint-space convergence OR per-primitive timeout
         timed_out = prim_steps >= prim_timeout[task.current_primitive]
@@ -242,7 +296,16 @@ def main():
                 )
                 for _ in range(cfg["sim"]["gripper_steps"]):
                     env.step(render=not args.headless)
+                if args.kinematic_carry:
+                    ee_pos = env.get_ee_pose(args.arm)[0].copy()
+                    block_pos = env.get_block_positions()[task.current_block].copy()
+                    held_block = task.current_block
+                    held_offset = block_pos - ee_pos
+                    carry_held_block()
             elif grip == "open":
+                if args.kinematic_carry:
+                    snap_held_block_to_stack()
+                held_block = None
                 franka.gripper.apply_action(
                     ArticulationAction(joint_positions=np.array([0.04, 0.04]))
                 )
