@@ -36,33 +36,33 @@ goals:
 heights:
   hover:  0.89    # table_height + 0.15 — pre-grasp hover
   grasp:  0.77    # table_height + 0.03 — fingertips at mid-block
-  lift:   0.99    # table_height + 0.25 — transport altitude
+  lift:   1.10    # carries block at this height; clears 6-block stack (top ~1.04m)
 
 # ── Simulation ────────────────────────────────────────────────────────────────
 sim:
   physics_dt:    0.00833    # 1/120
   rendering_dt:  0.01667    # 1/60
   steps_per_primitive:
-    reach:     120
-    grasp:     80
-    lift:      80
-    transport: 150
-    place:     80
+    reach:     60
+    grasp:     50
+    lift:      50
+    transport: 80
+    place:     50
   gripper_steps: 30
 
 # ── Neural DS training ────────────────────────────────────────────────────────
 training:
-  state_dim:        14       # [q (7), q_goal (7)] — joint-space DS input
+  state_dim:        7        # e = q - q_goal — error-based DS input
   velocity_dim:     7        # joint velocity output
   hidden_dim:       128
   lyapunov_hidden:  64
   alpha:            1.0      # Lyapunov decay rate
-  lambda_stab:      0.5      # weight on stability loss
+  lambda_stab:      0.05     # weight on stability loss (skip connection + f(0)=0 handle the rest)
   lr:               1.0e-3
   batch_size:       256
-  epochs:           500
+  epochs:           1000
   device:           cuda
-  max_joint_vel:    1.5      # rad/s clamp applied at deployment (per joint)
+  max_joint_vel:    2.0      # rad/s clamp applied at deployment (per joint)
 
 # ── Coordination ──────────────────────────────────────────────────────────────
 coordination:

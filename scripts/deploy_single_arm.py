@@ -52,17 +52,27 @@ def main():
     parser.add_argument("--arm", type=str, default="left", choices=["left", "right"])
     parser.add_argument("--config", type=str, default="configs/default.yaml")
     parser.add_argument("--ckpt_arm", type=str, default="both")
-    parser.add_argument("--max_steps", type=int, default=4000)
+    parser.add_argument("--max_steps", type=int, default=20000)
     parser.add_argument("--use_safe", action="store_true",
                         help="Apply Lyapunov projection at inference")
+    parser.add_argument("--alpha", type=float, default=None,
+                        help="Override Lyapunov decay rate at deployment "
+                             "(higher = more aggressive projection / faster convergence).")
     parser.add_argument("--headless", action="store_true")
     parser.add_argument("--done_tol", type=float, default=0.05,
                         help="L2 tolerance in joint space to declare primitive done.")
+    parser.add_argument("--log_csv", type=str, default=None,
+                        help="If set, write per-step diagnostics to this CSV "
+                             "for post-mortem plotting.")
+    parser.add_argument("--print_every", type=int, default=50,
+                        help="Print diagnostic line every N steps (0 = off).")
     args = parser.parse_args()
 
     from isaacsim import SimulationApp
-    simulation_app = SimulationApp({"headless": args.headless,
-                                    "width": 1280, "height": 720})
+    _app_cfg = {"headless": args.headless}
+    if not args.headless:
+        _app_cfg.update({"width": 1280, "height": 720})
+    simulation_app = SimulationApp(_app_cfg)
 
     from omni.isaac.core.utils.types import ArticulationAction
     from src.env import DualArmEnv
@@ -81,6 +91,12 @@ def main():
     primitives = ["reach", "grasp", "lift", "transport", "place"]
     ds_set = {p: load_ds(ckpt_dir / f"{args.ckpt_arm}_{p}.pt", device)
               for p in primitives}
+
+    # Override training alpha to drive faster Lyapunov decay at deployment
+    if args.alpha is not None:
+        for p in ds_set.values():
+            p["model"].alpha = args.alpha
+        print(f"[DEPLOY] Overriding alpha -> {args.alpha}")
 
     seq = TaskSequencer(env, cfg)
     physics_dt = cfg["sim"]["physics_dt"]
@@ -102,13 +118,26 @@ def main():
 
     last_primitive = seq.tasks[args.arm].current_primitive
     prim_steps = 0
-    # 4× the collection budget per primitive before we give up and advance
-    prim_timeout = {p: s * 4
+    # 30× the collection budget — very generous so a slow-converging DS
+    # has plenty of room before we give up and advance.
+    prim_timeout = {p: s * 30
                     for p, s in cfg["sim"]["steps_per_primitive"].items()}
 
     franka.gripper.apply_action(
         ArticulationAction(joint_positions=np.array([0.04, 0.04]))
     )
+
+    # Let blocks settle before querying their positions
+    for _ in range(60):
+        env.step(render=not args.headless)
+
+    csv_log = None
+    if args.log_csv is not None:
+        Path(args.log_csv).parent.mkdir(parents=True, exist_ok=True)
+        csv_log = open(args.log_csv, "w")
+        csv_log.write("step,primitive,prim_step,e_norm,V,"
+                      "qd_raw_norm,qd_norm,proj_delta,cos_to_goal\n")
+        print(f"[DEPLOY] Logging to {args.log_csv}")
 
     for step in range(args.max_steps):
         if not simulation_app.is_running():
@@ -121,6 +150,11 @@ def main():
         # If primitive changed since last step, refresh q_goal
         if task.current_primitive != last_primitive:
             update_q_goal(args.arm)
+            q_goal_dbg = task.q_goal
+            q_now_dbg  = franka.get_joint_positions()[:7]
+            init_e     = np.linalg.norm(q_now_dbg - q_goal_dbg)
+            print(f"[DEPLOY] -> {task.current_primitive:9s}  "
+                  f"q_goal={q_goal_dbg.round(2)}  init ||e||={init_e:.3f}")
             last_primitive = task.current_primitive
             prim_steps = 0
 
@@ -131,17 +165,59 @@ def main():
 
         # Build state & query DS
         ds  = ds_set[task.current_primitive]
-        x   = np.concatenate([q, q_goal])
+        x   = q - q_goal
         x_n = (x - ds["state_mean"]) / ds["state_std"]
         x_t = torch.tensor(x_n, dtype=torch.float32, device=device).unsqueeze(0)
+
+        # Always evaluate raw f for logging — cheap (single forward pass)
+        with torch.no_grad():
+            qd_n_raw = ds["model"](x_t)
         if args.use_safe:
-            qd_n = ds["model"].safe_velocity(x_t)
+            scale_factor = torch.tensor(
+                ds["vel_scale"] / ds["state_std"],
+                dtype=torch.float32, device=device).unsqueeze(0)
+            qd_n = ds["model"].safe_velocity(x_t, scale_factor=scale_factor)
         else:
-            with torch.no_grad():
-                qd_n = ds["model"](x_t)
-        q_dot = qd_n.cpu().numpy().squeeze(0) * ds["vel_scale"]
-        q_dot = np.clip(q_dot, -cfg["training"]["max_joint_vel"],
-                                cfg["training"]["max_joint_vel"])
+            qd_n = qd_n_raw
+
+        q_dot_raw = qd_n_raw.cpu().numpy().squeeze(0) * ds["vel_scale"]
+        q_dot     = qd_n.cpu().numpy().squeeze(0) * ds["vel_scale"]
+        q_dot_clipped = np.clip(q_dot, -cfg["training"]["max_joint_vel"],
+                                        cfg["training"]["max_joint_vel"])
+
+        # V value, useful for tracking convergence
+        with torch.no_grad():
+            V_val = ds["model"].V(x_t).item()
+
+        # Cosine between q_dot and -e: +1 means heading straight to goal,
+        # -1 means moving directly away. The single most diagnostic number.
+        e_norm = np.linalg.norm(x)
+        qd_norm = np.linalg.norm(q_dot_clipped)
+        cos_to_goal = (
+            -np.dot(x, q_dot_clipped) / (e_norm * qd_norm + 1e-9)
+            if e_norm * qd_norm > 1e-9 else 0.0
+        )
+
+        proj_correction = float(np.linalg.norm(q_dot - q_dot_raw))
+
+        if args.print_every and step % args.print_every == 0:
+            print(f"  step {step:5d} | {task.current_primitive:9s} | "
+                  f"||e||={e_norm:.3f}  V={V_val:7.3f}  "
+                  f"||qd_raw||={np.linalg.norm(q_dot_raw):.2f}  "
+                  f"||qd||={qd_norm:.2f}  "
+                  f"proj_Δ={proj_correction:.2f}  "
+                  f"cos→goal={cos_to_goal:+.2f}")
+
+        if args.log_csv is not None:
+            csv_log.write(
+                f"{step},{task.current_primitive},{prim_steps},"
+                f"{e_norm:.5f},{V_val:.5f},"
+                f"{np.linalg.norm(q_dot_raw):.5f},"
+                f"{qd_norm:.5f},{proj_correction:.5f},"
+                f"{cos_to_goal:.5f}\n"
+            )
+
+        q_dot = q_dot_clipped
 
         # Integrate to get joint position command
         q_cmd = q + q_dot * physics_dt
@@ -176,6 +252,8 @@ def main():
             prim_steps = 0
 
     print(f"[DEPLOY] Finished after {step + 1} steps.")
+    if csv_log is not None:
+        csv_log.close()
     simulation_app.close()
 
 

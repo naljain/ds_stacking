@@ -61,8 +61,11 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default="configs/default.yaml")
     parser.add_argument("--ckpt_arm", type=str, default="both")
-    parser.add_argument("--max_steps", type=int, default=8000)
+    parser.add_argument("--max_steps", type=int, default=30000)
     parser.add_argument("--use_safe", action="store_true")
+    parser.add_argument("--alpha", type=float, default=None,
+                        help="Override Lyapunov decay rate at deployment "
+                             "(higher = more aggressive projection).")
     parser.add_argument("--no_modulation", action="store_true",
                         help="Disable DS modulation (ablation).")
     parser.add_argument("--headless", action="store_true")
@@ -70,8 +73,10 @@ def main():
     args = parser.parse_args()
 
     from isaacsim import SimulationApp
-    simulation_app = SimulationApp({"headless": args.headless,
-                                    "width": 1280, "height": 720})
+    _app_cfg = {"headless": args.headless}
+    if not args.headless:
+        _app_cfg.update({"width": 1280, "height": 720})
+    simulation_app = SimulationApp(_app_cfg)
 
     from omni.isaac.core.utils.types import ArticulationAction
     from src.env import DualArmEnv
@@ -90,6 +95,12 @@ def main():
     ckpt_dir = Path(cfg["paths"]["checkpoints"])
     ds_set = load_ds_set(ckpt_dir, args.ckpt_arm, device)
 
+    # Override training alpha to drive faster Lyapunov decay at deployment
+    if args.alpha is not None:
+        for p in ds_set.values():
+            p["model"].alpha = args.alpha
+        print(f"[DEPLOY] Overriding alpha -> {args.alpha}")
+
     seq = TaskSequencer(env, cfg)
     mod = InterArmModulation(
         safe_radius=cfg["coordination"]["ee_safety_radius"],
@@ -103,6 +114,10 @@ def main():
         franka[arm].gripper.apply_action(
             ArticulationAction(joint_positions=np.array([0.04, 0.04]))
         )
+
+    # Let blocks settle before querying their positions
+    for _ in range(60):
+        env.step(render=not args.headless)
 
     # Initialise q_goals per arm
     def update_q_goal(arm):
@@ -120,7 +135,8 @@ def main():
 
     last_prim = {arm: seq.tasks[arm].current_primitive for arm in ("left", "right")}
     prim_steps = {"left": 0, "right": 0}
-    prim_timeout = {p: s * 4
+    # 30× the collection budget per primitive before we give up.
+    prim_timeout = {p: s * 30
                     for p, s in cfg["sim"]["steps_per_primitive"].items()}
 
     print(f"[DEPLOY] Dual-arm joint-space DS — safe={args.use_safe}, "
@@ -150,12 +166,15 @@ def main():
 
             q = franka[arm].get_joint_positions()[:7].copy()
             ds = ds_set[task.current_primitive]
-            x = np.concatenate([q, task.q_goal])
+            x = q - task.q_goal
             x_n = (x - ds["state_mean"]) / ds["state_std"]
             x_t = torch.tensor(x_n, dtype=torch.float32, device=device).unsqueeze(0)
 
             if args.use_safe:
-                qd_n = ds["model"].safe_velocity(x_t)
+                scale_factor = torch.tensor(
+                    ds["vel_scale"] / ds["state_std"],
+                    dtype=torch.float32, device=device).unsqueeze(0)
+                qd_n = ds["model"].safe_velocity(x_t, scale_factor=scale_factor)
             else:
                 with torch.no_grad():
                     qd_n = ds["model"](x_t)

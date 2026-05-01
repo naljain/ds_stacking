@@ -69,9 +69,12 @@ class TaskSequencer:
             self.tasks[arm] = ArmTaskState(arm, block_order, goal_xy)
 
         block_h = cfg["block"]["size"]
-        base_z  = cfg["table"]["height"] + block_h / 2
-        self.goal_z = base_z   # shared across both arms — single stack
+        self.base_z  = cfg["table"]["height"] + block_h / 2
         self.block_h = block_h + 0.002
+        # Per-arm block-placement counter — derived goal_z avoids the
+        # double-increment race when both arms complete "place" in the same
+        # physics step (which the old `self.goal_z += block_h` had).
+        self.placed_per_arm = {arm: 0 for arm in env.arms_active}
 
     def cartesian_target(self, arm):
         """Cartesian target for the current primitive on the given arm."""
@@ -101,10 +104,15 @@ class TaskSequencer:
             return grasp_quat_from_block(block_quat)
         return DEFAULT_DOWN_QUAT
 
+    @property
+    def goal_z(self):
+        n_total = sum(self.placed_per_arm.values())
+        return self.base_z + n_total * self.block_h
+
     def primitive_complete(self, arm):
         task = self.tasks[arm]
         if task.current_primitive == "place":
-            self.goal_z += self.block_h
+            self.placed_per_arm[arm] += 1
         task.advance_primitive()
 
     def gripper_action(self, arm):

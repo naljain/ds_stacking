@@ -153,9 +153,14 @@ class DualArmEnv:
         self.world.step(render=render)
 
     def reset_blocks(self, settle_steps=30, render=False):
-        """Teleport all blocks back to initial positions and let them settle."""
+        """Teleport all blocks back to initial positions AND identity
+        orientation, zero velocity. Without resetting orientation, blocks
+        accumulate rotation across demos which silently changes
+        grasp_quat_from_block(...) and corrupts training labels."""
+        identity_quat = np.array([1.0, 0.0, 0.0, 0.0])  # (w, x, y, z)
         for name, obj in self.blocks.items():
-            obj.set_world_pose(position=self.block_init[name])
+            obj.set_world_pose(position=self.block_init[name],
+                               orientation=identity_quat)
             obj.set_linear_velocity(np.zeros(3))
             obj.set_angular_velocity(np.zeros(3))
         for _ in range(settle_steps):

@@ -82,7 +82,8 @@ def run_one_trial(env, ds_set, seq, ik_kin, mod, franka, cfg,
                         [b["name"] for b in cfg["right_blocks"]]
         perturb_block = rng.choice(all_blocks)
 
-    prim_timeout = {p: s * 4
+    # 30× the collection budget per primitive before we give up.
+    prim_timeout = {p: s * 30
                     for p, s in cfg["sim"]["steps_per_primitive"].items()}
     prim_steps   = {"left": 0, "right": 0}
     max_joint_vel = cfg["training"]["max_joint_vel"]
@@ -136,12 +137,15 @@ def run_one_trial(env, ds_set, seq, ik_kin, mod, franka, cfg,
             prim_steps[arm] += 1
             q = franka[arm].get_joint_positions()[:7].copy()
             ds = ds_set[task.current_primitive]
-            x = np.concatenate([q, task.q_goal])
+            x = q - task.q_goal
             x_n = (x - ds["state_mean"]) / ds["state_std"]
             x_t = torch.tensor(x_n, dtype=torch.float32,
                                device=device).unsqueeze(0)
             if use_safe:
-                qd_n = ds["model"].safe_velocity(x_t)
+                scale_factor = torch.tensor(
+                    ds["vel_scale"] / ds["state_std"],
+                    dtype=torch.float32, device=device).unsqueeze(0)
+                qd_n = ds["model"].safe_velocity(x_t, scale_factor=scale_factor)
             else:
                 with torch.no_grad():
                     qd_n = ds["model"](x_t)
@@ -240,8 +244,10 @@ def main():
     args = parser.parse_args()
 
     from isaacsim import SimulationApp
-    simulation_app = SimulationApp({"headless": args.headless,
-                                    "width": 1280, "height": 720})
+    _app_cfg = {"headless": args.headless}
+    if not args.headless:
+        _app_cfg.update({"width": 1280, "height": 720})
+    simulation_app = SimulationApp(_app_cfg)
 
     from src.env import DualArmEnv
     from src.coordinator import TaskSequencer

@@ -44,16 +44,23 @@ def main():
     parser.add_argument("--n_demos",  type=int, default=50)
     parser.add_argument("--config",   type=str, default="configs/default.yaml")
     parser.add_argument("--headless", action="store_true")
-    parser.add_argument("--noise",    type=float, default=0.02,
+    parser.add_argument("--noise",    type=float, default=0.05,
                         help="Max XY noise added to block-target positions per demo.")
+    parser.add_argument("--start_jitter", type=float, default=0.15,
+                        help="Per-joint random start-pose perturbation (rad). "
+                             "Widens the demonstrated trajectory manifold so "
+                             "the DS doesn't overfit to one path.")
     args = parser.parse_args()
 
     from isaacsim import SimulationApp
-    simulation_app = SimulationApp({"headless": args.headless,
-                                    "width": 1280, "height": 720})
+    _app_cfg = {"headless": args.headless}
+    if not args.headless:
+        _app_cfg.update({"width": 1280, "height": 720})
+    simulation_app = SimulationApp(_app_cfg)
 
     from src.env import DualArmEnv
     from src.ik_controller import IKController
+    from src.franka_ik import FrankaIK
     from src.primitives import (primitive_target, PRIMITIVE_ORDER,
                                 grasp_quat_from_block)
 
@@ -62,6 +69,7 @@ def main():
     franka = env.frankas[args.arm]
 
     ik_motion = IKController(franka)
+    ik_kin    = FrankaIK(franka)
 
     block_names = [b["name"] for b in cfg[f"{args.arm}_blocks"]]
     goal_xy     = tuple(cfg["goals"][args.arm])
@@ -83,11 +91,25 @@ def main():
 
     print(f"\n[INFO] Collecting {args.n_demos} demos ({args.arm} arm).")
 
+    home_q = franka.get_joint_positions().copy()
+
     for demo_idx in range(args.n_demos):
         print(f"  Demo {demo_idx + 1}/{args.n_demos}")
         env.reset_blocks(render=not args.headless)
         ik_motion.reset()
         ik_motion.set_gripper(open=True)
+
+        # Randomise the starting joint pose so each demo's first reach starts
+        # from a different config. Without this, every demo's RMPflow path
+        # is essentially the same and the DS overfits to one trajectory shape.
+        if args.start_jitter > 0:
+            jitter = rng.uniform(-args.start_jitter, args.start_jitter,
+                                 size=7).astype(np.float32)
+            jittered = home_q.copy()
+            jittered[:7] += jitter
+            franka.set_joint_positions(jittered)
+            for _ in range(20):
+                env.world.step(render=not args.headless)
 
         demo_traj = []
         prev_q = franka.get_joint_positions()[:7].copy()
@@ -138,6 +160,11 @@ def main():
                     })
                     prev_q = q
 
+                # Reset prev_q so the first q_dot of this primitive is a clean
+                # forward-difference within the primitive, not contaminated by
+                # the retract or gripper-action motion that came before it.
+                prev_q = franka.get_joint_positions()[:7].copy()
+
                 ik_motion.move_to(
                     world=env.world,
                     target_pos=target_cart,
@@ -147,10 +174,15 @@ def main():
                     render=not args.headless,
                 )
 
-                # Label q_goal with where the arm actually settled — this is
-                # the joint config that q_dot was pointing toward throughout
-                # the primitive, so the DS training target is self-consistent.
-                q_goal = franka.get_joint_positions()[:7].copy()
+                # Compute q_goal via Lula IK seeded from the settled config.
+                # This matches exactly how deploy scripts compute q_goal at
+                # primitive transitions, so training and deployment see the
+                # same q_goal distribution (same null-space solution).
+                q_settled = franka.get_joint_positions()[:7].copy()
+                q_goal, ok = ik_kin.solve(
+                    target_cart, target_quat=target_quat, q_seed=q_settled)
+                if not ok:
+                    q_goal = q_settled
                 for step in prim_buf:
                     step["q_goal"] = q_goal
                 demo_traj.extend(prim_buf)
