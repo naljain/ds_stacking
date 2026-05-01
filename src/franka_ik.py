@@ -2,38 +2,48 @@
 IK utility for computing target joint configurations from Cartesian targets.
 
 Used in two places:
-  1. Data collection: at each primitive boundary, compute q_goal for the
-     recorded trajectory so we can label (q, q_goal, q̇) tuples.
-  2. Deployment: when a primitive completes, compute the new q_goal for the
-     next primitive's Cartesian goal. The DS then drives q -> q_goal in joint
-     space.
+  1. Data collection: compute q* per transport segment so trajectories are
+     labelled with consistent (q, q*, q_dot) tuples.
+  2. Deployment: compute q* for the transport target; DS drives q -> q*.
 
-We use Isaac Sim's Lula-based IK solver, which gives clean analytical solutions
-for the Franka. Falls back to a damped-least-squares numerical solver if Lula
-is unavailable.
+Elbow consistency guarantee
+---------------------------
+Even with a fixed seed, Lula can return solutions with different elbow
+configurations (joint 1 sign) depending on the Cartesian target. This causes
+visible elbow flips between demos and discontinuous training data.
+
+solve() now enforces that the returned solution stays in the same elbow
+homotopy class as the seed:
+  - After a successful solve, check that sign(q[1]) == sign(seed[1]).
+  - If the elbow flipped, retry up to `max_elbow_retries` times with a seed
+    that is nudged further into the desired elbow half-space.
+  - If all retries fail, return the seed (safe fallback, triggers the
+    existing [WARN] path in callers).
+
+This means collect_ik.py and deploy_single_arm.py need no changes — the
+consistency is enforced transparently inside solve().
 """
 
 import numpy as np
 
 try:
-    # Isaac Sim 5.x path
     from isaacsim.robot_motion.motion_generation.lula import LulaKinematicsSolver
     LULA_AVAILABLE = True
 except ImportError:
     try:
-        # Isaac Sim 4.x fallback
         from omni.isaac.motion_generation.lula import LulaKinematicsSolver
         LULA_AVAILABLE = True
     except ImportError:
         LULA_AVAILABLE = False
 
-
-# Default down-pointing gripper orientation (quaternion w,x,y,z)
 DEFAULT_DOWN_QUAT = np.array([0.0, 1.0, 0.0, 0.0])
+
+# How much to nudge joint 1 toward the desired sign on each retry (radians)
+_ELBOW_NUDGE = 0.15
 
 
 class FrankaIK:
-    """Wrapper around Lula IK for the Franka Panda."""
+    """Wrapper around Lula IK with elbow-consistency enforcement."""
 
     def __init__(self, franka, robot_description_path=None, urdf_path=None):
         self.franka = franka
@@ -42,10 +52,8 @@ class FrankaIK:
                 "Lula IK is not available. Install Isaac Sim motion_generation "
                 "extension or fall back to numerical IK."
             )
-        # Resolve default Franka description files shipped with Isaac Sim
         if robot_description_path is None or urdf_path is None:
             from isaacsim.core.utils.extensions import get_extension_path_from_name
-            # Try Isaac Sim 5.x extension name first, fall back to 4.x name
             mg_ext = None
             for ext_name in ("isaacsim.robot_motion.motion_generation",
                              "omni.isaac.motion_generation"):
@@ -60,9 +68,8 @@ class FrankaIK:
                     "Could not locate motion_generation extension. "
                     "Check your Isaac Sim install."
                 )
-            descriptor_dir = "rmp" + "flow"
             robot_description_path = robot_description_path or \
-                f"{mg_ext}/motion_policy_configs/franka/{descriptor_dir}/robot_descriptor.yaml"
+                f"{mg_ext}/motion_policy_configs/franka/rmpflow/robot_descriptor.yaml"
             urdf_path = urdf_path or \
                 f"{mg_ext}/motion_policy_configs/franka/lula_franka_gen.urdf"
 
@@ -70,21 +77,12 @@ class FrankaIK:
             robot_description_path=robot_description_path,
             urdf_path=urdf_path,
         )
-        # The Franka's TCP frame in the URDF
         self.ee_frame = "right_gripper"
 
-    def solve(self, target_pos, target_quat=None, q_seed=None):
-        """Return (q_goal, success) where q_goal is a 7-vector of target joint angles.
-        q_seed should be the current joint config to bias the solution."""
-        if target_quat is None:
-            target_quat = DEFAULT_DOWN_QUAT
-        if q_seed is None:
-            q_seed = self.franka.get_joint_positions()[:7]
-
-        # Robot base pose in world — needed because Lula solves in robot frame
+    def _solve_once(self, target_pos, target_quat, q_seed):
+        """Single Lula IK call. Returns (q, success)."""
         base_pos, base_rot = self.franka.get_world_pose()
         self.solver.set_robot_base_pose(base_pos, base_rot)
-
         action, success = self.solver.compute_inverse_kinematics(
             frame_name=self.ee_frame,
             target_position=target_pos,
@@ -92,39 +90,46 @@ class FrankaIK:
             warm_start=q_seed,
         )
         if success:
-            # Isaac Sim 5.x returns ndarray directly; 4.x returned ArticulationAction
             q = action if isinstance(action, np.ndarray) else action.joint_positions
             return q[:7].copy(), True
         return q_seed.copy(), False
 
-    def forward_position(self, q=None):
-        """Return the world position of the same Lula frame used for IK.
+    def solve(self, target_pos, target_quat=None, q_seed=None,
+              max_elbow_retries=5):
+        """Return (q*, success) with elbow consistency enforced.
 
-        Isaac's high-level Franka `end_effector` handle is not guaranteed to be
-        the exact same frame as Lula's `right_gripper`. Completion checks should
-        compare targets against this frame so IK success and Cartesian error use
-        the same geometry.
+        After a successful solve, if the elbow joint (joint 1) has flipped
+        sign relative to q_seed, the seed is nudged further into the desired
+        half-space and the solve is retried. This keeps all solutions in the
+        same homotopy class as the rest/default pose throughout a demo.
+
+        Args:
+            target_pos       : (3,) Cartesian target position
+            target_quat      : (4,) w,x,y,z orientation (default: down)
+            q_seed           : (7,) seed joints (default: current arm pose)
+            max_elbow_retries: how many times to retry on elbow flip
         """
-        if q is None:
-            q = self.franka.get_joint_positions()[:7]
+        if target_quat is None:
+            target_quat = DEFAULT_DOWN_QUAT
+        if q_seed is None:
+            q_seed = self.franka.get_joint_positions()[:7].copy()
 
-        base_pos, base_rot = self.franka.get_world_pose()
-        self.solver.set_robot_base_pose(base_pos, base_rot)
+        seed = q_seed.copy()
+        desired_elbow_sign = np.sign(seed[1]) if seed[1] != 0 else 1.0
 
-        try:
-            pose = self.solver.compute_forward_kinematics(
-                frame_name=self.ee_frame,
-                joint_positions=q,
-            )
-        except TypeError:
-            pose = self.solver.compute_forward_kinematics(self.ee_frame, q)
+        for attempt in range(max_elbow_retries + 1):
+            q, ok = self._solve_once(target_pos, target_quat, seed)
+            if not ok:
+                return q_seed.copy(), False
 
-        if isinstance(pose, tuple):
-            return np.asarray(pose[0], dtype=float).copy()
-        if hasattr(pose, "p"):
-            return np.asarray(pose.p, dtype=float).copy()
-        if hasattr(pose, "translation"):
-            return np.asarray(pose.translation, dtype=float).copy()
-        raise RuntimeError(
-            "Unsupported Lula FK return type from compute_forward_kinematics"
-        )
+            # Check elbow consistency
+            if np.sign(q[1]) == desired_elbow_sign or q[1] == 0:
+                return q, True
+
+            # Elbow flipped — nudge seed further into desired half-space
+            # and retry. Increase nudge each attempt.
+            seed = seed.copy()
+            seed[1] += desired_elbow_sign * _ELBOW_NUDGE * (attempt + 1)
+
+        # All retries failed to recover correct elbow — return seed as fallback
+        return q_seed.copy(), False

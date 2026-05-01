@@ -1,26 +1,110 @@
-"""
-Per-arm primitive sequencer.
+# Default config for dual-arm DS stacking project
 
-This is intentionally minimal: it just walks each arm through its block list
-in primitive order (reach -> grasp -> lift -> transport -> place) and bumps
-the stacking goal Z when 'place' completes. There is NO inter-arm collision
-logic here — that is handled smoothly and continuously by the DS modulation
-in src/modulation.py, so the closed-loop system remains a pure dynamical
-system rather than a hybrid system with discrete holds.
+# ── Scene geometry (metres) ────────────────────────────────────────────────────
+table:
+  height: 0.74
+  width:  1.20      # long side along X
+  depth:  0.70      # short side along Y
+  thick:  0.05
+  centre: [0.0, 0.45, 0.0]
 
-To compute joint-space goals q_goal for each primitive (needed by the joint-space
-DS), we use Isaac Sim's IK solver once per primitive transition, given the
-Cartesian target from primitives.primitive_target. The DS then drives toward
-that q_goal until the next primitive replaces it.
+block:
+  size: 0.045
+  mass: 0.05
+
+arms:
+  spacing: 0.60     # distance between left and right arm base in X
+  y:       0.0      # Y position of arm bases
+  face_table_quat: [0.7071, 0.0, 0.0, 0.7071]   # 90° around Z
+
+# ── Initial block layout ───────────────────────────────────────────────────────
+left_blocks:
+  - {name: block_red,    pos: [-0.40,  0.30, 0.7635], color: [1.0, 0.1, 0.1]}
+  - {name: block_orange, pos: [-0.40,  0.50, 0.7635], color: [1.0, 0.5, 0.0]}
+  - {name: block_pink,   pos: [-0.25,  0.40, 0.7635], color: [1.0, 0.4, 0.7]}
+
+right_blocks:
+  - {name: block_blue,   pos: [0.40,  0.30, 0.7635], color: [0.1, 0.3, 1.0]}
+  - {name: block_green,  pos: [0.40,  0.50, 0.7635], color: [0.1, 0.8, 0.1]}
+  - {name: block_yellow, pos: [0.25,  0.40, 0.7635], color: [1.0, 0.85, 0.0]}
+
+# Single shared stacking point at the centre of the table.
+# Both arms transport their blocks here and build one unified stack.
+shared_goal: [0.0, 0.65]
+
+# ── Motion primitive heights ──────────────────────────────────────────────────
+heights:
+  hover:  0.89    # table_height + 0.15 — pre-grasp hover
+  grasp:  0.75    # table_height + 0.01 — at block level
+  lift:   0.99    # table_height + 0.25 — transport altitude
+
+# ── Simulation ────────────────────────────────────────────────────────────────
+sim:
+  physics_dt:    0.00833    # 1/120
+  rendering_dt:  0.01667    # 1/60
+  steps_per_primitive:
+    reach:     120
+    grasp:     80
+    lift:      80
+    transport: 150
+    place:     80
+  gripper_steps: 30
+
+# ── Neural DS training ────────────────────────────────────────────────────────
+training:
+  state_dim:        14       # [q (7), q_goal (7)] — joint-space DS input
+  velocity_dim:     7        # joint velocity output
+  hidden_dim:       128
+  lyapunov_hidden:  64
+  alpha:            1.0      # Lyapunov decay rate
+  lambda_stab:      0.5      # weight on stability loss
+  lr:               1.0e-3
+  batch_size:       256
+  epochs:           500
+  device:           cuda
+
+# ── Coordination ──────────────────────────────────────────────────────────────
+coordination:
+  ee_safety_radius:    0.15    # arms back off if EE distance < this
+  hold_threshold:      0.20    # wait if other arm is closer than this to my goal
+  collision_check_hz:  60
+  yield_radius:        0.12    # arm waits to place if other EE is within this
+                               # distance of the shared stack goal (XY only)
+
+# ── Perturbations ─────────────────────────────────────────────────────────────
+perturbations:
+  block_displacement:
+    enabled: true
+    max_offset: 0.05    # max XY shift in metres
+  ee_disturbance:"""
+Per-arm primitive sequencer for shared-goal stacking.
+
+Both arms bring their blocks to a single shared_goal at the centre of the
+table and build one unified stack there.
+
+Key changes from the per-arm-goal version:
+  - ArmTaskState.goal_xy is the same shared point for both arms.
+  - There is a single global goal_z counter, incremented whenever *either*
+    arm completes a 'place'. This keeps the stack height correct regardless
+    of which arm placed last.
+  - can_place(arm) returns False when the other arm's EE is within
+    yield_radius (XY) of the stack goal AND that arm is currently in its
+    own 'place' or 'transport' primitive. This gives a simple discrete gate:
+    only one arm descends to place at a time. The DS modulation still handles
+    the smooth spatial avoidance; this gate is the higher-level "take turns"
+    rule that prevents simultaneous descents onto the same point.
+
+There is still NO discrete hold/release anywhere in the continuous DS loop
+(deploy_dual_arm.py). can_place() is only called at the primitive-completion
+check — if it returns False, seq.primitive_complete() is not called, so the
+arm stays at 'transport' (hovering above the stack) until the coast is clear.
 """
 
 import numpy as np
 
 from .primitives import (
     PRIMITIVE_ORDER,
-    DEFAULT_DOWN_QUAT,
     primitive_target,
-    grasp_quat_from_block,
     gripper_action_for_primitive,
 )
 
@@ -31,14 +115,11 @@ class ArmTaskState:
     def __init__(self, arm, block_order, goal_xy):
         self.arm         = arm
         self.block_order = list(block_order)
-        self.goal_xy     = goal_xy
+        self.goal_xy     = goal_xy          # shared goal for both arms
         self.current_block_idx = 0
         self.current_primitive = "reach"
         self.gripper_open      = True
-        self.q_goal = None    # set by the deployment loop after IK
-        self.reserved_goal_z = None
-        self.reserved_stack_slot = None
-        self.source_block_pos = None
+        self.q_goal = None    # set by deployment loop after IK
 
     @property
     def current_block(self):
@@ -53,33 +134,34 @@ class ArmTaskState:
         else:
             self.current_block_idx += 1
             self.current_primitive = "reach"
-            self.source_block_pos = None
 
     def is_done(self):
         return self.current_block_idx >= len(self.block_order)
 
 
 class TaskSequencer:
-    """Slim per-arm primitive sequencer. No collision arbitration."""
+    """Slim per-arm primitive sequencer with shared goal and place-yield gate."""
 
     def __init__(self, env, cfg):
         self.env = env
         self.cfg = cfg
 
+        # Both arms target the same shared goal xy
+        shared_xy = tuple(cfg["shared_goal"])
+
         self.tasks = {}
         for arm in env.arms_active:
             block_order = [b["name"] for b in cfg[f"{arm}_blocks"]]
-            goal_xy     = tuple(cfg["goals"][arm])
-            self.tasks[arm] = ArmTaskState(arm, block_order, goal_xy)
+            self.tasks[arm] = ArmTaskState(arm, block_order, shared_xy)
 
         block_h = cfg["block"]["size"]
-        self.base_z  = cfg["table"]["height"] + block_h / 2
+        base_z  = cfg["table"]["height"] + block_h / 2
+
+        # Single shared stack height — both arms read/write this
+        self.goal_z  = base_z
         self.block_h = block_h + 0.002
-        # Per-arm block-placement counter — derived goal_z avoids the
-        # double-increment race when both arms complete "place" in the same
-        # physics step (which the old `self.goal_z += block_h` had).
-        self.placed_per_arm = {arm: 0 for arm in env.arms_active}
-        self._next_stack_slot = 0
+
+        self.yield_radius = cfg["coordination"].get("yield_radius", 0.12)
 
     def cartesian_target(self, arm):
         """Cartesian target for the current primitive on the given arm."""
@@ -87,91 +169,59 @@ class TaskSequencer:
         if task.is_done():
             return None
         block_pos = self.env.get_block_positions()[task.current_block]
-        if task.current_primitive in ("reach", "grasp"):
-            task.source_block_pos = block_pos.copy()
-        elif task.current_primitive == "lift" and task.source_block_pos is not None:
-            block_pos = task.source_block_pos
-        goal_z = self._goal_z_for_task(task)
-        target = primitive_target(
+        return primitive_target(
             primitive=task.current_primitive,
             block_pos=block_pos,
             goal_xy=task.goal_xy,
-            goal_z=goal_z,
+            goal_z=self.goal_z,           # shared height
             hover_h=self.cfg["heights"]["hover"],
             lift_h =self.cfg["heights"]["lift"],
             grasp_h=self.cfg["heights"]["grasp"],
         )
-        if task.current_primitive == "transport":
-            target[2] = max(target[2], self.stack_clearance_z_for_task(task))
-        return target
 
-    def stack_clearance_z_for_task(self, task):
-        """Height that clears the current stack before lateral stack motion."""
-        goal_z = self._goal_z_for_task(task)
-        existing_stack_top = goal_z - self.cfg["block"]["size"] / 2
-        clearance = self.cfg.get("stack", {}).get("clearance_above_top", 0.12)
-        return max(self.cfg["heights"]["lift"], existing_stack_top + clearance)
+    def can_place(self, arm):
+        """Return True if this arm is allowed to proceed through 'place'.
 
-    def stack_clearance_target(self, arm):
-        """Cartesian clearance pose above the active/reserved stack slot."""
-        task = self.tasks[arm]
-        return np.array([
-            task.goal_xy[0],
-            task.goal_xy[1],
-            self.stack_clearance_z_for_task(task),
-        ])
+        Blocks the arm if the OTHER arm's EE is within yield_radius (XY) of
+        the shared stack goal AND the other arm is in 'transport' or 'place'
+        (i.e. it is also heading to or hovering over the stack).
 
-    def ee_orientation(self, arm):
-        """EE quaternion (w,x,y,z) for the current primitive.
-
-        Reach and grasp align to the block's yaw so fingers don't hit rotated
-        faces.  All other primitives use the default straight-down orientation.
+        This prevents two arms from descending onto the same point at once.
+        The DS modulation in modulation.py still handles all smooth spatial
+        avoidance; this is purely the "take turns descending" gate.
         """
-        task = self.tasks[arm]
-        if not task.is_done() and task.current_primitive in ("reach", "grasp"):
-            _, block_quat = self.env.get_block_poses()[task.current_block]
-            return grasp_quat_from_block(block_quat)
-        return DEFAULT_DOWN_QUAT
+        other = "right" if arm == "left" else "left"
+        if other not in self.tasks:
+            return True                       # single-arm mode, always go
+        other_task = self.tasks[other]
+        if other_task.is_done():
+            return True
+        if other_task.current_primitive not in ("transport", "place"):
+            return True
 
-    @property
-    def goal_z(self):
-        n_total = self._next_stack_slot
-        return self.base_z + n_total * self.block_h
-
-    def stack_target_position(self, arm):
-        """Center position for the active block's reserved stack slot."""
-        task = self.tasks[arm]
-        z = task.reserved_goal_z if task.reserved_goal_z is not None else self.goal_z
-        return np.array([task.goal_xy[0], task.goal_xy[1], z])
-
-    def stack_slot_index(self, arm):
-        return self.tasks[arm].reserved_stack_slot
-
-    def _goal_z_for_task(self, task):
-        """Reserve a unique shared-stack slot before the place primitive.
-
-        Both arms may run transport/place concurrently. If goal height is based
-        only on completed placements, two arms can target the same stack layer.
-        Reserving at target-generation time keeps the sequencing deterministic
-        without adding collision/hold logic to the coordinator.
-        """
-        if task.current_primitive in ("transport", "place"):
-            if task.reserved_goal_z is None:
-                task.reserved_stack_slot = self._next_stack_slot
-                task.reserved_goal_z = (
-                    self.base_z + task.reserved_stack_slot * self.block_h
-                )
-                self._next_stack_slot += 1
-            return task.reserved_goal_z
-        return self.goal_z
+        # Is the other arm's EE close to the stack goal in XY?
+        ee_other, _ = self.env.get_ee_pose(other)
+        gx, gy = self.tasks[arm].goal_xy
+        xy_dist = np.linalg.norm(ee_other[:2] - np.array([gx, gy]))
+        return xy_dist > self.yield_radius
 
     def primitive_complete(self, arm):
         task = self.tasks[arm]
         if task.current_primitive == "place":
-            self.placed_per_arm[arm] += 1
-            task.reserved_goal_z = None
-            task.reserved_stack_slot = None
+            self.goal_z += self.block_h    # shared counter advances once per place
         task.advance_primitive()
 
     def gripper_action(self, arm):
         return gripper_action_for_primitive(self.tasks[arm].current_primitive)
+    enabled: true
+    max_force: 5.0      # Newtons
+    duration: 0.2       # seconds
+  arm_block:
+    enabled: true
+    freeze_duration: 1.0    # seconds
+
+# ── Paths ─────────────────────────────────────────────────────────────────────
+paths:
+  demos:       data/demonstrations
+  checkpoints: data/checkpoints
+  results:     data/results

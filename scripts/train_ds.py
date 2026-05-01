@@ -104,6 +104,9 @@ def main():
     parser.add_argument("--arm", type=str, default="both",
                         choices=["left", "right", "both"])
     parser.add_argument("--config", type=str, default="configs/default.yaml")
+    parser.add_argument("--demos",  type=str, default=None,
+                        help="Path to a specific demos pkl (e.g. cleaned). "
+                             "Overrides the default per-arm path.")
     parser.add_argument("--epochs", type=int, default=None)
     args = parser.parse_args()
 
@@ -114,7 +117,9 @@ def main():
     device = torch.device(train_cfg["device"] if torch.cuda.is_available() else "cpu")
 
     demos_dir = Path(cfg["paths"]["demos"])
-    if args.arm == "both":
+    if args.demos:
+        demo_paths = [Path(args.demos)]
+    elif args.arm == "both":
         demo_paths = [demos_dir / "left_demos.pkl", demos_dir / "right_demos.pkl"]
     else:
         demo_paths = [demos_dir / f"{args.arm}_demos.pkl"]

@@ -1,18 +1,19 @@
 """
-Deploy joint-space Neural DS on a single arm.
+Deploy transport-only Neural DS on a single arm.
 
-The DS produces q_dot directly. We integrate q_dot to get a target joint
-position, send that as the command, and let Isaac Sim's articulation
-controller handle the low-level torque tracking. IK is used only at primitive
-transitions; inside a primitive, the closed-loop joint dynamics are the trained
-DS modulo actuator dynamics and optional deployment ablations.
+Workflow per block:
+  1. reach     — IK straight-line to hover above block
+  2. grasp     — IK straight-line descend, close gripper
+  3. lift      — IK straight-line raise to transport height
+  4. transport — Neural DS drives q -> q_goal (above shared stack)  ← learned
+  5. place     — IK straight-line descend, open gripper
 
-When a primitive transitions, we call Lula IK once to compute q_goal for the
-new Cartesian target, then keep that q_goal fixed until the next transition.
+Block positions are read from the sim at runtime (known perfectly).
+The DS q_goal is computed once via Lula IK at the transport target.
 
 Usage:
   python scripts/deploy_single_arm.py --arm left
-  python scripts/deploy_single_arm.py --arm left --use_safe   # Lyapunov projection
+  python scripts/deploy_single_arm.py --arm left --use_safe
 """
 
 import os
@@ -31,13 +32,12 @@ os.environ["CARB_LOG_LEVEL"] = "error"
 def load_ds(ckpt_path, device):
     from src.neural_ds import StableNeuralDS, N_JOINTS
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-    cfg = ckpt["config"]
+    cfg  = ckpt["config"]
     model = StableNeuralDS(
         n_joints    = N_JOINTS,
         hidden_dim  = cfg["hidden_dim"],
         lyap_hidden = cfg["lyapunov_hidden"],
         alpha       = cfg["alpha"],
-        stable_skip_gain = cfg.get("stable_skip_gain", 0.0),
     ).to(device)
     model.load_state_dict(ckpt["state_dict"])
     model.eval()
@@ -51,475 +51,178 @@ def load_ds(ckpt_path, device):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--arm", type=str, default="left", choices=["left", "right"])
-    parser.add_argument("--config", type=str, default="configs/default.yaml")
-    parser.add_argument("--ckpt_arm", type=str, default="both")
-    parser.add_argument("--max_steps", type=int, default=20000)
-    parser.add_argument("--use_safe", action="store_true",
-                        help="Apply Lyapunov projection at inference")
-    parser.add_argument("--alpha", type=float, default=None,
-                        help="Override Lyapunov decay rate at deployment "
-                             "(higher = more aggressive projection / faster convergence).")
-    parser.add_argument("--goal_gain", type=float, default=0.0,
-                        help="Add q_goal attraction term -gain*(q-q_goal) to "
-                             "the learned DS at deployment. Use this as a "
-                             "stabilizing ablation if the learned field points "
-                             "away from the attractor.")
-    parser.add_argument("--ds_scale", type=float, default=1.0,
-                        help="Scale learned DS velocity. Use 0 with "
-                             "--goal_gain for a pure joint-space attractor "
-                             "sanity check.")
-    parser.add_argument("--transport_ds_scale", type=float, default=None,
-                        help="Optional DS velocity scale used only for the "
-                             "transport primitive. Defaults to --ds_scale.")
-    parser.add_argument("--transport_goal_gain", type=float, default=0.0,
-                        help="Additional joint-space attraction gain used only "
-                             "for the transport primitive. This keeps transport "
-                             "DS in the loop while stabilizing a divergent "
-                             "transport field.")
-    parser.add_argument("--transport_min_radial_speed", type=float, default=0.0,
-                        help="For transport only, enforce a minimum inward "
-                             "joint-space radial speed toward q_goal in rad/s. "
-                             "This is a diagnostic flow guard for divergent "
-                             "transport checkpoints; 0 leaves the DS unchanged.")
-    parser.add_argument("--max_joint_vel", type=float, default=None,
-                        help="Deployment joint velocity clamp in rad/s. "
-                             "Defaults to training.max_joint_vel from config.")
-    parser.add_argument("--headless", action="store_true")
-    parser.add_argument("--done_tol", type=float, default=0.05,
-                        help="Legacy completion tolerance. Used as the default "
-                             "joint-space tolerance unless --joint_done_tol is set.")
-    parser.add_argument("--joint_done_tol", type=float, default=None,
-                        help="L2 joint-space tolerance for DS primitive completion. "
-                             "Defaults to --done_tol.")
-    parser.add_argument("--cart_done_tol", type=float, default=0.02,
-                        help="Cartesian EE tolerance in meters for IK primitive "
-                             "completion.")
-    parser.add_argument("--ds_reach_cart_done_tol", type=float, default=0.03,
-                        help="Cartesian EE tolerance in meters that can complete "
-                             "a DS reach primitive even when the redundant joint "
-                             "configuration does not match q_goal exactly.")
-    parser.add_argument("--grasp_cart_done_tol", type=float, default=None,
-                        help="Optional Cartesian tolerance in meters for IK grasp "
-                             "completion. Defaults to --cart_done_tol.")
-    parser.add_argument("--lift_cart_done_tol", type=float, default=0.03,
-                        help="Optional Cartesian tolerance in meters for IK lift "
-                             "completion. Defaults to 0.03 because lift only "
-                             "needs clearance, not placement precision.")
-    parser.add_argument("--transport_cart_done_tol", type=float, default=None,
-                        help="Optional Cartesian tolerance in meters for IK transport "
-                             "completion. Defaults to --cart_done_tol.")
-    parser.add_argument("--place_cart_done_tol", type=float, default=None,
-                        help="Optional Cartesian tolerance in meters for IK place "
-                             "completion. Defaults to --cart_done_tol.")
-    parser.add_argument("--log_csv", type=str, default=None,
-                        help="If set, write per-step diagnostics to this CSV "
-                             "for post-mortem plotting.")
-    parser.add_argument("--print_every", type=int, default=50,
-                        help="Print diagnostic line every N steps (0 = off).")
-    parser.add_argument("--debug_ik", action="store_true",
-                        help="Print IK target, success flag, and resulting "
-                             "joint goal at each primitive transition.")
-    parser.add_argument("--kinematic_carry", action="store_true",
-                        help="After grasp, attach the active block to the EE "
-                             "kinematically until place. Use this to debug the "
-                             "DS/task pipeline separately from gripper contact.")
-    parser.add_argument("--advance_on_timeout", action="store_true",
-                        help="Legacy debug behavior: advance to the next "
-                             "primitive on timeout even if q has not reached "
-                             "q_goal. Leave this off for pickup tests.")
-    parser.add_argument("--ik_primitives", type=str, default="grasp,lift,place",
-                        help="Comma-separated primitives to execute with the "
-                             "Lula joint-space controller instead of the "
-                             "learned DS.")
-    parser.add_argument("--ik_goal_gain", type=float, default=3.0,
-                        help="Joint-space attraction gain for "
-                             "Lula-controlled primitives.")
-    parser.add_argument("--post_place_lift_steps", type=int, default=80,
-                        help="After opening on place, lift the empty gripper "
-                             "back to transport height for this many joint-Lula "
-                             "steps before advancing to the next block. Use 0 "
-                             "to disable.")
-    parser.add_argument("--post_place_lift_tol", type=float, default=0.03,
-                        help="Cartesian tolerance in meters for the post-place "
-                             "empty-gripper lift.")
-    parser.add_argument("--debug_post_place_lift", action="store_true",
-                        help="Print post-place lift target and final EE error.")
+    parser.add_argument("--arm",       type=str, default="left", choices=["left", "right"])
+    parser.add_argument("--config",    type=str, default="configs/default.yaml")
+    parser.add_argument("--ckpt_arm",  type=str, default=None,
+                        help="Checkpoint arm label (default: same as --arm)")
+    parser.add_argument("--max_steps", type=int, default=2000,
+                        help="Max DS steps per transport primitive")
+    parser.add_argument("--use_safe",  action="store_true",
+                        help="Apply Lyapunov projection at inference (neural DS only)")
+    parser.add_argument("--model",     type=str, default="neural",
+                        choices=["neural", "lpvds"],
+                        help="DS model type: neural (default) or lpvds")
+    parser.add_argument("--headless",  action="store_true")
+    parser.add_argument("--done_tol",  type=float, default=0.05,
+                        help="EE distance (m) or joint L2 to declare transport done")
     args = parser.parse_args()
-    joint_done_tol = args.done_tol if args.joint_done_tol is None else args.joint_done_tol
 
-    def cart_done_tol_for(primitive):
-        if primitive == "grasp" and args.grasp_cart_done_tol is not None:
-            return args.grasp_cart_done_tol
-        if primitive == "lift" and args.lift_cart_done_tol is not None:
-            return args.lift_cart_done_tol
-        if primitive == "transport" and args.transport_cart_done_tol is not None:
-            return args.transport_cart_done_tol
-        if primitive == "place" and args.place_cart_done_tol is not None:
-            return args.place_cart_done_tol
-        return args.cart_done_tol
+    if args.ckpt_arm is None:
+        args.ckpt_arm = args.arm
 
     from isaacsim import SimulationApp
-    _app_cfg = {"headless": args.headless}
-    if not args.headless:
-        _app_cfg.update({"width": 1280, "height": 720})
-    simulation_app = SimulationApp(_app_cfg)
+    simulation_app = SimulationApp({"headless": args.headless,
+                                    "width": 1280, "height": 720})
 
-    try:
-        from isaacsim.core.utils.types import ArticulationAction
-    except ImportError:
-        from omni.isaac.core.utils.types import ArticulationAction
     from src.env import DualArmEnv
-    from src.coordinator import TaskSequencer
+    from src.ik_controller import IKController
     from src.franka_ik import FrankaIK
-    from src.primitives import (
-        DS_PRIMITIVES,
-        SCRIPTED_PRIMITIVES,
-        gripper_action_for_primitive,
-    )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    env = DualArmEnv(config_path=args.config, arms=(args.arm,))
-    cfg = env.cfg
+    env    = DualArmEnv(config_path=args.config, arms=(args.arm,))
+    cfg    = env.cfg
     franka = env.frankas[args.arm]
-    ik_kin = FrankaIK(franka)
-    ik_primitives = {p.strip() for p in args.ik_primitives.split(",") if p.strip()}
-    if not ik_primitives:
-        ik_primitives = set(SCRIPTED_PRIMITIVES)
-    valid_primitives = {"reach", "grasp", "lift", "transport", "place"}
-    bad_primitives = ik_primitives - valid_primitives
-    if bad_primitives:
-        raise ValueError(f"Unknown --ik_primitives entries: {sorted(bad_primitives)}")
 
+    default_joints = np.array(cfg["arms"][f"default_joints_{args.arm}"])
+    ik_motion = IKController(franka, arm=args.arm, rest_q=default_joints)
+    ik_kin    = FrankaIK(franka)
+
+    # Load transport DS — neural or LPVDS
     ckpt_dir = Path(cfg["paths"]["checkpoints"])
-    ds_primitives = [p for p in DS_PRIMITIVES if p not in ik_primitives]
-    ds_set = {p: load_ds(ckpt_dir / f"{args.ckpt_arm}_{p}.pt", device)
-              for p in ds_primitives}
+    if args.model == "lpvds":
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+        from src.lpv_ds import LPVDS
+        lpv_model = LPVDS.load(ckpt_dir / f"{args.ckpt_arm}_transport_lpvds.pkl")
+        ds = None  # not used
+    else:
+        ds = load_ds(ckpt_dir / f"{args.ckpt_arm}_transport.pt", device)
+        lpv_model = None
 
-    # Override training alpha to drive faster Lyapunov decay at deployment
-    if args.alpha is not None:
-        for p in ds_set.values():
-            p["model"].alpha = args.alpha
-        print(f"[DEPLOY] Overriding alpha -> {args.alpha}")
-
-    seq = TaskSequencer(env, cfg)
     physics_dt = cfg["sim"]["physics_dt"]
-    max_joint_vel = (cfg["training"]["max_joint_vel"]
-                     if args.max_joint_vel is None else args.max_joint_vel)
+    steps      = cfg["sim"]["steps_per_primitive"]
+    hover_h    = cfg["heights"]["hover"]
+    lift_h     = cfg["heights"]["lift"]
+    grasp_h    = cfg["heights"]["grasp"]
+    block_h    = cfg["block"]["size"]
+    goal_xy    = tuple(cfg["shared_goal"])
+    block_names = [b["name"] for b in cfg[f"{args.arm}_blocks"]]
 
-    # Compute initial q_goal for the first primitive
-    def update_q_goal(arm):
-        cart = seq.cartesian_target(arm)
-        if cart is None:
-            return None
-        q_seed = franka.get_joint_positions()[:7].copy()
-        ee_quat = seq.ee_orientation(arm)
-        q_goal, ok = ik_kin.solve(cart, target_quat=ee_quat, q_seed=q_seed)
-        if args.debug_ik:
-            print(f"[IK] {seq.tasks[arm].current_primitive:9s} ok={ok} "
-                  f"cart={cart.round(3)} seed={q_seed.round(3)} "
-                  f"q_goal={q_goal.round(3)} "
-                  f"||seed-goal||={np.linalg.norm(q_seed - q_goal):.3f}")
-        task = seq.tasks[arm]
-        if task.current_primitive in ("transport", "place"):
-            print(f"[STACK] {arm}/{task.current_primitive} "
-                  f"slot={seq.stack_slot_index(arm)} "
-                  f"block_center_z={task.reserved_goal_z:.3f} "
-                  f"ee_target_z={cart[2]:.3f}")
-        seq.tasks[arm].q_goal = q_goal
-        return q_goal
+    ee_down = np.array([0.0, 1.0, 0.0, 0.0])   # w,x,y,z straight down
 
-    update_q_goal(args.arm)
+    # Pre-place target: fixed position above the stack
+    transport_pos = np.array([goal_xy[0], goal_xy[1], lift_h])
 
-    print(f"[DEPLOY] Joint-space DS on {args.arm} arm — safe={args.use_safe}, "
-          f"goal_gain={args.goal_gain}, ds_scale={args.ds_scale}, "
-          f"max_joint_vel={max_joint_vel}")
+    # Compute transport q_goal once — it never changes (fixed target)
+    q_goal, ok = ik_kin.solve(transport_pos, target_quat=ee_down,
+                               q_seed=default_joints)
+    if not ok:
+        print("[WARN] IK failed for transport target, using seed")
 
-    last_primitive = seq.tasks[args.arm].current_primitive
-    prim_steps = 0
-    # 30× the collection budget — very generous so a slow-converging DS
-    # has plenty of room before we give up and advance.
-    prim_timeout = {p: s * 30
-                    for p, s in cfg["sim"]["steps_per_primitive"].items()}
+    goal_z = cfg["table"]["height"] + block_h / 2
 
-    franka.gripper.apply_action(
-        ArticulationAction(joint_positions=np.array([0.04, 0.04]))
-    )
+    print(f"[DEPLOY] Single-arm transport DS — arm={args.arm}  safe={args.use_safe}")
 
-    # Let blocks settle before querying their positions
-    for _ in range(60):
-        env.step(render=not args.headless)
-
-    csv_log = None
-    if args.log_csv is not None:
-        Path(args.log_csv).parent.mkdir(parents=True, exist_ok=True)
-        csv_log = open(args.log_csv, "w")
-        csv_log.write("step,primitive,prim_step,e_norm,V,"
-                      "qd_raw_norm,qd_norm,proj_delta,cos_to_goal\n")
-        print(f"[DEPLOY] Logging to {args.log_csv}")
-
-    held_block = None
-    held_offset = np.zeros(3)
-
-    def carry_held_block():
-        if held_block is None:
-            return
-        ee_pos = env.get_ee_pose(args.arm)[0].copy()
-        obj = env.get_block_obj(held_block)
-        obj.set_world_pose(position=ee_pos + held_offset,
-                           orientation=np.array([1.0, 0.0, 0.0, 0.0]))
-        obj.set_linear_velocity(np.zeros(3))
-        obj.set_angular_velocity(np.zeros(3))
-
-    def snap_held_block_to_stack():
-        if held_block is None:
-            return
-        obj = env.get_block_obj(held_block)
-        obj.set_world_pose(position=seq.stack_target_position(args.arm),
-                           orientation=np.array([1.0, 0.0, 0.0, 0.0]))
-        obj.set_linear_velocity(np.zeros(3))
-        obj.set_angular_velocity(np.zeros(3))
-
-    def ik_frame_position():
+    def _articulation_action(positions):
         try:
-            return ik_kin.forward_position(franka.get_joint_positions()[:7].copy())
-        except Exception as exc:
-            if args.debug_ik:
-                print(f"[WARN] Lula FK failed, using env EE pose: {exc}")
-            return env.get_ee_pose(args.arm)[0]
+            from isaacsim.core.utils.types import ArticulationAction
+        except ImportError:
+            from omni.isaac.core.utils.types import ArticulationAction
+        return ArticulationAction(joint_positions=positions)
 
-    def joint_lula_move_to_cart(target_cart, steps, cart_tol=None, label="joint_lula"):
-        if steps <= 0:
-            return False
-        if cart_tol is None:
-            cart_tol = args.post_place_lift_tol
-        start_ee = env.get_ee_pose(args.arm)[0].copy()
-        q_seed = franka.get_joint_positions()[:7].copy()
-        q_goal, ok = ik_kin.solve(target_cart, target_quat=None, q_seed=q_seed)
-        if not ok:
-            print(f"[WARN] {label} IK failed for target={target_cart.round(3)}")
-            return False
-        if args.debug_post_place_lift:
-            print(f"[POST_PLACE] target={target_cart.round(3)} "
-                  f"start_ee={start_ee.round(3)} "
-                  f"||q-q_goal||={np.linalg.norm(q_seed - q_goal):.3f}")
-        for _ in range(steps):
-            q_now = franka.get_joint_positions()[:7].copy()
-            ee_now = ik_frame_position()
-            if np.linalg.norm(ee_now - target_cart) < cart_tol:
+    for block_name in block_names:
+        block_pos = env.get_block_positions()[block_name].copy()
+        bx, by = block_pos[0], block_pos[1]
+        print(f"  [DEPLOY] Block {block_name} at ({bx:.3f}, {by:.3f})")
+
+        # ── 1. Reach ──────────────────────────────────────────────────────
+        ee_grasp = env.get_block_grasp_quat(block_name)
+        ik_motion.move_to(env.world, np.array([bx, by, hover_h]),
+                          target_quat=ee_grasp,
+                          steps=steps["reach"], render=not args.headless)
+
+        # ── 2. Grasp ──────────────────────────────────────────────────────
+        ik_motion.move_to(env.world, np.array([bx, by, grasp_h]),
+                          target_quat=ee_grasp,
+                          steps=steps["grasp"], render=not args.headless)
+        ik_motion.set_gripper(open=False)
+        for _ in range(cfg["sim"]["gripper_steps"]):
+            env.world.step(render=not args.headless)
+
+        # ── 3. Lift ───────────────────────────────────────────────────────
+        ik_motion.move_to(env.world, np.array([bx, by, lift_h]),
+                          target_quat=ee_down,
+                          steps=steps["lift"], render=not args.headless)
+
+        # ── 4. Transport — Neural DS ──────────────────────────────────────
+        print(f"  [DEPLOY] Transport DS running...")
+        for step in range(args.max_steps):
+            if not simulation_app.is_running():
                 break
-            err = q_now - q_goal
-            q_dot = np.clip(-args.ik_goal_gain * err, -max_joint_vel, max_joint_vel)
-            full_cmd = franka.get_joint_positions().copy()
-            full_cmd[:7] = q_now + q_dot * physics_dt
-            franka.apply_action(ArticulationAction(joint_positions=full_cmd))
-            env.step(render=not args.headless)
-        final_ee = ik_frame_position().copy()
-        final_err = np.linalg.norm(final_ee - target_cart)
-        if args.debug_post_place_lift:
-            print(f"[POST_PLACE] final_ee={final_ee.round(3)} "
-                  f"err={final_err:.3f}")
-        return final_err < cart_tol
 
-    for step in range(args.max_steps):
-        if not simulation_app.is_running():
-            break
-        task = seq.tasks[args.arm]
-        if task.is_done():
-            print("[DEPLOY] All blocks placed.")
-            break
+            q = franka.get_joint_positions()[:7].copy()
 
-        # If primitive changed since last step, refresh q_goal
-        if task.current_primitive != last_primitive:
-            update_q_goal(args.arm)
-            q_goal_dbg = task.q_goal
-            q_now_dbg  = franka.get_joint_positions()[:7]
-            init_e     = np.linalg.norm(q_now_dbg - q_goal_dbg)
-            print(f"[DEPLOY] -> {task.current_primitive:9s}  "
-                  f"q_goal={q_goal_dbg.round(2)}  init ||e||={init_e:.3f}")
-            last_primitive = task.current_primitive
-            prim_steps = 0
-
-        prim_steps += 1
-
-        q      = franka.get_joint_positions()[:7].copy()
-        q_goal = task.q_goal
-        cart_target = seq.cartesian_target(args.arm)
-        using_ik = task.current_primitive in ik_primitives
-
-        if using_ik:
-            V_val = 0.0
-            x = q - q_goal
-            e_norm = np.linalg.norm(x)
-            ee_err = np.linalg.norm(env.get_ee_pose(args.arm)[0] - cart_target)
-            q_dot_raw = -args.ik_goal_gain * x
-            q_dot_clipped = np.clip(q_dot_raw, -max_joint_vel, max_joint_vel)
-            qd_norm = np.linalg.norm(q_dot_clipped)
-            cos_to_goal = (
-                -np.dot(x, q_dot_clipped) / (e_norm * qd_norm + 1e-9)
-                if e_norm * qd_norm > 1e-9 else 0.0
-            )
-            proj_correction = 0.0
-        else:
-            # Build state & query DS
-            ds  = ds_set[task.current_primitive]
-            x   = q - q_goal
-            x_n = (x - ds["state_mean"]) / ds["state_std"]
-            x_t = torch.tensor(x_n, dtype=torch.float32, device=device).unsqueeze(0)
-
-            # Always evaluate raw f for logging — cheap (single forward pass)
-            with torch.no_grad():
-                qd_n_raw = ds["model"](x_t)
-            if args.use_safe:
-                scale_factor = torch.tensor(
-                    ds["vel_scale"] / ds["state_std"],
-                    dtype=torch.float32, device=device).unsqueeze(0)
-                qd_n = ds["model"].safe_velocity(x_t, scale_factor=scale_factor)
+            # Check convergence
+            if args.model == "lpvds":
+                ee_pos, _ = franka.end_effector.get_world_pose()
+                conv_dist = np.linalg.norm(np.array(ee_pos) - lpv_model.x_goal)
+                done = conv_dist < args.done_tol
             else:
-                qd_n = qd_n_raw
+                done = np.linalg.norm(q - q_goal) < args.done_tol
+            if done:
+                print(f"  [DEPLOY] Transport done in {step} steps")
+                break
 
-            q_dot_raw = qd_n_raw.cpu().numpy().squeeze(0) * ds["vel_scale"]
-            ds_scale = args.ds_scale
-            goal_gain = args.goal_gain
-            if task.current_primitive == "transport":
-                ds_scale = (args.transport_ds_scale
-                            if args.transport_ds_scale is not None else ds_scale)
-                goal_gain += args.transport_goal_gain
-            q_dot = ds_scale * qd_n.cpu().numpy().squeeze(0) * ds["vel_scale"]
-            if goal_gain > 0:
-                q_dot = q_dot - goal_gain * x
-            if (task.current_primitive == "transport"
-                    and args.transport_min_radial_speed > 0
-                    and np.linalg.norm(x) > 1e-9):
-                inward = -x / np.linalg.norm(x)
-                radial_speed = float(np.dot(q_dot, inward))
-                if radial_speed < args.transport_min_radial_speed:
-                    q_dot = q_dot + (
-                        args.transport_min_radial_speed - radial_speed
-                    ) * inward
-            q_dot_clipped = np.clip(q_dot, -max_joint_vel, max_joint_vel)
+            # Query DS
+            if args.model == "lpvds":
+                # Cartesian DS: integrate desired EE velocity one step forward,
+                # then solve IK for that target position. This avoids the
+                # finite-difference Jacobian which perturbs sim state.
+                ee_pos, _ = franka.end_effector.get_world_pose()
+                ee_pos    = np.array(ee_pos)
+                x_dot_des = lpv_model.predict(ee_pos)              # (3,) m/s
+                ee_next   = ee_pos + x_dot_des * physics_dt        # (3,) target
+                q_next, ok = ik_kin.solve(ee_next, target_quat=ee_down,
+                                          q_seed=q)
+                if not ok:
+                    q_next = q  # hold if IK fails
+                q_dot = (q_next - q) / physics_dt                  # (7,)
+            else:
+                x   = np.concatenate([q, q_goal])
+                x_n = (x - ds["state_mean"]) / ds["state_std"]
+                x_t = torch.tensor(x_n, dtype=torch.float32,
+                                   device=device).unsqueeze(0)
+                if args.use_safe:
+                    qd_n = ds["model"].safe_velocity(x_t)
+                else:
+                    with torch.no_grad():
+                        qd_n = ds["model"](x_t)
+                q_dot = qd_n.cpu().numpy().squeeze(0) * ds["vel_scale"]
 
-            # V value, useful for tracking convergence
-            with torch.no_grad():
-                V_val = ds["model"].V(x_t).item()
-
-            # Cosine between q_dot and -e: +1 means heading straight to goal,
-            # -1 means moving directly away. The single most diagnostic number.
-            e_norm = np.linalg.norm(x)
-            qd_norm = np.linalg.norm(q_dot_clipped)
-            cos_to_goal = (
-                -np.dot(x, q_dot_clipped) / (e_norm * qd_norm + 1e-9)
-                if e_norm * qd_norm > 1e-9 else 0.0
-            )
-            ee_err = np.linalg.norm(env.get_ee_pose(args.arm)[0] - cart_target)
-
-            proj_correction = float(np.linalg.norm(q_dot - q_dot_raw))
-
-        if args.print_every and step % args.print_every == 0:
-            q_cmd_preview = q + q_dot_clipped * physics_dt
-            print(f"  step {step:5d} | {task.current_primitive:9s} | "
-                  f"{'IK' if using_ik else 'DS'} | "
-                  f"||e||={e_norm:.3f}  V={V_val:7.3f}  "
-                  f"ee_err={ee_err:.3f}  "
-                  f"||qd_raw||={np.linalg.norm(q_dot_raw):.2f}  "
-                  f"||qd||={qd_norm:.2f}  "
-                  f"proj_Δ={proj_correction:.2f}  "
-                  f"cos→goal={cos_to_goal:+.2f}  "
-                  f"max|Δqcmd|={np.max(np.abs(q_cmd_preview - q)):.4f}")
-
-        if args.log_csv is not None:
-            csv_log.write(
-                f"{step},{task.current_primitive},{prim_steps},"
-                f"{e_norm:.5f},{V_val:.5f},"
-                f"{np.linalg.norm(q_dot_raw):.5f},"
-                f"{qd_norm:.5f},{proj_correction:.5f},"
-                f"{cos_to_goal:.5f}\n"
-            )
-
-        if using_ik:
-            q_cmd = q + q_dot_clipped * physics_dt
-            full_cmd = franka.get_joint_positions().copy()
-            full_cmd[:7] = q_cmd
-            franka.apply_action(ArticulationAction(joint_positions=full_cmd))
-        elif not using_ik:
-            q_dot = q_dot_clipped
-
-            # Integrate to get joint position command
+            # Integrate and command all 9 joints at once
             q_cmd = q + q_dot * physics_dt
-            full_cmd = franka.get_joint_positions().copy()
-            full_cmd[:7] = q_cmd
-            franka.apply_action(ArticulationAction(joint_positions=full_cmd))
-
-        env.step(render=not args.headless)
-        carry_held_block()
-
-        # Primitive completion: only convergence means success. A timeout is a
-        # controller failure for real pickup; advancing would close the gripper
-        # from the wrong pose and cascade into misleading downstream failures.
-        timed_out = prim_steps >= prim_timeout[task.current_primitive]
-        if using_ik:
-            ee_pos = ik_frame_position()
-            cart_err = np.linalg.norm(ee_pos - cart_target)
-            joint_err = np.linalg.norm(franka.get_joint_positions()[:7] - q_goal)
-            done_err = cart_err
-            converged = done_err < cart_done_tol_for(task.current_primitive)
-            done_label = "||ee-target||"
+            finger = ik_motion._finger_width
+            full_cmd = np.concatenate([q_cmd, [finger, finger]])
+            franka.apply_action(_articulation_action(full_cmd))
+            env.step(render=not args.headless)
         else:
-            joint_err = np.linalg.norm(q - q_goal)
-            cart_err = np.linalg.norm(ik_frame_position() - cart_target)
-            if task.current_primitive == "reach" and cart_err < args.ds_reach_cart_done_tol:
-                converged = True
-                done_err = cart_err
-                done_label = "||ee-target||"
-            else:
-                converged = joint_err < joint_done_tol
-                done_err = joint_err
-                done_label = "||q-q_goal||"
-        if converged or timed_out:
-            if timed_out and not converged:
-                print(f"[WARN] {task.current_primitive} timed out after "
-                      f"{prim_steps} steps ({done_label}={done_err:.3f})")
-                if not args.advance_on_timeout:
-                    print("[DEPLOY] Aborting instead of advancing. Use "
-                          "--advance_on_timeout only for phase-flow debugging.")
-                    break
-            grip = gripper_action_for_primitive(task.current_primitive)
-            if grip == "close":
-                franka.gripper.apply_action(
-                    ArticulationAction(joint_positions=np.array([0.0, 0.0]))
-                )
-                for _ in range(cfg["sim"]["gripper_steps"]):
-                    env.step(render=not args.headless)
-                if args.kinematic_carry:
-                    ee_pos = env.get_ee_pose(args.arm)[0].copy()
-                    block_pos = env.get_block_positions()[task.current_block].copy()
-                    held_block = task.current_block
-                    held_offset = block_pos - ee_pos
-                    carry_held_block()
-            elif grip == "open":
-                if args.kinematic_carry:
-                    snap_held_block_to_stack()
-                held_block = None
-                franka.gripper.apply_action(
-                    ArticulationAction(joint_positions=np.array([0.04, 0.04]))
-                )
-                for _ in range(cfg["sim"]["gripper_steps"]):
-                    env.step(render=not args.headless)
-                if args.post_place_lift_steps > 0:
-                    retract_cart = seq.stack_clearance_target(args.arm)
-                    joint_lula_move_to_cart(
-                        retract_cart,
-                        args.post_place_lift_steps,
-                        cart_tol=args.post_place_lift_tol,
-                        label="post-place lift",
-                    )
-            seq.primitive_complete(args.arm)
-            prim_steps = 0
+            print(f"  [WARN] Transport hit max_steps ({args.max_steps})")
 
-    print(f"[DEPLOY] Finished after {step + 1} steps.")
-    if csv_log is not None:
-        csv_log.close()
+        # ── 5. Place ──────────────────────────────────────────────────────
+        place_pos = np.array([goal_xy[0], goal_xy[1], goal_z + 0.02])
+        ik_motion.move_to(env.world, place_pos, target_quat=ee_down,
+                          steps=steps["place"], render=not args.headless)
+        ik_motion.set_gripper(open=True)
+        for _ in range(cfg["sim"]["gripper_steps"]):
+            env.world.step(render=not args.headless)
+
+        # Retract before next block
+        ik_motion.move_to(env.world, transport_pos, target_quat=ee_down,
+                          steps=60, render=not args.headless)
+
+        goal_z += block_h + 0.002
+
+    print("[DEPLOY] All blocks placed.")
     simulation_app.close()
 
 

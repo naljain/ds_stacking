@@ -9,16 +9,8 @@ table:
   centre: [0.0, 0.45, 0.0]
 
 block:
-  size: 0.05
+  size: 0.045
   mass: 0.05
-
-stack:
-  clearance_above_top: 0.12
-
-# arms:
-#   spacing: 0.60     # distance between left and right arm base in X
-#   y:       0.0      # Y position of arm bases
-#   face_table_quat: [0.7071, 0.0, 0.0, 0.7071]   # 90° around Z
 
 arms:
   spacing: 0.60     # distance between left and right arm base in X
@@ -33,25 +25,35 @@ arms:
   default_joints_left:  [ 1.93,  1.10, -1.8639, -2.6820,  1.0833,  1.9480, -0.1237]
   default_joints_right: [-1.93, 1.10, 1.8639, -2.6820,  -1.0833,  1.9480, 0.1237]
 
-# ── Initial block layout ───────────────────────────────────────────────────────
+# ── Block layout ───────────────────────────────────────────────────────────────
+# Fixed colors and names. Positions are randomised each demo within the
+# workspace bounds defined below — only the spawn Z is fixed (table surface).
 left_blocks:
-  - {name: block_red,    pos: [-0.40,  0.30, 0.765], color: [1.0, 0.1, 0.1]}
-  - {name: block_orange, pos: [-0.40,  0.50, 0.765], color: [1.0, 0.5, 0.0]}
-  - {name: block_pink,   pos: [-0.25,  0.40, 0.765], color: [1.0, 0.4, 0.7]}
+  - {name: block_red,    color: [1.0, 0.1, 0.1]}
+  - {name: block_orange, color: [1.0, 0.5, 0.0]}
+  - {name: block_pink,   color: [1.0, 0.4, 0.7]}
 
 right_blocks:
-  - {name: block_blue,   pos: [0.40,  0.30, 0.765], color: [0.1, 0.3, 1.0]}
-  - {name: block_green,  pos: [0.40,  0.50, 0.765], color: [0.1, 0.8, 0.1]}
-  - {name: block_yellow, pos: [0.25,  0.40, 0.765], color: [1.0, 0.85, 0.0]}
+  - {name: block_blue,   color: [0.1, 0.3, 1.0]}
+  - {name: block_green,  color: [0.1, 0.8, 0.1]}
+  - {name: block_yellow, color: [1.0, 0.85, 0.0]}
 
-goals:
-  left:  [0.0, 0.65]   # single shared stack — both arms transport to centre
-  right: [0.0, 0.65]
+# Per-arm workspace bounds for block randomisation [x_min, x_max, y_min, y_max].
+# Blocks are placed randomly within this region, keeping clear of the shared
+# goal area and the arm bases.  Z is always table_height + block_size/2.
+block_workspace:
+  left:  {x_min: -0.50, x_max: -0.15, y_min: 0.20, y_max: 0.60}
+  right: {x_min:  0.15, x_max:  0.50, y_min: 0.20, y_max: 0.60}
+  min_block_spacing: 0.08   # minimum distance between any two blocks (metres)
+
+# Single shared stacking point at the centre of the table.
+# Both arms transport their blocks here and build one unified stack.
+shared_goal: [0.0, 0.65]
 
 # ── Motion primitive heights ──────────────────────────────────────────────────
 heights:
-  hover:  0.95    # table_height + 0.21 — pre-grasp hover
-  grasp:  0.77    # table_height + 0.03 — fingertips at mid-block
+  hover:  0.89    # table_height + 0.15 — pre-grasp hover
+  grasp:  0.75    # table_height + 0.01 — at block level
   lift:   0.99    # table_height + 0.25 — transport altitude
 
 # ── Simulation ────────────────────────────────────────────────────────────────
@@ -60,36 +62,32 @@ sim:
   rendering_dt:  0.01667    # 1/60
   steps_per_primitive:
     reach:     120
-    grasp:     60
+    grasp:     80
     lift:      80
     transport: 150
     place:     80
   gripper_steps: 30
-  inter_primitive_pause_steps: 120
 
 # ── Neural DS training ────────────────────────────────────────────────────────
 training:
-  state_dim:        7        # e = q - q_goal — error-based DS input
+  state_dim:        14       # [q (7), q_goal (7)] — joint-space DS input
   velocity_dim:     7        # joint velocity output
   hidden_dim:       128
   lyapunov_hidden:  64
   alpha:            1.0      # Lyapunov decay rate
-  lambda_stab:      0.05     # light Lyapunov regularizer; do not let it dominate imitation
-  stable_skip_gain: 1.0      # convergent linear prior baked into the architecture
-                             # (f(e) = residual(e) - gain * e). 0 means pure NN
-                             # residual, which trains poorly when demos are noisy.
+  lambda_stab:      0.5      # weight on stability loss
   lr:               1.0e-3
   batch_size:       256
-  epochs:           1000
+  epochs:           500
   device:           cuda
-  max_joint_vel:    1.5      # rad/s clamp applied at deployment (per joint)
 
 # ── Coordination ──────────────────────────────────────────────────────────────
 coordination:
   ee_safety_radius:    0.15    # arms back off if EE distance < this
   hold_threshold:      0.20    # wait if other arm is closer than this to my goal
   collision_check_hz:  60
-  start_stagger_steps: 2400    # 20.0 s at 120 Hz; right arm starts after left
+  yield_radius:        0.12    # arm waits to place if other EE is within this
+                               # distance of the shared stack goal (XY only)
 
 # ── Perturbations ─────────────────────────────────────────────────────────────
 perturbations:
