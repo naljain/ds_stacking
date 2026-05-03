@@ -28,9 +28,9 @@ right_blocks:
   - {name: block_green,  pos: [0.40,  0.50, 0.7635], color: [0.1, 0.8, 0.1]}
   - {name: block_yellow, pos: [0.25,  0.40, 0.7635], color: [1.0, 0.85, 0.0]}
 
-# Single shared stacking point at the centre of the table.
+# Single shared stacking point near the centre of the table.
 # Both arms transport their blocks here and build one unified stack.
-shared_goal: [0.0, 0.65]
+shared_goal: [0.0, 0.45]
 
 # ── Motion primitive heights ──────────────────────────────────────────────────
 heights:

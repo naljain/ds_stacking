@@ -128,7 +128,7 @@ def main():
                 nonlocal prev_q, prev_ee
                 q      = franka.get_joint_positions()[:7].copy()
                 q_dot  = (q - prev_q) / physics_dt
-                ee_pos = franka.end_effector.get_world_pose()[0].copy()
+                ee_pos = ik_kin.get_world_pose()[0].copy()
                 ee_vel = (ee_pos - prev_ee) / physics_dt                          if prev_ee is not None else np.zeros(3)
                 demo_traj.append({
                     "q":         q,
@@ -136,6 +136,7 @@ def main():
                     "q_goal":    q_goal.copy(),
                     "ee_pos":    ee_pos,
                     "ee_vel":    ee_vel,
+                    "physics_dt": physics_dt,
                     "primitive": "transport",
                     "block":     block_name,
                     "arm":       args.arm,

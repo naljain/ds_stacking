@@ -331,7 +331,7 @@ def main():
     ik_kin = {a: FrankaIK(franka[a]) for a in franka}
     mod = InterArmModulation(
         safe_radius=cfg["coordination"]["ee_safety_radius"],
-        reactivity=4.0,
+        reactivity=cfg["coordination"].get("modulation_reactivity", 2.0),
     )
 
     results = {cond: [] for cond in args.conditions}

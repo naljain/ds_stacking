@@ -39,16 +39,17 @@ right_blocks:
   - {name: block_yellow, color: [1.0, 0.85, 0.0]}
 
 # Per-arm workspace bounds for block randomisation [x_min, x_max, y_min, y_max].
-# Blocks are placed randomly within this region, keeping clear of the shared
-# goal area and the arm bases.  Z is always table_height + block_size/2.
+# Blocks are picked from each arm's own side of the table; both arms then
+# transport into the shared central stacking workspace.
+# Z is always table_height + block_size/2.
 block_workspace:
   left:  {x_min: -0.50, x_max: -0.15, y_min: 0.20, y_max: 0.60}
   right: {x_min:  0.15, x_max:  0.50, y_min: 0.20, y_max: 0.60}
   min_block_spacing: 0.08   # minimum distance between any two blocks (metres)
 
-# Single shared stacking point at the centre of the table.
+# Single shared stacking point near the centre of the table.
 # Both arms transport their blocks here and build one unified stack.
-shared_goal: [0.0, 0.65]
+shared_goal: [0.0, 0.45]
 
 # ── Motion primitive heights ──────────────────────────────────────────────────
 heights:
@@ -83,8 +84,9 @@ training:
 
 # ── Coordination ──────────────────────────────────────────────────────────────
 coordination:
-  ee_safety_radius:    0.15    # arms back off if EE distance < this
-  hold_threshold:      0.20    # wait if other arm is closer than this to my goal
+  ee_safety_radius:    0.30    # spherical modulation radius around each EE
+  modulation_reactivity: 2.0   # Γ=(d/R)^p; lower p makes avoidance start earlier
+  hold_threshold:      0.30    # wait if other arm is closer than this to my goal
   collision_check_hz:  60
   yield_radius:        0.12    # arm waits to place if other EE is within this
                                # distance of the shared stack goal (XY only)

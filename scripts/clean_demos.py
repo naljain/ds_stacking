@@ -179,8 +179,7 @@ def main():
     print(f"[CLEAN] Saved {len(clean_demos)} demos "
           f"({n_steps_out} steps, was {n_steps_in}) → {out_path}")
     print(f"[CLEAN] To train on clean data:")
-    print(f"  python scripts/train_ds.py --primitive transport --arm {args.arm} "
-          f"--demos {out_path}")
+    print(f"  python scripts/train_lpvds.py --arm {args.arm} --demos {out_path}")
 
 
 if __name__ == "__main__":

@@ -104,12 +104,16 @@ class HuberModulation:
     # ── Construct E(x), the basis aligned with reference direction ─────────
     def _build_basis(self, r):
         """Return a 3x3 orthonormal matrix whose first column is r."""
-        # Use SVD of (I - r r^T) to get an orthonormal complement
-        P = np.eye(3) - np.outer(r, r)
-        U, _, _ = np.linalg.svd(P)
-        # First two columns of U span the tangent plane to r
-        t1 = U[:, 0]
-        t2 = U[:, 1]
+        r = r / (np.linalg.norm(r) + 1e-12)
+        # Match the MEAM HW 3D construction: normal plus two tangents.  Choose
+        # a helper axis that is not parallel to r, then Gram-Schmidt.
+        helper = np.array([1.0, 0.0, 0.0])
+        if abs(np.dot(helper, r)) > 0.9:
+            helper = np.array([0.0, 1.0, 0.0])
+        t1 = helper - np.dot(helper, r) * r
+        t1 = t1 / (np.linalg.norm(t1) + 1e-12)
+        t2 = np.cross(r, t1)
+        t2 = t2 / (np.linalg.norm(t2) + 1e-12)
         return np.column_stack([r, t1, t2])
 
     # ── Modulation matrix M(x) = E D E^T ────────────────────────────────────
@@ -120,8 +124,9 @@ class HuberModulation:
         damping when the velocity already points outward.
         """
         Γ = self.gamma(x, x_obs)
-        # Far away → no modulation
-        if Γ > 50.0:
+        # Far away -> no modulation. Keep this threshold generous so a larger
+        # EE safety sphere creates an early, smooth avoidance field.
+        if Γ > 100.0:
             return np.eye(3)
 
         r = self.reference_direction(x, x_obs)

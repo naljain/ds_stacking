@@ -38,6 +38,11 @@ except ImportError:
 
 DEFAULT_DOWN_QUAT = np.array([0.0, 1.0, 0.0, 0.0])
 
+# Use Lula's nominal gripper frame for Cartesian DS state and IK targets.
+# Isaac's Franka wrapper reports /panda_rightfinger as end_effector, which is
+# a different frame; read this frame via Lula FK instead of mixing the two.
+DEFAULT_EE_FRAME = "right_gripper"
+
 # How much to nudge joint 1 toward the desired sign on each retry (radians)
 _ELBOW_NUDGE = 0.15
 
@@ -77,7 +82,28 @@ class FrankaIK:
             robot_description_path=robot_description_path,
             urdf_path=urdf_path,
         )
-        self.ee_frame = "right_gripper"
+        self.ee_frame = DEFAULT_EE_FRAME
+
+    def get_world_pose(self, q=None):
+        """Return the Lula EE frame pose in world coordinates.
+
+        This is the pose that should be used for Cartesian DS state whenever
+        IK targets are solved for self.ee_frame.  It avoids mixing Isaac's
+        /panda_rightfinger prim with Lula's synthetic right_gripper frame.
+        """
+        if q is None:
+            q = self.franka.get_joint_positions()[:7].copy()
+        base_pos, base_rot = self.franka.get_world_pose()
+        self.solver.set_robot_base_pose(base_pos, base_rot)
+        pos, rot = self.solver.compute_forward_kinematics(self.ee_frame, q)
+        try:
+            from scipy.spatial.transform import Rotation
+            quat_xyzw = Rotation.from_matrix(rot).as_quat()
+            quat_wxyz = np.array([quat_xyzw[3], quat_xyzw[0],
+                                  quat_xyzw[1], quat_xyzw[2]])
+        except Exception:
+            quat_wxyz = None
+        return np.asarray(pos), quat_wxyz
 
     def _solve_once(self, target_pos, target_quat, q_seed):
         """Single Lula IK call. Returns (q, success)."""

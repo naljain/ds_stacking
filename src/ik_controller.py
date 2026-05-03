@@ -113,6 +113,7 @@ class IKController:
         ])
         ArticulationAction = _articulation_action()
         self.franka.apply_action(ArticulationAction(joint_positions=full_cmd))
+        return ok
 
     # ── Straight-line move with trapezoidal velocity profile ─────────────────
     def move_to(self, world, target_pos, target_quat=None, steps=120,
@@ -126,7 +127,7 @@ class IKController:
         if target_quat is None:
             target_quat = DEFAULT_DOWN_QUAT
 
-        ee_start, _ = self.franka.end_effector.get_world_pose()
+        ee_start, _ = self.ik.get_world_pose()
         ee_start = np.array(ee_start).copy()
         ee_end   = np.array(target_pos).copy()
 
@@ -135,9 +136,9 @@ class IKController:
         for s in s_values:
             waypoint = ee_start + s * (ee_end - ee_start)
             self.step_to(waypoint, target_quat)
+            world.step(render=render)
             if record_callback is not None:
                 record_callback()
-            world.step(render=render)
 
 
 # ── Trapezoidal velocity profile ─────────────────────────────────────────────
