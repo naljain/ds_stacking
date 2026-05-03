@@ -2,13 +2,15 @@
 Joint-space trajectory collection for joint-space Neural DS training.
 
 For each demo, scripts the arm through the full pick-and-stack sequence on its
-3 blocks using RMPflow as the underlying motion generator, but records:
+3 blocks. By default it computes the same Lula q_goal used at deployment and
+records a joint-space expert moving toward that attractor. The older Cartesian
+RMPflow expert remains available with --motion_source rmpflow.
 
     q       (7,)   joint positions  (excludes finger joints)
     q_dot   (7,)   joint velocities (finite-diff)
-    q_goal  (7,)   target joint configuration for the active primitive
-                   (the joint config where RMPflow actually settled — sampled
-                    after move_to completes so labels are consistent with q_dot)
+    q_goal  (7,)   target joint configuration for the active primitive.
+                   By default this is the Lula target used by the joint-space
+                   expert and by deployment.
 
 Also recorded for bookkeeping:
     primitive   str   one of {reach, grasp, lift, transport, place}
@@ -17,8 +19,8 @@ Also recorded for bookkeeping:
 
 Saved to data/demonstrations/{arm}_demos.pkl as a list of demos.
 
-The DS will be trained to map [q, q_goal] -> q_dot, learning a goal-conditioned
-joint-space velocity field.
+The DS will be trained to map q - q_goal -> q_dot, learning an error-space
+joint velocity field for each primitive.
 
 Usage:
   python scripts/collect_ik.py --arm left  --n_demos 50
@@ -57,8 +59,10 @@ def main():
                              "Widens the demonstrated trajectory manifold so "
                              "the DS doesn't overfit to one path.")
     parser.add_argument("--settle_tol", type=float, default=0.01,
-                        help="Extra RMPflow settling tolerance in Cartesian EE "
-                             "position before switching primitives.")
+                        help="Extra settling tolerance before switching "
+                             "primitives. Cartesian EE tolerance for rmpflow; "
+                             "joint tolerance is controlled by --joint_done_tol "
+                             "for joint_lula.")
     parser.add_argument("--settle_extra_steps", type=int, default=60,
                         help="Max extra controller steps used to settle at each "
                              "primitive target.")
@@ -70,6 +74,37 @@ def main():
                              "Default collection kinematically carries the "
                              "active block after grasp so DS demos are not "
                              "discarded due contact-grasp flakiness.")
+    parser.add_argument("--motion_source", type=str, default="joint_lula",
+                        choices=["joint_lula", "rmpflow"],
+                        help="Expert used to generate joint-space demos. "
+                             "'joint_lula' computes the same Lula q_goal used "
+                             "at deployment, then records joint-space motion "
+                             "toward that attractor. 'rmpflow' preserves the "
+                             "older Cartesian RMPflow collection path.")
+    parser.add_argument("--q_goal_source", type=str, default="lula",
+                        choices=["settled", "lula"],
+                        help="How to label q_goal in collected samples. "
+                             "'lula' uses the deployment-style Lula IK target. "
+                             "'settled' uses the terminal expert joint state "
+                             "and is mainly useful when auditing rmpflow.")
+    parser.add_argument("--joint_goal_gain", type=float, default=3.0,
+                        help="First-order joint-space expert gain used by "
+                             "--motion_source joint_lula.")
+    parser.add_argument("--joint_done_tol", type=float, default=0.03,
+                        help="Joint-space tolerance for early stopping in "
+                             "--motion_source joint_lula.")
+    parser.add_argument("--direct_joint_set", action="store_true", default=True,
+                        help="For --motion_source joint_lula, set joint "
+                             "positions directly along the generated demo "
+                             "trajectory instead of relying on articulation "
+                             "position-controller tracking. Useful when Isaac "
+                             "tracking lags make q_settled differ from q_goal.")
+    parser.add_argument("--track_joint_commands", dest="direct_joint_set",
+                        action="store_false",
+                        help="For --motion_source joint_lula, use articulation "
+                             "position command tracking instead of direct joint "
+                             "sets. This is diagnostic only; tracking lag can "
+                             "produce inconsistent q_goal labels.")
     args = parser.parse_args()
 
     from isaacsim import SimulationApp
@@ -83,6 +118,7 @@ def main():
     from src.franka_ik import FrankaIK
     from src.primitives import (primitive_target, PRIMITIVE_ORDER,
                                 grasp_quat_from_block)
+    from omni.isaac.core.utils.types import ArticulationAction
 
     env = DualArmEnv(config_path=args.config, arms=(args.arm,))
     cfg = env.cfg
@@ -117,6 +153,10 @@ def main():
     if not args.physical_grasp:
         print("[INFO] Kinematic block carry is ON for collection "
               "(use --physical_grasp to require contact grasps).")
+    if args.motion_source == "joint_lula" and args.q_goal_source != "lula":
+        print("[INFO] --motion_source joint_lula requires q_goal_source=lula; "
+              "overriding q_goal_source.")
+        args.q_goal_source = "lula"
 
     def reset_arm_to_start():
         franka.set_joint_positions(home_q)
@@ -150,8 +190,8 @@ def main():
                 env.world.step(render=not args.headless)
 
         # Randomise the starting joint pose so each demo's first reach starts
-        # from a different config. Without this, every demo's RMPflow path
-        # is essentially the same and the DS overfits to one trajectory shape.
+        # from a different config. Without this, every demo's path is
+        # essentially the same and the DS overfits to one trajectory shape.
         if args.start_jitter > 0:
             jitter = rng.uniform(-args.start_jitter, args.start_jitter,
                                  size=7).astype(np.float32)
@@ -192,7 +232,7 @@ def main():
             aligned_quat = grasp_quat_from_block(block_quat)
 
             for primitive in PRIMITIVE_ORDER:
-                # Cartesian target for RMPflow
+                # Cartesian target for this primitive.
                 target_cart = primitive_target(
                     primitive=primitive,
                     block_pos=noisy_pos,
@@ -207,8 +247,8 @@ def main():
                 # for lift / transport / place (block orientation no longer matters).
                 target_quat = aligned_quat if primitive in ("reach", "grasp") else None
 
-                # Buffer this primitive's steps; q_goal is filled in retroactively
-                # below once we know where RMPflow actually settled.
+                # Buffer this primitive's steps; q_goal is filled in once the
+                # primitive attractor is known.
                 prim_buf = []
 
                 def record():
@@ -231,29 +271,83 @@ def main():
                 # the retract or gripper-action motion that came before it.
                 prev_q = franka.get_joint_positions()[:7].copy()
 
-                ik_motion.move_to(
-                    world=env.world,
-                    target_pos=target_cart,
-                    target_quat=target_quat,
-                    steps=steps[primitive],
-                    record_callback=record,
-                    render=not args.headless,
-                    stop_tolerance=args.settle_tol,
-                    max_extra_steps=args.settle_extra_steps,
-                    post_step_callback=carry_held_block,
-                )
-
-                # Compute q_goal via Lula IK seeded from the settled config.
-                # This matches exactly how deploy scripts compute q_goal at
-                # primitive transitions, so training and deployment see the
-                # same q_goal distribution (same null-space solution).
-                q_settled = franka.get_joint_positions()[:7].copy()
-                q_goal, ok = ik_kin.solve(
-                    target_cart, target_quat=target_quat, q_seed=q_settled)
+                q_seed = franka.get_joint_positions()[:7].copy()
+                q_goal_lula, ok = ik_kin.solve(
+                    target_cart, target_quat=target_quat, q_seed=q_seed)
                 if not ok:
-                    q_goal = q_settled
+                    print(f"    [WARN] Lula IK failed for {primitive}; "
+                          "using current q as q_goal.")
+                    q_goal_lula = q_seed
+
+                if args.motion_source == "joint_lula":
+                    # Generate the expert in the same joint-error space used by
+                    # deployment. This avoids training on RMPflow's null-space
+                    # choice while deploying to a different Lula q_goal.
+                    max_joint_vel = cfg["training"]["max_joint_vel"]
+                    q_start = franka.get_joint_positions().copy()
+                    dist = float(np.max(np.abs(q_goal_lula - q_start[:7])))
+                    min_steps = int(np.ceil(dist / (max_joint_vel * physics_dt)))
+                    n_steps = max(steps[primitive], min_steps) + args.settle_extra_steps
+                    n_steps = max(n_steps, 2)
+                    prev_q = q_start[:7].copy()
+
+                    for i in range(1, n_steps + 1):
+                        s = i / n_steps
+                        q_cmd = q_start.copy()
+                        q_cmd[:7] = q_start[:7] + s * (q_goal_lula - q_start[:7])
+                        if args.direct_joint_set:
+                            franka.set_joint_positions(q_cmd)
+                        else:
+                            franka.apply_action(
+                                ArticulationAction(joint_positions=q_cmd)
+                            )
+                        env.world.step(render=not args.headless)
+                        carry_held_block()
+                        record()
+                    if args.direct_joint_set:
+                        q_final = franka.get_joint_positions().copy()
+                        q_final[:7] = q_goal_lula
+                        franka.set_joint_positions(q_final)
+                        env.world.step(render=not args.headless)
+                        carry_held_block()
+                        record()
+                    q_settled = franka.get_joint_positions()[:7].copy()
+                else:
+                    ik_motion.move_to(
+                        world=env.world,
+                        target_pos=target_cart,
+                        target_quat=target_quat,
+                        steps=steps[primitive],
+                        record_callback=record,
+                        render=not args.headless,
+                        stop_tolerance=args.settle_tol,
+                        max_extra_steps=args.settle_extra_steps,
+                        post_step_callback=carry_held_block,
+                    )
+
+                    # RMPflow can settle at a different redundant-arm
+                    # null-space configuration than a fresh Lula IK solve.
+                    q_settled = franka.get_joint_positions()[:7].copy()
+                    q_goal_lula_after, ok_after = ik_kin.solve(
+                        target_cart, target_quat=target_quat, q_seed=q_settled)
+                    if ok_after:
+                        q_goal_lula = q_goal_lula_after
+                        ok = ok_after
+
+                q_goal = q_settled if args.q_goal_source == "settled" else q_goal_lula
+                q_goal_lula_error = float(np.linalg.norm(q_settled - q_goal_lula))
+                if q_goal_lula_error > 0.25:
+                    print(f"    [WARN] {primitive} Lula q_goal differs from "
+                          f"expert settled q by {q_goal_lula_error:.3f} rad; "
+                          f"label_source={args.q_goal_source}")
                 for step in prim_buf:
                     step["q_goal"] = q_goal
+                    step["q_goal_source"] = args.q_goal_source
+                    step["motion_source"] = args.motion_source
+                    step["q_goal_settled"] = q_settled
+                    step["q_goal_lula"] = q_goal_lula
+                    step["q_goal_lula_ok"] = bool(ok)
+                    step["q_goal_lula_error"] = q_goal_lula_error
                 demo_traj.extend(prim_buf)
 
                 if primitive == "grasp":

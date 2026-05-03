@@ -13,11 +13,22 @@ closed-loop a pure dynamical system.
 
 ## Why joint-space DS?
 
-The DS is trained directly on `q̇ = f(q, q*)` where `q` is the 7-DOF Franka
-joint configuration and `q*` is the target joint configuration for the
-current primitive. At deployment the network's output is sent to the robot
-verbatim — no IK, no integration-and-retarget — so the closed-loop joint
-dynamics are exactly the trained DS modulo low-level actuator dynamics.
+The DS is trained directly on `q̇ = f(e)` where
+`e = q - q_goal`, `q` is the 7-DOF Franka joint configuration, and `q_goal`
+is the target joint configuration for the current primitive. At deployment,
+Lula IK is queried once at each primitive transition to compute `q_goal`; then
+the network output is integrated as joint-position commands until the primitive
+converges. There is no Cartesian controller or IK inside the control loop.
+
+The model is parameterized as a stable error-space DS:
+
+```text
+f(e_n) = residual_theta(e_n) - stable_skip_gain * e_n
+```
+
+where `e_n` is normalized joint error. The stable skip is part of the learned
+DS architecture and is trained together with the residual; it is different from
+deployment-only `--goal_gain`, which is only a diagnostic controller.
 
 This means:
   - Lyapunov stability claims hold in the actual control space.
@@ -64,15 +75,16 @@ ds_stacking/
 ├── src/
 │   ├── env.py               # Isaac Sim scene with two Frankas + table + blocks
 │   ├── primitives.py        # Primitive Cartesian targets + completion checks
-│   ├── ik_controller.py     # RMPflow wrapper (used at data-collection only)
-│   ├── franka_ik.py         # Lula IK wrapper for q* lookup
+│   ├── ik_controller.py     # RMPflow wrapper (legacy collection option)
+│   ├── franka_ik.py         # Lula IK wrapper for q_goal lookup
 │   ├── neural_ds.py         # Joint-space Neural DS + Lyapunov network
 │   ├── modulation.py        # DS modulation matrices for collision avoidance
 │   ├── coordinator.py       # Slim primitive sequencer (no FSM)
 │   └── perturbations.py     # Perturbation injectors for evaluation
 ├── scripts/
 │   ├── smoke_test.py        # Verify the scene loads
-│   ├── collect_ik.py        # Generate (q, q*, q̇) demos with RMPflow
+│   ├── collect_ik.py        # Generate (q, q_goal, q̇) joint-space demos
+│   ├── audit_demo_labels.py # Check primitive/q_goal label consistency
 │   ├── teleop.py            # Manual demo collection
 │   ├── train_ds.py          # Train Neural DS for one primitive
 │   ├── train_all.sh         # Train all 5 primitives sequentially
@@ -96,22 +108,28 @@ ds_stacking/
 python scripts/smoke_test.py
 
 # 2. Collect demos (joint-space)
-python scripts/collect_ik.py --arm left  --n_demos 50
-python scripts/collect_ik.py --arm right --n_demos 50
+python scripts/collect_ik.py --arm left  --n_demos 50 --headless
+python scripts/collect_ik.py --arm right --n_demos 50 --headless
 
-# 3. Train all 5 primitives (joint-space DS + Lyapunov)
+# 3. Audit demo labels before training
+python scripts/audit_demo_labels.py data/demonstrations/left_demos.pkl data/demonstrations/right_demos.pkl
+
+# 4. Train all 5 primitives from pooled left+right demos
 bash scripts/train_all.sh
 
-# 4. Validate on one arm
-python scripts/deploy_single_arm.py --arm left
+# 5. Pure learned-DS validation on one arm
+python scripts/deploy_single_arm.py --arm left --kinematic_carry --use_safe --ds_scale 1.0 --goal_gain 0.0 --done_tol 0.25 --print_every 25 --debug_ik --log_csv data/results/left_pure_ds.csv
 
-# 5. Deploy dual-arm with modulation
-python scripts/deploy_dual_arm.py
+# 6. Deploy dual-arm with modulation
+python scripts/deploy_dual_arm.py --kinematic_carry --use_safe --ds_scale 1.0 --goal_gain 0.0 --done_tol 0.25
 
-# 6. Run evaluation suite
-python scripts/evaluate.py --n_trials 10
+# 7. Run pure learned-DS evaluation
+python scripts/evaluate.py --n_trials 10 --use_safe --ds_scale 1.0 --goal_gain 0.0 --done_tol 0.25
 
-# 7. Ablations for the writeup
+# 8. Plot all learned primitive DS fields and rollouts
+python scripts/plot_ds.py --all --ckpt_arm both --use_safe --joints 0 1 --out_dir data/results/ds_plots
+
+# 9. Ablations for the writeup
 python scripts/evaluate.py --no_modulation                # collision-avoidance ablation
 python scripts/evaluate.py --use_safe                     # Lyapunov projection
 ```
@@ -119,6 +137,36 @@ python scripts/evaluate.py --use_safe                     # Lyapunov projection
 If collection settings change, rerun from step 2 onward. The trained DS is only
 as good as the saved demonstrations, so demos with missed grasps, target-noise
 artifacts, or jerky primitive transitions should not be reused.
+
+For focused single-arm debugging, train left-only checkpoints before judging the
+learned DS:
+
+```bash
+python scripts/train_ds.py --primitive reach --arm left
+python scripts/train_ds.py --primitive grasp --arm left
+python scripts/train_ds.py --primitive lift --arm left
+python scripts/train_ds.py --primitive transport --arm left
+python scripts/train_ds.py --primitive place --arm left
+
+python scripts/deploy_single_arm.py --arm left --ckpt_arm left --kinematic_carry --use_safe --ds_scale 1.0 --goal_gain 0.0 --done_tol 0.25 --print_every 25 --debug_ik --log_csv data/results/left_pure_ds.csv
+```
+
+Timeouts are failures in deployment and evaluation unless
+`--advance_on_timeout` is explicitly passed for phase-flow debugging.
+
+Diagnostic controllers such as `--goal_gain > 0`, `--ds_scale < 1`, or
+`--ds_scale 0` are useful for isolating IK/actuation problems, but they are not
+the learned-DS method and should not be reported as the main result.
+
+To debug the learned vector fields directly, plot every primitive checkpoint:
+
+```bash
+python scripts/plot_ds.py --all --ckpt_arm both --use_safe --joints 0 1 --out_dir data/results/ds_plots
+```
+
+This creates loss curves, 2D phase portraits, Lyapunov landscapes, and closed-loop
+rollouts for `reach`, `grasp`, `lift`, `transport`, and `place`. Use `--ckpt_arm
+left` after left-only retraining.
 
 ## Setup
 
@@ -143,22 +191,78 @@ asset server.
 
 ## Data Collection Notes
 
-`collect_ik.py` uses RMPflow only for demonstration collection. The default
-collection path is conservative: it targets the observed block pose directly,
-uses no block jitter, and uses no target noise. Keep legacy target noise
-`--noise` at `0` for reliable grasp demos; nonzero target noise commands the
-gripper beside the observed block and can produce failed grasps.
+`collect_ik.py` now defaults to `--motion_source joint_lula`. For each
+primitive it computes the same Lula `q_goal` used by deployment, then records a
+joint-space expert trajectory moving toward that attractor. This keeps the
+training label `q_goal` and the demonstrated `q_dot` in the same joint-space DS.
+
+The older Cartesian RMPflow collection path is still available with
+`--motion_source rmpflow`, but it is diagnostic only for the pure joint-space DS
+pipeline because RMPflow and Lula can choose different redundant-arm null-space
+solutions for the same Cartesian target.
+
+The default collection path is conservative: it targets the observed block pose
+directly, uses no block jitter, and uses no target noise. Keep legacy target
+noise `--noise` at `0` for reliable grasp demos; nonzero target noise commands
+the gripper beside the observed block and can produce failed grasps.
 
 After the base grasp is reliable, `--block_xy_jitter` can be used to move the
 physical blocks and widen the data distribution without commanding grasps away
 from the cube.
 
-Collection adds extra RMPflow settling steps before switching primitives. By
-default, after `grasp` it kinematically carries the active block with the EE so
-clean joint-space demos are not discarded because Isaac contact grasping is
-flaky. Use `--physical_grasp` when you explicitly want to test whether the
-parallel gripper/contact setup can lift the cube; in that mode failed lifts are
-discarded.
+With `--motion_source joint_lula`, collection uses extra joint-space settling
+steps before switching primitives. With `--motion_source rmpflow`, those same
+extra steps are RMPflow settling steps. By default, after `grasp` collection
+kinematically carries the active block with the EE so clean joint-space demos
+are not discarded because Isaac contact grasping is flaky. Use `--physical_grasp`
+when you explicitly want to test whether the parallel gripper/contact setup can
+lift the cube; in that mode failed lifts are discarded.
+
+`q_goal` labels matter as much as primitive labels. The default collection mode
+uses `--motion_source joint_lula --q_goal_source lula`, so each sample's
+attractor is the same style of Lula joint target used at deployment. The
+collector also stores the terminal expert state as metadata (`q_goal_settled`,
+`q_goal_lula_error`) so mismatches can be audited. If you use the legacy
+`--motion_source rmpflow` path, large `q_goal_lula_error` values mean RMPflow is
+moving toward a different null-space solution than deployment will use.
+
+Before training, run:
+
+```bash
+python scripts/audit_demo_labels.py data/demonstrations/left_demos.pkl data/demonstrations/right_demos.pkl
+```
+
+For each primitive, the final `||q - q_goal||` should be small and
+`cos(q_dot, -error)` should usually be positive. Large final errors or a high
+fraction of negative cosines mean the DS is being trained on inconsistent
+attractor labels.
+
+## Data Partitioning for DS Training
+
+The demonstration pickle for an arm contains full pick-and-stack trajectories,
+not one file per primitive. Every recorded timestep stores a `primitive` label.
+`scripts/train_ds.py` partitions the data by filtering on that label:
+
+```text
+reach samples     -> *_reach.pt
+grasp samples     -> *_grasp.pt
+lift samples      -> *_lift.pt
+transport samples -> *_transport.pt
+place samples     -> *_place.pt
+```
+
+The `--arm` flag controls which files are pooled:
+
+| Training command | Source demos | Checkpoint prefix |
+|---|---|---|
+| `--arm left` | `left_demos.pkl` | `left_*` |
+| `--arm right` | `right_demos.pkl` | `right_*` |
+| `--arm both` | left + right demos | `both_*` |
+
+Each checkpoint now stores a `data_manifest` with the primitive label, source
+demo files, total sample count, samples by file, samples by arm, and samples by
+block. The same information is printed during training so it is explicit which
+data trained each DS.
 
 ## Primitives
 
@@ -173,8 +277,8 @@ Each pick-and-stack sequence decomposes into 5 learned primitives:
 | `place`     | descend onto stack | IK of place pose |
 
 Each primitive has its own `f_theta` and `V_phi` networks. At a primitive
-transition, Lula IK is queried once to compute the new `q*`; the DS then
-drives `q -> q*` smoothly until the next transition.
+transition, Lula IK is queried once to compute the new `q_goal`; the DS then
+drives `q -> q_goal` smoothly until the next transition.
 
 ## Dual-Arm Coordination
 
@@ -198,13 +302,17 @@ carry offset instead of the coordinator's stack layer.
 
 If a newly trained DS does not converge at deployment, inspect
 `cos→goal` in `deploy_single_arm.py`. Negative values mean the learned vector
-field is pointing away from `q_goal`. For debugging or a stabilizing ablation,
-run with `--goal_gain 1.0`, which adds a linear attraction term toward `q_goal`
-while still evaluating the learned DS velocity.
+field is pointing away from `q_goal`. The pure learned-DS setting is
+`--ds_scale 1.0 --goal_gain 0.0`. Any nonzero `--goal_gain` adds a hand-coded
+linear attractor and is diagnostic only.
+
+Single-arm deployment aborts on primitive timeout by default. This prevents a
+failed `reach` from cascading into a false `grasp`. Use `--advance_on_timeout`
+only for phase-flow debugging.
 
 ## Stability
 
-Per-primitive: `V(q, q*)` is positive-definite around `q*` by construction;
+Per-primitive: `V(e)` is positive-definite around `e = q - q_goal = 0` by construction;
 training enforces `dV/dt + α·V <= 0` on the data distribution; inference can
 optionally project `f(x)` onto the half-space where this holds exactly
 (`--use_safe`).

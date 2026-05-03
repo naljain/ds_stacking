@@ -8,7 +8,7 @@ Key difference from the previous (FSM-coordinator) version:
   - Inter-arm collision avoidance is handled by a state-dependent modulation
     matrix M(x_self, x_other) applied to each arm's velocity. The modulated
     velocity smoothly tangents along the safety-sphere of the other arm's EE.
-  - Closed-loop: q̇_self = J_self^+ · M(ee_self, ee_other) · J_self · f(q, q*)
+  - Closed-loop: q̇_self = J_self^+ · M(ee_self, ee_other) · J_self · f(q - q_goal)
     The whole system is therefore a coupled dynamical system, not a hybrid
     system with discrete events.
 
@@ -45,6 +45,7 @@ def load_ds_set(ckpt_dir, ckpt_arm, device):
             hidden_dim  = cfg["hidden_dim"],
             lyap_hidden = cfg["lyapunov_hidden"],
             alpha       = cfg["alpha"],
+            stable_skip_gain = cfg.get("stable_skip_gain", 0.0),
         ).to(device)
         model.load_state_dict(ckpt["state_dict"])
         model.eval()
@@ -86,6 +87,9 @@ def main():
                         help="After grasp, attach each active block to its EE "
                              "kinematically until place. Use this to debug the "
                              "DS/task pipeline separately from gripper contact.")
+    parser.add_argument("--advance_on_timeout", action="store_true",
+                        help="Legacy debug behavior: advance a primitive on "
+                             "timeout even when q has not reached q_goal.")
     parser.add_argument("--headless", action="store_true")
     parser.add_argument("--done_tol", type=float, default=0.05)
     args = parser.parse_args()
@@ -272,7 +276,12 @@ def main():
                 if timed_out and not converged:
                     print(f"[WARN] {arm}/{task.current_primitive} timed out "
                           f"after {prim_steps[arm]} steps "
-                          f"(||q-q*||={np.linalg.norm(q - task.q_goal):.3f})")
+                          f"(||q-q_goal||={np.linalg.norm(q - task.q_goal):.3f})")
+                    if not args.advance_on_timeout:
+                        print("[DEPLOY] Aborting instead of advancing. Use "
+                              "--advance_on_timeout only for phase-flow debugging.")
+                        simulation_app.close()
+                        return
                 grip = gripper_action_for_primitive(task.current_primitive)
                 if grip == "close":
                     franka[arm].gripper.apply_action(

@@ -8,10 +8,10 @@ logic here — that is handled smoothly and continuously by the DS modulation
 in src/modulation.py, so the closed-loop system remains a pure dynamical
 system rather than a hybrid system with discrete holds.
 
-To compute joint-space goals q* for each primitive (needed by the joint-space
+To compute joint-space goals q_goal for each primitive (needed by the joint-space
 DS), we use Isaac Sim's IK solver once per primitive transition, given the
 Cartesian target from primitives.primitive_target. The DS then drives toward
-that q* until the next primitive replaces it.
+that q_goal until the next primitive replaces it.
 """
 
 import numpy as np

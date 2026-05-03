@@ -67,6 +67,9 @@ def run_one_trial(env, ds_set, seq, ik_kin, mod, franka, cfg,
         "grasp_attempts": 0,
         "grasp_failures": 0,
         "collisions":     0,
+        "timed_out":      False,
+        "timeout_arm":    None,
+        "timeout_primitive": None,
         "duration_s":     0.0,
     }
 
@@ -199,13 +202,21 @@ def run_one_trial(env, ds_set, seq, ik_kin, mod, franka, cfg,
         env.step(render=render)
 
         # Primitive completion
+        trial_failed = False
         for arm in ("left", "right"):
             task = seq.tasks[arm]
             if task.is_done():
                 continue
             q = franka[arm].get_joint_positions()[:7]
             timed_out = prim_steps[arm] >= prim_timeout[task.current_primitive]
-            if np.linalg.norm(q - task.q_goal) < done_tol or timed_out:
+            converged = np.linalg.norm(q - task.q_goal) < done_tol
+            if timed_out and not converged:
+                metrics["timed_out"] = True
+                metrics["timeout_arm"] = arm
+                metrics["timeout_primitive"] = task.current_primitive
+                trial_failed = True
+                break
+            if converged:
                 grip = gripper_action_for_primitive(task.current_primitive)
                 if task.current_primitive == "grasp":
                     metrics["grasp_attempts"] += 1
@@ -228,6 +239,9 @@ def run_one_trial(env, ds_set, seq, ik_kin, mod, franka, cfg,
                         metrics["grasp_failures"] += 1
                 seq.primitive_complete(arm)
                 prim_steps[arm] = 0
+
+        if trial_failed:
+            break
 
         if all(seq.tasks[a].is_done() for a in ("left", "right")):
             metrics["completed"] = True

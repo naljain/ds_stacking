@@ -1,15 +1,15 @@
 """
 Joint-space Neural Dynamical System with learned Lyapunov function.
 
-State:    e = q - q* ∈ R^7   (joint error relative to current goal)
+State:    e = q - q_goal ∈ R^7   (joint error relative to current goal)
 Velocity: q̇ = f_theta(e) ∈ R^7
 
-Using the error e = q - q* as input rather than [q, q*] ∈ R^14 eliminates
+Using the error e = q - q_goal as input rather than [q, q_goal] ∈ R^14 eliminates
 the null-space distribution mismatch: the error distribution (large at
 primitive start, zero at goal) is the same regardless of which IK solver
-computed q*. The [q, q*] formulation caused q* to appear OOD at deployment
+computed q_goal. The [q, q_goal] formulation caused q_goal to appear OOD at deployment
 because RMPflow and Lula IK settle to different null-space configurations,
-making state_std for q* dimensions near zero during training.
+making state_std for q_goal dimensions near zero during training.
 
 Lyapunov candidate (positive definite around e=0 by construction):
     V(e) = ||g(e) - g(0)||² + epsilon * ||e||²
@@ -27,10 +27,12 @@ STATE_DIM = N_JOINTS      # e = q - q_goal (7)
 
 
 class NeuralDS(nn.Module):
-    """Joint-velocity field f_theta(q, q*) -> R^7."""
+    """Joint-velocity field f_theta(q - q_goal) -> R^7."""
 
-    def __init__(self, state_dim=STATE_DIM, hidden_dim=128, n_joints=N_JOINTS):
+    def __init__(self, state_dim=STATE_DIM, hidden_dim=128, n_joints=N_JOINTS,
+                 stable_skip_gain=0.0):
         super().__init__()
+        self.stable_skip_gain = stable_skip_gain
         self.net = nn.Sequential(
             nn.Linear(state_dim, hidden_dim),
             nn.Tanh(),
@@ -40,12 +42,12 @@ class NeuralDS(nn.Module):
         )
 
     def forward(self, x):
-        # f(x) = net(x) - net(0) guarantees f(0) = 0 (hard equilibrium at the
-        # goal). No -x skip: it gets cancelled during training (net learns
-        # net(x) ≈ x + residual), which was hurting OOD behaviour. Convergence
-        # is now provided by the Lyapunov projection at deployment (--use_safe).
+        # net(x) - net(0) guarantees f_res(0) = 0.  The optional stable skip is
+        # part of the learned DS architecture, not a deployment controller:
+        # training learns a residual around a globally attracting linear field.
         zero = torch.zeros(x.shape[-1], dtype=x.dtype, device=x.device)
-        return self.net(x) - self.net(zero)
+        residual = self.net(x) - self.net(zero)
+        return residual - self.stable_skip_gain * x
 
 
 class LyapunovNet(nn.Module):
@@ -81,11 +83,13 @@ class StableNeuralDS(nn.Module):
     """Joint-space DS with Lyapunov stability machinery."""
 
     def __init__(self, n_joints=N_JOINTS, hidden_dim=128, lyap_hidden=64,
-                 alpha=1.0):
+                 alpha=1.0, stable_skip_gain=0.0):
         super().__init__()
         self.n_joints = n_joints
+        self.stable_skip_gain = stable_skip_gain
         self.f = NeuralDS(state_dim=n_joints, hidden_dim=hidden_dim,
-                          n_joints=n_joints)
+                          n_joints=n_joints,
+                          stable_skip_gain=stable_skip_gain)
         self.V = LyapunovNet(n_joints=n_joints, hidden_dim=lyap_hidden)
         self.alpha = alpha
 

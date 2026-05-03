@@ -2,10 +2,11 @@
 IK utility for computing target joint configurations from Cartesian targets.
 
 Used in two places:
-  1. Data collection: at each primitive boundary, compute q* for the recorded
-     trajectory so we can label (q, q*, q̇) tuples for joint-space DS training.
-  2. Deployment: when a primitive completes, compute the new q* for the next
-     primitive's Cartesian goal. The DS then drives q -> q* in joint space.
+  1. Data collection: at each primitive boundary, compute q_goal for the
+     recorded trajectory so we can label (q, q_goal, q̇) tuples.
+  2. Deployment: when a primitive completes, compute the new q_goal for the
+     next primitive's Cartesian goal. The DS then drives q -> q_goal in joint
+     space.
 
 We use Isaac Sim's Lula-based IK solver, which gives clean analytical solutions
 for the Franka. Falls back to a damped-least-squares numerical solver if Lula
@@ -72,7 +73,7 @@ class FrankaIK:
         self.ee_frame = "right_gripper"
 
     def solve(self, target_pos, target_quat=None, q_seed=None):
-        """Return (q*, success) where q* is a 7-vector of target joint angles.
+        """Return (q_goal, success) where q_goal is a 7-vector of target joint angles.
         q_seed should be the current joint config to bias the solution."""
         if target_quat is None:
             target_quat = DEFAULT_DOWN_QUAT

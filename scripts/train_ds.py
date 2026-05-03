@@ -2,8 +2,8 @@
 Train a joint-space Neural DS + Lyapunov network for one primitive.
 
 Loads demos from data/demonstrations/{arm}_demos.pkl, filters to the requested
-primitive, forms (state, q_dot) pairs where state = [q (7), q_goal (7)] and
-q_dot is the demonstrated joint velocity.
+primitive, forms (state, q_dot) pairs where state = q - q_goal and q_dot is
+the demonstrated joint velocity.
 
 Saves a checkpoint per (arm, primitive) at data/checkpoints/{arm}_{primitive}.pt.
 
@@ -27,12 +27,35 @@ from src.neural_ds import StableNeuralDS, total_loss, N_JOINTS
 
 
 def load_trajectories(demo_paths, primitive):
-    """Concatenate (state=q-q_goal, q_dot) pairs for one primitive."""
+    """Concatenate (state=q-q_goal, q_dot) pairs for one primitive.
+
+    Also returns a manifest describing exactly which saved demonstrations
+    contributed samples. This keeps the data split explicit: each DS checkpoint
+    is trained from one primitive label, optionally pooled across arms.
+    """
     states = []
     velocities = []
+    manifest = {
+        "primitive": primitive,
+        "demo_files": [str(p) for p in demo_paths],
+        "total_samples": 0,
+        "per_file": {},
+        "per_arm": {},
+        "per_block": {},
+        "per_q_goal_source": {},
+        "per_motion_source": {},
+        "q_goal_lula_error": {},
+    }
     for path in demo_paths:
+        path_key = str(path)
+        manifest["per_file"][path_key] = {
+            "demos": 0,
+            "samples": 0,
+            "blocks": {},
+        }
         with open(path, "rb") as f:
             demos = pickle.load(f)
+        manifest["per_file"][path_key]["demos"] = len(demos)
         for demo in demos:
             for step in demo["trajectory"]:
                 if step["primitive"] != primitive:
@@ -40,9 +63,32 @@ def load_trajectories(demo_paths, primitive):
                 x = step["q"] - step["q_goal"]  # error-based: 7-dim
                 states.append(x)
                 velocities.append(step["q_dot"])
+
+                arm = step.get("arm", demo.get("arm", "unknown"))
+                block = step.get("block", "unknown")
+                q_goal_source = step.get("q_goal_source", "legacy_unknown")
+                motion_source = step.get("motion_source", "legacy_unknown")
+                manifest["total_samples"] += 1
+                manifest["per_file"][path_key]["samples"] += 1
+                manifest["per_arm"][arm] = manifest["per_arm"].get(arm, 0) + 1
+                manifest["per_block"][block] = manifest["per_block"].get(block, 0) + 1
+                manifest["per_q_goal_source"][q_goal_source] = (
+                    manifest["per_q_goal_source"].get(q_goal_source, 0) + 1
+                )
+                manifest["per_motion_source"][motion_source] = (
+                    manifest["per_motion_source"].get(motion_source, 0) + 1
+                )
+                if "q_goal_lula_error" in step:
+                    err_stats = manifest["q_goal_lula_error"]
+                    err_stats["count"] = err_stats.get("count", 0) + 1
+                    err_stats["sum"] = err_stats.get("sum", 0.0) + float(step["q_goal_lula_error"])
+                    err_stats["max"] = max(err_stats.get("max", 0.0),
+                                           float(step["q_goal_lula_error"]))
+                blocks = manifest["per_file"][path_key]["blocks"]
+                blocks[block] = blocks.get(block, 0) + 1
     if not states:
         raise RuntimeError(f"No samples found for primitive '{primitive}' in {demo_paths}")
-    return np.stack(states), np.stack(velocities)
+    return np.stack(states), np.stack(velocities), manifest
 
 
 def main():
@@ -68,13 +114,25 @@ def main():
         demo_paths = [demos_dir / f"{args.arm}_demos.pkl"]
 
     print(f"[TRAIN] Loading {args.primitive} samples from {demo_paths}")
-    states, velocities = load_trajectories(demo_paths, args.primitive)
+    states, velocities, data_manifest = load_trajectories(demo_paths, args.primitive)
     print(f"[TRAIN] Got {len(states)} samples, state dim {states.shape[1]}")
+    print("[TRAIN] ── data partition used for this DS ──")
+    print(f"[TRAIN]   checkpoint           : {args.arm}_{args.primitive}.pt")
+    print(f"[TRAIN]   primitive label      : {args.primitive}")
+    print(f"[TRAIN]   source demo files    : {data_manifest['demo_files']}")
+    print(f"[TRAIN]   samples by arm       : {data_manifest['per_arm']}")
+    print(f"[TRAIN]   samples by block     : {data_manifest['per_block']}")
+    print(f"[TRAIN]   q_goal source counts : {data_manifest['per_q_goal_source']}")
+    print(f"[TRAIN]   motion source counts : {data_manifest['per_motion_source']}")
+    if data_manifest["q_goal_lula_error"].get("count", 0):
+        err = data_manifest["q_goal_lula_error"]
+        print("[TRAIN]   Lula-settled mismatch: "
+              f"mean={err['sum'] / err['count']:.3f}, max={err['max']:.3f}")
 
-    # Defensive clip — RMPflow respects max_joint_vel during collection, so
-    # anything above this is a finite-difference artifact (e.g. across an
-    # un-recorded primitive boundary). Letting one outlier through poisons
-    # vel_scale and crushes the model's effective output resolution.
+    # Defensive clip — collection experts respect max_joint_vel, so anything
+    # above this is a finite-difference artifact (e.g. across an un-recorded
+    # primitive boundary). Letting one outlier through poisons vel_scale and
+    # crushes the model's effective output resolution.
     max_v = train_cfg["max_joint_vel"]
     n_clipped = int((np.abs(velocities) > max_v).sum())
     if n_clipped > 0:
@@ -84,7 +142,8 @@ def main():
     # ── Normalisation per joint ───────────────────────────────────────────────
     # Zero-mean: goal (e=0) maps to x_n=0 so the -x skip connection points at it.
     # Floor on std: prevents OOD amplification for joints whose error barely
-    # varies in training (e.g. wrist joints RMPflow holds in a fixed null-space).
+    # varies in training (e.g. wrist joints the expert holds in a fixed
+    # null-space).
     # Without this, a deployment q_goal differing by 0.05 rad in such a joint
     # produces x_n=10+ and saturates Tanh, destroying the velocity output.
     state_mean = np.zeros(N_JOINTS)
@@ -120,6 +179,7 @@ def main():
         hidden_dim  = train_cfg["hidden_dim"],
         lyap_hidden = train_cfg["lyapunov_hidden"],
         alpha       = train_cfg["alpha"],
+        stable_skip_gain = train_cfg.get("stable_skip_gain", 0.0),
     ).to(device)
 
     optim     = torch.optim.Adam(model.parameters(), lr=train_cfg["lr"])
@@ -178,6 +238,7 @@ def main():
                 "config":      train_cfg,
                 "n_joints":    N_JOINTS,
                 "history":     history,
+                "data_manifest": data_manifest,
             }, ckpt_path)
 
         scheduler.step()

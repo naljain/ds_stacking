@@ -3,11 +3,12 @@ Deploy joint-space Neural DS on a single arm.
 
 The DS produces q_dot directly. We integrate q_dot to get a target joint
 position, send that as the command, and let Isaac Sim's articulation
-controller handle the low-level torque tracking. There is no IK at runtime —
-the closed-loop joint dynamics ARE the trained DS (modulo actuator dynamics).
+controller handle the low-level torque tracking. IK is used only at primitive
+transitions; inside a primitive, the closed-loop joint dynamics are the trained
+DS modulo actuator dynamics and optional deployment ablations.
 
-When a primitive transitions, we call Lula IK once to compute q* for the
-new Cartesian target, then keep that q* fixed until the next transition.
+When a primitive transitions, we call Lula IK once to compute q_goal for the
+new Cartesian target, then keep that q_goal fixed until the next transition.
 
 Usage:
   python scripts/deploy_single_arm.py --arm left
@@ -36,6 +37,7 @@ def load_ds(ckpt_path, device):
         hidden_dim  = cfg["hidden_dim"],
         lyap_hidden = cfg["lyapunov_hidden"],
         alpha       = cfg["alpha"],
+        stable_skip_gain = cfg.get("stable_skip_gain", 0.0),
     ).to(device)
     model.load_state_dict(ckpt["state_dict"])
     model.eval()
@@ -85,6 +87,10 @@ def main():
                         help="After grasp, attach the active block to the EE "
                              "kinematically until place. Use this to debug the "
                              "DS/task pipeline separately from gripper contact.")
+    parser.add_argument("--advance_on_timeout", action="store_true",
+                        help="Legacy debug behavior: advance to the next "
+                             "primitive on timeout even if q has not reached "
+                             "q_goal. Leave this off for pickup tests.")
     args = parser.parse_args()
 
     from isaacsim import SimulationApp
@@ -281,14 +287,20 @@ def main():
         env.step(render=not args.headless)
         carry_held_block()
 
-        # Primitive completion: joint-space convergence OR per-primitive timeout
+        # Primitive completion: only convergence means success. A timeout is a
+        # controller failure for real pickup; advancing would close the gripper
+        # from the wrong pose and cascade into misleading downstream failures.
         timed_out = prim_steps >= prim_timeout[task.current_primitive]
         converged = np.linalg.norm(q - q_goal) < args.done_tol
         if converged or timed_out:
             if timed_out and not converged:
                 print(f"[WARN] {task.current_primitive} timed out after "
-                      f"{prim_steps} steps (||q-q*||="
+                      f"{prim_steps} steps (||q-q_goal||="
                       f"{np.linalg.norm(q - q_goal):.3f})")
+                if not args.advance_on_timeout:
+                    print("[DEPLOY] Aborting instead of advancing. Use "
+                          "--advance_on_timeout only for phase-flow debugging.")
+                    break
             grip = gripper_action_for_primitive(task.current_primitive)
             if grip == "close":
                 franka.gripper.apply_action(

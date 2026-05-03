@@ -15,6 +15,7 @@ The 2D slice fixes 5 of the 7 error joints to zero and varies two of them
 
 Usage:
   python scripts/plot_ds.py data/checkpoints/both_reach.pt
+  python scripts/plot_ds.py --all --ckpt_arm both
   python scripts/plot_ds.py data/checkpoints/both_reach.pt --joints 0 3
   python scripts/plot_ds.py data/checkpoints/both_transport.pt --no-rollouts
 """
@@ -39,6 +40,7 @@ def load_checkpoint(ckpt_path, device):
         hidden_dim  = cfg["hidden_dim"],
         lyap_hidden = cfg["lyapunov_hidden"],
         alpha       = cfg["alpha"],
+        stable_skip_gain = cfg.get("stable_skip_gain", 0.0),
     ).to(device)
     model.load_state_dict(ckpt["state_dict"])
     model.eval()
@@ -55,6 +57,21 @@ def make_grid(joint_a, joint_b, n=40, span=3.0):
     xs[:, joint_a] = A.flatten()
     xs[:, joint_b] = B.flatten()
     return A, B, xs
+
+
+def model_velocity(model, x_t, use_safe=False, vel_scale=None, state_std=None):
+    """Evaluate the checkpoint velocity in normalized coordinates."""
+    if not use_safe:
+        with torch.no_grad():
+            return model(x_t)
+    if vel_scale is None or state_std is None:
+        raise ValueError("safe velocity plotting requires vel_scale and state_std")
+    scale_factor = torch.tensor(
+        vel_scale / state_std,
+        dtype=torch.float32,
+        device=x_t.device,
+    ).unsqueeze(0)
+    return model.safe_velocity(x_t, scale_factor=scale_factor)
 
 
 def plot_loss(history, title, out):
@@ -78,11 +95,17 @@ def plot_loss(history, title, out):
     print(f"[plot] saved {out}")
 
 
-def plot_phase_portrait(model, joint_a, joint_b, title, out, device, span=3.0):
+def plot_phase_portrait(model, joint_a, joint_b, title, out, device, span=3.0,
+                        use_safe=False, vel_scale=None, state_std=None):
     """Streamlines of f(x) projected onto (joint_a, joint_b) plane."""
     A, B, xs = make_grid(joint_a, joint_b, n=40, span=span)
-    with torch.no_grad():
-        v = model(torch.from_numpy(xs).to(device)).cpu().numpy()
+    v = model_velocity(
+        model,
+        torch.from_numpy(xs).to(device),
+        use_safe=use_safe,
+        vel_scale=vel_scale,
+        state_std=state_std,
+    ).detach().cpu().numpy()
     U = v[:, joint_a].reshape(A.shape)
     V = v[:, joint_b].reshape(A.shape)
     speed = np.sqrt(U ** 2 + V ** 2)
@@ -94,7 +117,8 @@ def plot_phase_portrait(model, joint_a, joint_b, title, out, device, span=3.0):
     ax.scatter([0], [0], color="red", s=80, zorder=5, label="goal (e=0)")
     ax.set_xlabel(f"x_n[{joint_a}]   (= e[{joint_a}] / state_std[{joint_a}])")
     ax.set_ylabel(f"x_n[{joint_b}]")
-    ax.set_title(f"{title} — phase portrait of f(x)")
+    suffix = "safe f(x)" if use_safe else "raw f(x)"
+    ax.set_title(f"{title} — phase portrait of {suffix}")
     ax.legend(loc="upper right")
     ax.set_aspect("equal")
     fig.tight_layout()
@@ -139,7 +163,7 @@ def plot_lyapunov(model, joint_a, joint_b, title, out, device, span=3.0):
 
 def rollouts(model, vel_scale, state_std, title, out, device,
              n_traj=12, n_steps=400, dt=0.00833,
-             max_joint_vel=2.0, span=2.5):
+             max_joint_vel=2.0, span=2.5, use_safe=False):
     """Forward-simulate the closed-loop DS in REAL joint space (not normalised)
     from random initial errors. This is the same Euler integrator the deploy
     scripts use, so what you see here is what you'll get at deployment (modulo
@@ -153,7 +177,13 @@ def rollouts(model, vel_scale, state_std, title, out, device,
     with torch.no_grad():
         for t in range(n_steps):
             x_n = e_traj[:, t] / state_std
-            v_n = model(torch.from_numpy(x_n).to(device)).cpu().numpy()
+            x_t = torch.from_numpy(x_n).to(device)
+            v_n = model_velocity(
+                model, x_t,
+                use_safe=use_safe,
+                vel_scale=vel_scale,
+                state_std=state_std,
+            ).detach().cpu().numpy()
             q_dot = np.clip(v_n * vel_scale, -max_joint_vel, max_joint_vel)
             speeds[:, t] = np.linalg.norm(q_dot, axis=-1)
             e_traj[:, t + 1] = e_traj[:, t] + q_dot * dt
@@ -183,7 +213,8 @@ def rollouts(model, vel_scale, state_std, title, out, device,
     axes[1].grid(True, alpha=0.3)
     axes[1].legend()
 
-    fig.suptitle(f"{title} — closed-loop rollouts ({n_traj} initial conditions)")
+    suffix = "safe DS" if use_safe else "raw DS"
+    fig.suptitle(f"{title} — {suffix} rollouts ({n_traj} initial conditions)")
     fig.tight_layout()
     fig.savefig(out, dpi=120)
     plt.close(fig)
@@ -240,10 +271,75 @@ def plot_deploy_log(csv_path, out_path):
     print(f"[plot] saved {out_path}")
 
 
+def checkpoint_paths(args):
+    if args.all:
+        ckpt_dir = Path(args.ckpt_dir)
+        if args.ckpt_arm == "all":
+            paths = sorted(ckpt_dir.glob("*.pt"))
+        else:
+            paths = [
+                ckpt_dir / f"{args.ckpt_arm}_{primitive}.pt"
+                for primitive in ("reach", "grasp", "lift", "transport", "place")
+            ]
+        missing = [p for p in paths if not p.exists()]
+        if missing:
+            raise FileNotFoundError(
+                "missing checkpoints: " + ", ".join(str(p) for p in missing)
+            )
+        return paths
+    if args.ckpt is None:
+        raise ValueError("provide a checkpoint path or use --all")
+    return [Path(args.ckpt)]
+
+
+def plot_checkpoint(ckpt_path, args, device):
+    assert ckpt_path.exists(), f"checkpoint not found: {ckpt_path}"
+
+    out_dir = Path(args.out_dir) / ckpt_path.stem
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    ckpt, model = load_checkpoint(ckpt_path, device)
+    title = f"{ckpt.get('arm', '?')} / {ckpt.get('primitive', '?')}"
+    vel_scale = np.array(ckpt["vel_scale"], dtype=np.float32)
+    state_std = np.array(ckpt["state_std"], dtype=np.float32)
+    print(f"[plot] {ckpt_path}")
+    print(f"[plot] state_std: {state_std.round(3)}")
+    print(f"[plot] vel_scale: {vel_scale.round(3)}")
+    if "data_manifest" in ckpt:
+        print(f"[plot] data_manifest: {ckpt['data_manifest']}")
+
+    plot_loss(ckpt.get("history"), title,
+              out_dir / "01_loss.png")
+    plot_phase_portrait(model, args.joints[0], args.joints[1], title,
+                        out_dir / "02_phase_portrait.png", device, args.span,
+                        use_safe=args.use_safe,
+                        vel_scale=vel_scale,
+                        state_std=state_std)
+    plot_lyapunov(model, args.joints[0], args.joints[1], title,
+                  out_dir / "03_lyapunov.png", device, args.span)
+    if not args.no_rollouts:
+        rollouts(model,
+                 vel_scale=vel_scale,
+                 state_std=state_std,
+                 title=title,
+                 out=out_dir / "04_rollouts.png",
+                 device=device,
+                 max_joint_vel=ckpt["config"].get("max_joint_vel", 2.0),
+                 span=args.span * 0.8,
+                 use_safe=args.use_safe)
+
+    print(f"[plot] all figures saved to {out_dir}")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("ckpt", type=str, nargs="?",
                         help="Path to checkpoint .pt file")
+    parser.add_argument("--all", action="store_true",
+                        help="Plot every checkpoint for --ckpt_arm in --ckpt_dir.")
+    parser.add_argument("--ckpt_dir", type=str, default="data/checkpoints")
+    parser.add_argument("--ckpt_arm", type=str, default="both",
+                        help="Checkpoint prefix to plot with --all: both, left, right, or all.")
     parser.add_argument("--joints", type=int, nargs=2, default=[0, 1],
                         help="Two joint indices to slice for 2D plots")
     parser.add_argument("--out_dir", type=str, default="data/results/ds_plots",
@@ -252,6 +348,8 @@ def main():
                         help="Half-width of the 2D state-space slice "
                              "(in units of std)")
     parser.add_argument("--no-rollouts", action="store_true")
+    parser.add_argument("--use_safe", action="store_true",
+                        help="Plot the Lyapunov-projected velocity field and rollouts.")
     parser.add_argument("--deploy_log", type=str, default=None,
                         help="Path to deploy CSV log; if set, plots that "
                              "trace instead of (or in addition to) checkpoint.")
@@ -265,35 +363,9 @@ def main():
             return
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    ckpt_path = Path(args.ckpt)
-    assert ckpt_path.exists(), f"checkpoint not found: {ckpt_path}"
-
-    out_dir = Path(args.out_dir) / ckpt_path.stem
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    ckpt, model = load_checkpoint(ckpt_path, device)
-    title = f"{ckpt.get('arm', '?')} / {ckpt.get('primitive', '?')}"
-    print(f"[plot] {ckpt_path}")
-    print(f"[plot] state_std: {np.array(ckpt['state_std']).round(3)}")
-    print(f"[plot] vel_scale: {np.array(ckpt['vel_scale']).round(3)}")
-
-    plot_loss(ckpt.get("history"), title,
-              out_dir / "01_loss.png")
-    plot_phase_portrait(model, args.joints[0], args.joints[1], title,
-                        out_dir / "02_phase_portrait.png", device, args.span)
-    plot_lyapunov(model, args.joints[0], args.joints[1], title,
-                  out_dir / "03_lyapunov.png", device, args.span)
-    if not args.no_rollouts:
-        rollouts(model,
-                 vel_scale=np.array(ckpt["vel_scale"], dtype=np.float32),
-                 state_std=np.array(ckpt["state_std"], dtype=np.float32),
-                 title=title,
-                 out=out_dir / "04_rollouts.png",
-                 device=device,
-                 max_joint_vel=ckpt["config"].get("max_joint_vel", 2.0),
-                 span=args.span * 0.8)
-
-    print(f"[plot] all figures saved to {out_dir}")
+    paths = checkpoint_paths(args)
+    for ckpt_path in paths:
+        plot_checkpoint(ckpt_path, args, device)
 
 
 if __name__ == "__main__":

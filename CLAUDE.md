@@ -14,7 +14,7 @@ These aren't defaults — earlier iterations of the project used a Cartesian DS 
 
 ### Joint-space DS (not Cartesian)
 
-The DS is `q̇ = f_θ(q, q*)` where `q ∈ R^7` is the Franka joint configuration and `q*` is the target joint config for the current primitive. At deployment, network output is sent to the robot verbatim — **no IK at runtime, no Jacobian inversion**. The closed-loop joint dynamics ARE the trained DS modulo low-level actuator dynamics, so Lyapunov stability claims hold in the actual control space. Cartesian DS + Jacobian-pseudoinverse would push singularity / null-space issues into the closed loop and break the stability story.
+The DS is `q̇ = f_θ(e)` where `e = q - q_goal`, `q ∈ R^7` is the Franka joint configuration, and `q_goal` is the target joint config for the current primitive. The model is parameterized as `f(e_n) = residual_θ(e_n) - stable_skip_gain * e_n`, so the convergent linear prior is inside the learned DS architecture rather than added as a deployment controller. At deployment, Lula IK is called once at each primitive transition to compute `q_goal`; the inner loop then uses the learned joint-space velocity field, not Cartesian IK or Jacobian inversion. Cartesian DS + Jacobian-pseudoinverse would push singularity / null-space issues into the closed loop and break the stability story.
 
 ### Huber 2019 modulation (not FSM coordination)
 
@@ -22,7 +22,7 @@ Inter-arm collision avoidance is **smooth, state-dependent velocity shaping**, n
 
 ### Lyapunov stability
 
-`V(q, q*) = ||g([q,q*]) - g([q*,q*])||² + ε||q - q*||²`, positive-definite around `q*` by construction. Training enforces `dV/dt + α·V ≤ 0` on the data distribution as a soft loss. The `safe_velocity()` method projects f(x) onto the half-space where this holds exactly — this is opt-in via `--use_safe` at deployment so we can ablate soft vs hard stability.
+`V(e) = ||g(e) - g(0)||² + ε||e||²`, positive-definite around `e = 0` by construction. Training enforces `dV/dt + α·V ≤ 0` on the data distribution as a soft loss. The `safe_velocity()` method projects f(x) onto the half-space where this holds exactly — this is opt-in via `--use_safe` at deployment so we can ablate soft vs hard stability.
 
 ## Repo structure
 
@@ -30,8 +30,8 @@ Inter-arm collision avoidance is **smooth, state-dependent velocity shaping**, n
 src/
   env.py             Isaac Sim scene (two Frankas + table + blocks). Builds from configs/default.yaml.
   primitives.py      5 primitives: reach, grasp, lift, transport, place. Cartesian targets + completion checks.
-  ik_controller.py   RMPflow wrapper. Used ONLY at data-collection time. Not at deployment.
-  franka_ik.py       Lula IK wrapper for q* lookup. Auto-discovers config paths across Isaac Sim 4.x/5.x.
+  ik_controller.py   RMPflow wrapper. Legacy collection option only; not at deployment.
+  franka_ik.py       Lula IK wrapper for q_goal lookup. Auto-discovers config paths across Isaac Sim 4.x/5.x.
   neural_ds.py       Joint-space Neural DS + Lyapunov network. StableNeuralDS class.
   modulation.py      Huber 2019 modulation. HuberModulation + InterArmModulation classes.
   coordinator.py     Slim primitive sequencer. NO collision logic — that's modulation's job.
@@ -39,7 +39,8 @@ src/
 
 scripts/
   smoke_test.py            Verify scene loads
-  collect_ik.py            Generate (q, q*, q̇) demos with RMPflow
+  collect_ik.py            Generate (q, q_goal, q̇) joint-space demos
+  audit_demo_labels.py     Audit primitive/q_goal label consistency
   teleop.py                Manual demo collection
   train_ds.py              Train one primitive
   train_all.sh             Train all 5 primitives
@@ -49,7 +50,7 @@ scripts/
   plot_modulation.py       3 figures: field, gamma timeseries, radial dot
 
 configs/default.yaml       All hyperparameters and constants
-data/demonstrations/       Saved (q, q*, q̇) trajectory pickles
+data/demonstrations/       Saved (q, q_goal, q̇) trajectory pickles
 data/checkpoints/          Trained model .pt files (one per arm × primitive)
 data/results/              Eval JSON + diagnostic pickles + figures
 ```
@@ -60,11 +61,13 @@ data/results/              Eval JSON + diagnostic pickles + figures
 1. python scripts/smoke_test.py
 2. python scripts/collect_ik.py --arm left  --n_demos 50
    python scripts/collect_ik.py --arm right --n_demos 50
-3. bash scripts/train_all.sh
-4. python scripts/deploy_single_arm.py --arm left      # sanity check
-5. python scripts/deploy_dual_arm.py                   # full system
-6. python scripts/evaluate.py --n_trials 10
-7. python scripts/plot_modulation.py all --diag data/results/diag_<ts>.pkl
+3. python scripts/audit_demo_labels.py data/demonstrations/left_demos.pkl data/demonstrations/right_demos.pkl
+4. bash scripts/train_all.sh
+5. python scripts/deploy_single_arm.py --arm left --kinematic_carry --use_safe --ds_scale 1.0 --goal_gain 0.0 --done_tol 0.25 --print_every 25 --debug_ik --log_csv data/results/left_pure_ds.csv
+6. python scripts/deploy_dual_arm.py --kinematic_carry --use_safe --ds_scale 1.0 --goal_gain 0.0 --done_tol 0.25
+7. python scripts/evaluate.py --n_trials 10 --use_safe --ds_scale 1.0 --goal_gain 0.0 --done_tol 0.25
+8. python scripts/plot_ds.py --all --ckpt_arm both --use_safe --joints 0 1 --out_dir data/results/ds_plots
+9. python scripts/plot_modulation.py all --diag data/results/diag_<ts>.pkl
 ```
 
 If `collect_ik.py` behaviour changes, rerun from step 2 onward. Do not retrain
@@ -89,7 +92,7 @@ avoid `add_default_ground_plane()` pulling from the remote asset root.
 - **Joint conventions** — Franka has 9 joints in the articulation (7 arm + 2 fingers). All DS work is on `q[:7]`. Fingers are controlled separately via `franka.gripper.apply_action(...)`.
 - **`render=not args.headless`** — every `world.step()` and `env.step()` call needs this so headless mode actually skips rendering.
 - **Configs over magic numbers** — table dimensions, primitive heights, training hyperparams etc. all live in `configs/default.yaml`, not as constants in code. If something needs tuning, check the config first.
-- **One IK call per primitive transition.** The DS handles smooth motion within a primitive; Lula IK is only called when the primitive switches and a new `q*` is needed. Don't put IK in the inner loop.
+- **One IK call per primitive transition.** The DS handles smooth motion within a primitive; Lula IK is only called when the primitive switches and a new `q_goal` is needed. Don't put IK in the inner loop.
 - **Coordinator stays slim.** It owns block order, primitive order, stack-slot reservation, and the initial arm phase offset. It should not implement close-range hold/release collision logic; that belongs to modulation or an explicit ablation.
 - **Dual-arm start is intentionally staggered.** `coordination.start_stagger_steps` delays the right arm slightly so both arms do not hit the shared stack in perfect synchrony. This is phase scheduling, not collision arbitration.
 
@@ -105,15 +108,21 @@ avoid `add_default_ground_plane()` pulling from the remote asset root.
 
 5. **Target noise in collection can cause missed grasps.** `collect_ik.py --noise` is legacy target noise and should normally stay at 0. Default collection is conservative: no target noise and no block jitter. Once the base grasp is reliable, use `--block_xy_jitter` to move the physical blocks and widen the data distribution without commanding the gripper beside the cube.
 
-6. **Collection separates motion demos from contact grasp validation.** By default `collect_ik.py` kinematically carries the active block after `grasp` so RMPflow joint-space demos are not discarded due Isaac contact flakiness. Pass `--physical_grasp` to require the gripper/contact setup to actually lift the cube; in that mode failed lifts are discarded.
+6. **Collection separates motion demos from contact grasp validation.** By default `collect_ik.py` kinematically carries the active block after `grasp` so joint-space demos are not discarded due Isaac contact flakiness. Pass `--physical_grasp` to require the gripper/contact setup to actually lift the cube; in that mode failed lifts are discarded.
 
-7. **RMPflow settling affects jerk and labels.** `collect_ik.py` allows extra settling steps before primitive transitions. Abruptly switching targets before the controller reaches the previous target creates jerky finite-difference `q_dot` labels.
+7. **Default collection should match deployment q_goal.** The default is `--motion_source joint_lula --q_goal_source lula`: compute the same Lula target used at deployment, then record a joint-space expert moving toward it. The legacy `--motion_source rmpflow` path can be useful for comparison, but RMPflow and Lula often choose different null-space solutions for the same Cartesian target.
 
-8. **Shared stack slots are reserved before transport/place.** The coordinator reserves stack heights when an arm asks for a transport/place target, not only after placement completes. Otherwise two arms can target the same stack layer.
+8. **`q_goal` labels must match the demonstrated attractor.** The collector stores `q_goal_lula`, `q_goal_settled`, and `q_goal_lula_error` metadata. If `audit_demo_labels.py` shows large final `||q-q_goal||` or many negative `cos(q_dot, -error)` samples, retrain only after recollecting or relabeling; otherwise the learned flow can diverge even when primitive names are correct.
 
-9. **Kinematic-carry release must use the reserved stack slot.** In debug deployment with `--kinematic_carry`, the carried cube follows the EE during motion, then snaps to `TaskSequencer.stack_target_position(arm)` when `place` opens the gripper. Do not release at the raw EE-plus-offset pose, or every block can appear to land near the same table-height pose even though the coordinator reserved increasing stack heights.
+9. **Training data partition is primitive-label based.** Demonstration pickles contain full trajectories. `train_ds.py` filters by `step["primitive"]`, so `*_grasp.pt` is trained only from `grasp` timesteps, `*_place.pt` only from `place` timesteps, etc. The checkpoint stores `data_manifest` with demo files, samples by file, samples by arm, samples by block, and q_goal source counts. Check this manifest before blaming model behavior on architecture.
 
-10. **Jacobian via finite differences is slow.** `jacobian_finite_difference()` does 7 set-and-restore operations per call. Fine for evaluation but if it becomes a bottleneck, swap to Isaac Sim's analytical Jacobian (`articulation.get_jacobians()` — exact field/indexing has shifted between versions, check what works on the install).
+10. **Shared stack slots are reserved before transport/place.** The coordinator reserves stack heights when an arm asks for a transport/place target, not only after placement completes. Otherwise two arms can target the same stack layer.
+
+11. **Kinematic-carry release must use the reserved stack slot.** In debug deployment with `--kinematic_carry`, the carried cube follows the EE during motion, then snaps to `TaskSequencer.stack_target_position(arm)` when `place` opens the gripper. Do not release at the raw EE-plus-offset pose, or every block can appear to land near the same table-height pose even though the coordinator reserved increasing stack heights.
+
+12. **Single-arm deploy aborts on timeout by default.** This is intentional. Advancing after a failed `reach` closes the gripper from the wrong pose and hides the real failure. Use `--advance_on_timeout` only for phase-flow debugging.
+
+13. **Jacobian via finite differences is slow.** `jacobian_finite_difference()` does 7 set-and-restore operations per call. Fine for evaluation but if it becomes a bottleneck, swap to Isaac Sim's analytical Jacobian (`articulation.get_jacobians()` — exact field/indexing has shifted between versions, check what works on the install).
 
 ## Evaluation conditions
 
@@ -126,9 +135,11 @@ combined             all of the above
 ```
 
 Ablations available via flags: `--no_modulation` (FSM-free, naive parallel), `--use_safe` (Lyapunov projection on).
-`--goal_gain` is a stabilizing deployment ablation: it adds `-gain*(q-q*)` to
-the learned velocity when the raw DS points away from the attractor. Do not
-present this as the pure learned-DS baseline.
+The project should be viewed and reported as learning a pure DS. The pure
+learned-DS setting is `--ds_scale 1.0 --goal_gain 0.0`, optionally with
+`--use_safe` for hard Lyapunov projection. `--goal_gain > 0`, `--ds_scale < 1`,
+and `--ds_scale 0` are diagnostics for isolating IK/actuation/data issues; do
+not present them as the method or main baseline.
 
 ## Metrics (evaluate.py)
 
