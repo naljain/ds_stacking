@@ -40,6 +40,45 @@ def load_demos(path):
         return pickle.load(f)
 
 
+def mean_demo_target(demos):
+    targets = []
+    for demo in demos:
+        for step in demo["trajectory"]:
+            if step.get("primitive", "transport") == "transport" and "target" in step:
+                targets.append(np.asarray(step["target"], dtype=float)[:3])
+                break
+    if not targets:
+        return None
+    return np.vstack(targets).mean(axis=0)
+
+
+def select_demos_for_model(arm, demo_dir, model, variant="auto"):
+    candidates = {
+        "raw": demo_dir / f"{arm}_demos.pkl",
+        "clean": demo_dir / f"{arm}_demos_clean.pkl",
+    }
+    if variant in ("raw", "clean"):
+        demos = load_demos(candidates[variant])
+        return demos, candidates[variant], mean_demo_target(demos)
+
+    scored = []
+    for name, path in candidates.items():
+        if not path.exists():
+            continue
+        demos = load_demos(path)
+        target = mean_demo_target(demos)
+        if target is None:
+            score = np.inf
+        else:
+            score = float(np.linalg.norm(target - model.x_goal))
+        scored.append((score, name, path, demos, target))
+    if not scored:
+        raise FileNotFoundError(f"No demonstrations found for {arm} in {demo_dir}")
+    scored.sort(key=lambda item: item[0])
+    _, _, path, demos, target = scored[0]
+    return demos, path, target
+
+
 def transport_xyz(demo):
     pts = [
         np.asarray(step["ee_pos"], dtype=float)[:3]
@@ -263,12 +302,220 @@ def plot_interaction_report(diag_path, out):
     plt.close(fig)
 
 
+def _demo_xy_and_vel(demos, dt):
+    pts, vels = [], []
+    for demo in demos:
+        xyz = transport_xyz(demo)
+        if len(xyz) < 2:
+            continue
+        vel = np.diff(xyz, axis=0) / dt
+        pts.append(xyz[:-1])
+        vels.append(vel)
+    if not pts:
+        return np.empty((0, 3)), np.empty((0, 3))
+    return np.vstack(pts), np.vstack(vels)
+
+
+def _confidence_ellipse(ax, mean, cov, color, nsig=1.8, **kwargs):
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Ellipse
+
+    vals, vecs = np.linalg.eigh(cov)
+    vals = np.maximum(vals, 1e-10)
+    order = vals.argsort()[::-1]
+    vals, vecs = vals[order], vecs[:, order]
+    angle = np.degrees(np.arctan2(vecs[1, 0], vecs[0, 0]))
+    width, height = 2.0 * nsig * np.sqrt(vals)
+    patch = Ellipse(mean, width, height, angle=angle, facecolor=color,
+                    edgecolor=color, alpha=0.16, lw=1.5, **kwargs)
+    ax.add_patch(patch)
+    return patch
+
+
+def plot_hw_style_flow(arm, demos, model, cfg, out):
+    import matplotlib.pyplot as plt
+
+    ws = cfg["block_workspace"][arm]
+    goal = np.asarray(model.x_goal, dtype=float)
+    z = goal[2]
+    x_min = min(ws["x_min"], goal[0]) - 0.04
+    x_max = max(ws["x_max"], goal[0]) + 0.04
+    y_min = min(ws["y_min"], goal[1]) - 0.04
+    y_max = max(ws["y_max"], goal[1]) + 0.04
+
+    xs = np.linspace(x_min, x_max, 45)
+    ys = np.linspace(y_min, y_max, 45)
+    X, Y = np.meshgrid(xs, ys)
+    U = np.zeros_like(X)
+    V = np.zeros_like(Y)
+    speed = np.zeros_like(X)
+    for idx in np.ndindex(X.shape):
+        vel = model.safe_velocity(np.array([X[idx], Y[idx], z]))
+        U[idx], V[idx] = vel[:2]
+        speed[idx] = np.linalg.norm(vel)
+
+    fig, ax = plt.subplots(figsize=(6.2, 5.4))
+    ax.streamplot(X, Y, U, V, color=speed, cmap="viridis", density=1.35, linewidth=1.1)
+    for demo in demos:
+        xyz = transport_xyz(demo)
+        if len(xyz) > 0:
+            ax.plot(xyz[:, 0], xyz[:, 1], color="black", alpha=0.18, lw=0.9)
+    ax.scatter(goal[0], goal[1], marker="*", s=180, color="crimson", label="attractor")
+    ax.set_title(f"{arm.capitalize()} LPVDS flow with demonstrations")
+    ax.set_xlabel("x [m]")
+    ax.set_ylabel("y [m]")
+    ax.set_aspect("equal", adjustable="box")
+    ax.grid(alpha=0.25)
+    ax.legend(frameon=False)
+    fig.tight_layout()
+    fig.savefig(out, dpi=220)
+    plt.close(fig)
+
+
+def plot_hw_style_gaussians(arm, demos, model, cfg, out):
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(6.2, 5.4))
+    color = ARM_COLORS[arm]
+    for demo in demos:
+        xyz = transport_xyz(demo)
+        if len(xyz) > 0:
+            ax.plot(xyz[:, 0], xyz[:, 1], color="0.20", alpha=0.16, lw=0.9)
+
+    for k in range(len(model.priors)):
+        mean = model.x_mean + model.x_scale * model.mus[:, k]
+        cov = (model.x_scale[:, None] * model.sigmas[:, :, k]) * model.x_scale[None, :]
+        _confidence_ellipse(ax, mean[:2], cov[:2, :2], color)
+        ax.scatter(mean[0], mean[1], color=color, s=20)
+        ax.text(mean[0], mean[1], str(k + 1), fontsize=8, color=color,
+                ha="center", va="center")
+
+    ax.scatter(model.x_goal[0], model.x_goal[1], marker="*", s=180,
+               color="crimson", label="attractor")
+    ax.set_title(f"{arm.capitalize()} LPVDS Gaussian mixture regions")
+    ax.set_xlabel("x [m]")
+    ax.set_ylabel("y [m]")
+    ax.set_aspect("equal", adjustable="box")
+    ax.grid(alpha=0.25)
+    ax.legend(frameon=False)
+    fig.tight_layout()
+    fig.savefig(out, dpi=220)
+    plt.close(fig)
+
+
+def plot_hw_style_velocity_compare(arm, demos, model, cfg, out):
+    import matplotlib.pyplot as plt
+
+    dt = float(cfg["sim"]["physics_dt"])
+    pts, demo_vel = _demo_xy_and_vel(demos, dt)
+    if len(pts) == 0:
+        return
+    stride = max(1, len(pts) // 3500)
+    pts = pts[::stride]
+    demo_vel = demo_vel[::stride]
+    pred_vel = np.array([model.safe_velocity(p) for p in pts])
+
+    demo_speed = np.linalg.norm(demo_vel, axis=1)
+    pred_speed = np.linalg.norm(pred_vel, axis=1)
+    lim = max(float(demo_speed.max()), float(pred_speed.max()), 1e-6)
+    rmse = np.sqrt(np.mean(np.sum((pred_vel - demo_vel) ** 2, axis=1)))
+
+    fig, axes = plt.subplots(1, 3, figsize=(13, 4.2))
+    labels = [("x velocity [m/s]", 0), ("y velocity [m/s]", 1), ("speed [m/s]", None)]
+    for ax, (title, idx) in zip(axes, labels):
+        if idx is None:
+            x, y = demo_speed, pred_speed
+        else:
+            x, y = demo_vel[:, idx], pred_vel[:, idx]
+        mn = min(float(x.min()), float(y.min()))
+        mx = max(float(x.max()), float(y.max()))
+        pad = 0.06 * max(mx - mn, 1e-6)
+        ax.scatter(x, y, s=5, alpha=0.18, color=ARM_COLORS[arm], edgecolors="none")
+        ax.plot([mn - pad, mx + pad], [mn - pad, mx + pad], "k--", lw=1.0)
+        ax.set_xlim(mn - pad, mx + pad)
+        ax.set_ylim(mn - pad, mx + pad)
+        ax.set_title(title)
+        ax.set_xlabel("demonstration")
+        ax.set_ylabel("LPVDS prediction")
+        ax.grid(alpha=0.25)
+    fig.suptitle(f"{arm.capitalize()} velocity reproduction, RMSE={rmse*1000:.1f} mm/s")
+    fig.tight_layout()
+    fig.savefig(out, dpi=220)
+    plt.close(fig)
+
+
+def plot_hw_style_lyapunov(arm, model, cfg, out_v, out_vdot):
+    import matplotlib.pyplot as plt
+
+    ws = cfg["block_workspace"][arm]
+    goal = np.asarray(model.x_goal, dtype=float)
+    z = goal[2]
+    x_min = min(ws["x_min"], goal[0]) - 0.05
+    x_max = max(ws["x_max"], goal[0]) + 0.05
+    y_min = min(ws["y_min"], goal[1]) - 0.05
+    y_max = max(ws["y_max"], goal[1]) + 0.05
+    xs = np.linspace(x_min, x_max, 90)
+    ys = np.linspace(y_min, y_max, 90)
+    X, Y = np.meshgrid(xs, ys)
+    V = np.zeros_like(X)
+    Vdot = np.zeros_like(X)
+    for idx in np.ndindex(X.shape):
+        p = np.array([X[idx], Y[idx], z])
+        err = p - goal
+        vel = model.safe_velocity(p)
+        V[idx] = np.dot(err, err)
+        Vdot[idx] = 2.0 * np.dot(err, vel)
+
+    for arr, path, title, cmap in [
+        (V, out_v, f"{arm.capitalize()} quadratic Lyapunov candidate", "magma"),
+        (Vdot, out_vdot, f"{arm.capitalize()} Lyapunov derivative along LPVDS", "coolwarm"),
+    ]:
+        fig, ax = plt.subplots(figsize=(6.2, 5.2))
+        if path == out_vdot:
+            vmax = np.percentile(np.abs(arr), 98)
+            im = ax.contourf(X, Y, arr, levels=32, cmap=cmap, vmin=-vmax, vmax=vmax)
+            ax.contour(X, Y, arr, levels=[0.0], colors="black", linewidths=1.2)
+        else:
+            im = ax.contourf(X, Y, arr, levels=32, cmap=cmap)
+        ax.scatter(goal[0], goal[1], marker="*", s=180, color="lime", edgecolor="black")
+        ax.set_title(title)
+        ax.set_xlabel("x [m]")
+        ax.set_ylabel("y [m]")
+        ax.set_aspect("equal", adjustable="box")
+        ax.grid(alpha=0.18)
+        fig.colorbar(im, ax=ax, shrink=0.9)
+        fig.tight_layout()
+        fig.savefig(path, dpi=220)
+        plt.close(fig)
+
+
+def generate_hw_style_set(demos_by_arm, models, cfg, out_root):
+    hw_dir = out_root / "hw_style"
+    hw_dir.mkdir(parents=True, exist_ok=True)
+    outputs = []
+    for arm in ("left", "right"):
+        specs = [
+            (plot_hw_style_flow, hw_dir / f"project_lpvds_{arm}_flow.png"),
+            (plot_hw_style_gaussians, hw_dir / f"project_lpvds_{arm}_gaussians.png"),
+            (plot_hw_style_velocity_compare, hw_dir / f"project_lpvds_{arm}_velocity_compare.png"),
+        ]
+        for func, path in specs:
+            func(arm, demos_by_arm[arm], models[arm], cfg, path)
+            outputs.append(path)
+        v_path = hw_dir / f"project_lpvds_{arm}_lyapunov.png"
+        vd_path = hw_dir / f"project_lpvds_{arm}_lyapunov_d.png"
+        plot_hw_style_lyapunov(arm, models[arm], cfg, v_path, vd_path)
+        outputs.extend([v_path, vd_path])
+    return outputs
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/default.yaml")
     parser.add_argument("--out", default="data/results/homework_plots")
     parser.add_argument("--diag", default="data/results/lpvds_interaction.pkl")
-    parser.add_argument("--use_clean", action="store_true", default=True)
+    parser.add_argument("--demo_variant", choices=["auto", "raw", "clean"], default="auto",
+                        help="Which demonstrations to plot; auto matches demo target to LPVDS attractor")
     args = parser.parse_args()
 
     out = Path(args.out)
@@ -276,15 +523,22 @@ def main():
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
 
-    suffix = "_clean" if args.use_clean else ""
-    demos_by_arm = {
-        arm: load_demos(Path(cfg["paths"]["demos"]) / f"{arm}_demos{suffix}.pkl")
-        for arm in ("left", "right")
-    }
     models = {
         arm: load_model(Path(cfg["paths"]["checkpoints"]) / f"{arm}_transport_lpvds.pkl")
         for arm in ("left", "right")
     }
+    demos_by_arm = {}
+    demo_dir = Path(cfg["paths"]["demos"])
+    for arm in ("left", "right"):
+        demos, demo_path, target = select_demos_for_model(
+            arm, demo_dir, models[arm], variant=args.demo_variant
+        )
+        demos_by_arm[arm] = demos
+        target_str = "unknown" if target is None else np.round(target, 4)
+        print(
+            f"[DATA] {arm}: using {demo_path} "
+            f"target={target_str} model_goal={np.round(models[arm].x_goal, 4)}"
+        )
 
     outputs = [
         out / "fig1_transport_demo_atlas.png",
@@ -297,6 +551,7 @@ def main():
     if Path(args.diag).exists():
         outputs.append(out / "fig4_interaction_diagnostics.png")
         plot_interaction_report(args.diag, outputs[-1])
+    outputs.extend(generate_hw_style_set(demos_by_arm, models, cfg, out))
 
     for path in outputs:
         print(f"[PLOT] Saved {path}")
