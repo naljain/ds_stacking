@@ -34,6 +34,8 @@ def main():
     parser.add_argument("--arm",      type=str, default="left", choices=["left", "right"])
     parser.add_argument("--n_demos",  type=int, default=50)
     parser.add_argument("--config",   type=str, default="configs/default.yaml")
+    parser.add_argument("--seed",     type=int, default=42,
+                        help="Random seed for block placement during collection")
     parser.add_argument("--headless", action="store_true")
 
     args = parser.parse_args()
@@ -72,10 +74,11 @@ def main():
     # EE orientation for transport/lift/place — straight down, no yaw
     ee_down = np.array([0.0, 1.0, 0.0, 0.0])   # w,x,y,z
 
-    rng = np.random.default_rng(seed=42)
+    rng = np.random.default_rng(seed=args.seed)
     all_demos = []
 
-    print(f"\n[INFO] Collecting {args.n_demos} demos ({args.arm} arm) — transport only.")
+    print(f"\n[INFO] Collecting {args.n_demos} demos ({args.arm} arm) — "
+          f"transport only, seed={args.seed}.")
 
     for demo_idx in range(args.n_demos):
         print(f"  Demo {demo_idx + 1}/{args.n_demos}")

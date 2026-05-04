@@ -43,8 +43,9 @@ right_blocks:
 # transport into the shared central stacking workspace.
 # Z is always table_height + block_size/2.
 block_workspace:
-  left:  {x_min: -0.50, x_max: -0.15, y_min: 0.20, y_max: 0.60}
-  right: {x_min:  0.15, x_max:  0.50, y_min: 0.20, y_max: 0.60}
+  front_y_min: 0.30       # keep random blocks sufficiently in front of bases
+  left:  {x_min: -0.50, x_max: -0.15, y_min: 0.30, y_max: 0.60}
+  right: {x_min:  0.15, x_max:  0.50, y_min: 0.30, y_max: 0.60}
   min_block_spacing: 0.08   # minimum distance between any two blocks (metres)
 
 # Single shared stacking point near the centre of the table.

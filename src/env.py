@@ -119,10 +119,13 @@ class DualArmEnv:
     def _build_blocks(self):
         """Spawn blocks at workspace centre — randomised before each demo."""
         block_z = self.cfg["table"]["height"] + self.cfg["block"]["size"] / 2
+        front_y_min = self.cfg["block_workspace"].get(
+            "front_y_min", self.cfg["arms"]["y"] + 0.30
+        )
         for arm in self.arms_active:
             ws = self.cfg["block_workspace"][arm]
             cx = (ws["x_min"] + ws["x_max"]) / 2
-            cy = (ws["y_min"] + ws["y_max"]) / 2
+            cy = (max(ws["y_min"], front_y_min) + ws["y_max"]) / 2
             for i, b in enumerate(self.cfg[f"{arm}_blocks"]):
                 spawn_pos = np.array([cx + i * 0.10, cy, block_z])
                 obj = self.world.scene.add(DynamicCuboid(
@@ -157,21 +160,32 @@ class DualArmEnv:
         """Randomise block positions within per-arm workspace bounds.
 
         Blocks are placed at random (x, y) within their arm's workspace with
-        a minimum separation enforced between all blocks.
+        a minimum separation enforced between all blocks. The Y lower bound is
+        also clamped so cubes spawn far enough in front of the robot bases.
         """
         if rng is None:
             rng = np.random.default_rng()
 
         block_z  = self.cfg["table"]["height"] + self.cfg["block"]["size"] / 2
         min_sep  = self.cfg["block_workspace"]["min_block_spacing"]
+        front_y_min = self.cfg["block_workspace"].get(
+            "front_y_min", self.cfg["arms"]["y"] + 0.30
+        )
         placed   = []
 
         for arm in self.arms_active:
             ws = self.cfg["block_workspace"][arm]
+            y_min = max(ws["y_min"], front_y_min)
+            y_max = ws["y_max"]
+            if y_min >= y_max:
+                raise ValueError(
+                    f"{arm} block workspace has no valid forward spawn band: "
+                    f"y_min={y_min:.3f}, y_max={y_max:.3f}"
+                )
             for b in self.cfg[f"{arm}_blocks"]:
                 for _ in range(200):
                     x = rng.uniform(ws["x_min"], ws["x_max"])
-                    y = rng.uniform(ws["y_min"], ws["y_max"])
+                    y = rng.uniform(y_min, y_max)
                     if all(np.linalg.norm([x - px, y - py]) >= min_sep
                            for px, py in placed):
                         break
