@@ -117,6 +117,10 @@ def main():
                         help="Clip LPVDS Cartesian speed before IK retargeting")
     parser.add_argument("--cart_gain", type=float, default=1.0,
                         help="Scale LPVDS Cartesian velocity before speed clipping")
+    parser.add_argument("--speedup", type=float, default=1.0,
+                        help="Global motion speed multiplier for IK timing and DS velocities")
+    parser.add_argument("--sync_speeds", action="store_true",
+                        help="Scale down the faster arm to match transport speed norms")
     parser.add_argument("--raw_lpvds",     action="store_true",
                         help="Use raw LPVDS velocity without stability projection")
     parser.add_argument("--no_workspace_clamp", action="store_true",
@@ -131,6 +135,8 @@ def main():
                         help="Use the scene's initial block positions")
     parser.add_argument("--diag_out", type=str, default=None,
                         help="Optional path to save LPVDS interaction diagnostics")
+    parser.add_argument("--status_every", type=int, default=240,
+                        help="Print deployment progress every N sim steps")
     args = parser.parse_args()
 
     from isaacsim import SimulationApp
@@ -138,7 +144,7 @@ def main():
                                     "width": 1280, "height": 720})
 
     from src.env import DualArmEnv
-    from src.ik_controller import IKController
+    from src.ik_controller import IKController, _trapezoid_profile
     from src.franka_ik import FrankaIK
     from src.modulation import InterArmModulation, jacobian_finite_difference
 
@@ -230,6 +236,7 @@ def main():
     ee_grasp    = {a: ee_down.copy() for a in ARMS}
     transport_steps = {a: 0 for a in ARMS}
     ik_fail_streak = {a: 0 for a in ARMS}
+    ik_plan_fail_streak = {a: 0 for a in ARMS}
     priority_arm = args.priority_arm
     diag_log = []
 
@@ -244,11 +251,11 @@ def main():
     def other_arm(arm):
         return "right" if arm == "left" else "left"
 
-    def modulation_weight(arm):
-        """Blend weight for this arm's avoidance correction."""
+    def avoidance_weight(arm):
+        """Blend weight for this arm's smooth avoidance correction."""
         if args.no_modulation:
             return 0.0
-        if stage[arm] != Stage.TRANSPORT or arm_done(arm):
+        if arm_done(arm):
             return 0.0
         other = other_arm(arm)
         if arm_done(other):
@@ -256,6 +263,12 @@ def main():
         if arm == priority_arm:
             return args.priority_mod_weight
         return args.yield_mod_weight
+
+    def modulation_weight(arm):
+        """Transport-only alias used by diagnostics and DS modulation."""
+        if stage[arm] != Stage.TRANSPORT:
+            return 0.0
+        return avoidance_weight(arm)
 
     def can_place(arm):
         """Yield if other arm is also near the stack goal."""
@@ -270,6 +283,44 @@ def main():
         gx, gy = goal_xy
         return np.linalg.norm(ee_other[:2] - np.array([gx, gy])) > yield_radius
 
+    def sync_vector_norms(vectors, min_norm=1e-5):
+        """Scale down faster active arms so paired transport speeds match."""
+        if not args.sync_speeds:
+            return
+        active = [a for a in ARMS if vectors.get(a) is not None]
+        if len(active) < 2:
+            return
+        norms = {a: float(np.linalg.norm(vectors[a])) for a in active}
+        target = min(norms.values())
+        if target < min_norm:
+            return
+        for arm in active:
+            if norms[arm] > target:
+                vectors[arm] *= target / norms[arm]
+
+    def sped_steps(n_steps):
+        return max(1, int(round(n_steps / max(args.speedup, 1e-6))))
+
+    def print_status(prefix="[STATUS]"):
+        ee = {a: ik_motion[a].ik.get_world_pose()[0].copy() for a in ARMS}
+        dist = float(np.linalg.norm(ee["left"] - ee["right"]))
+        parts = []
+        for arm in ARMS:
+            plan = ik_plan[arm]
+            if plan is not None:
+                progress = f"{plan['kind']}:{plan['i']}/{len(plan['s_values'])}"
+            elif gripper_wait[arm] is not None:
+                progress = f"gripper:{gripper_wait[arm]['remaining']}"
+            elif joint_plan[arm] is not None:
+                progress = f"home:{joint_plan[arm]['i']}/{len(joint_plan[arm]['s_values'])}"
+            else:
+                progress = "-"
+            parts.append(
+                f"{arm}={stage[arm].name} block={block_idx[arm]} "
+                f"plan={progress} transport={transport_steps[arm]}"
+            )
+        print(f"{prefix} step={global_step} ee_dist={dist:.3f} " + " | ".join(parts))
+
     mod_mode = "OFF" if args.no_modulation else (
         f"weighted priority={priority_arm} "
         f"priority_w={args.priority_mod_weight} yield_w={args.yield_mod_weight}"
@@ -278,6 +329,8 @@ def main():
           f"modulation={mod_mode}")
     print(f"[DEPLOY] Modulation sphere radius={mod_radius:.3f}m "
           f"reactivity={mod_reactivity:.2f}")
+    if not args.no_modulation:
+        print("[DEPLOY] IK primitives use smooth Cartesian EE modulation")
     print(f"[DEPLOY] IK frame={ik_motion['left'].ik.ee_frame}")
     if args.model == "lpvds":
         for arm in ARMS:
@@ -288,67 +341,205 @@ def main():
                 print(f"[DEPLOY] {arm} LPVDS target clamp min={np.round(lpv_min[arm], 3)} "
                       f"max={np.round(lpv_max[arm], 3)}")
 
-    # ── IK move helper (runs synchronously, blocks until done) ────────────────
-    def ik_move(arm, target, quat, n_steps):
-        ik_motion[arm].move_to(env.world, target, target_quat=quat,
-                               steps=n_steps, render=not args.headless)
+    # ── Nonblocking primitive motion helpers ────────────────────────────────
+    # IK primitives advance one waypoint per simulation tick.  Both arms use
+    # the same normalized trapezoid profile for a given primitive, so paired
+    # reach/grasp/lift/place moves have matching speed shapes.
+    ik_plan = {a: None for a in ARMS}
+    joint_plan = {a: None for a in ARMS}
+    gripper_wait = {a: None for a in ARMS}
 
-    def joint_move(arm, target_q, n_steps=120):
-        q0 = franka[arm].get_joint_positions()[:7].copy()
-        finger = ik_motion[arm]._finger_width
-        for s in np.linspace(0.0, 1.0, n_steps):
-            q = q0 + s * (target_q - q0)
-            full = np.concatenate([q, [finger, finger]])
-            franka[arm].apply_action(_articulation_action(full))
-            env.world.step(render=not args.headless)
-        ik_motion[arm].reset()
+    def start_ik_plan(arm, target, quat, n_steps, kind):
+        if ik_plan[arm] is not None:
+            return
+        ee_start, _ = ik_motion[arm].ik.get_world_pose()
+        ik_plan[arm] = {
+            "start": np.asarray(ee_start, dtype=float).copy(),
+            "end": np.asarray(target, dtype=float).copy(),
+            "quat": quat.copy(),
+            "s_values": _trapezoid_profile(n_steps, ik_motion[arm].vel_ramp_frac),
+            "i": 0,
+            "kind": kind,
+        }
+
+    def start_joint_plan(arm, target_q, n_steps, kind):
+        if joint_plan[arm] is not None:
+            return
+        joint_plan[arm] = {
+            "start": franka[arm].get_joint_positions()[:7].copy(),
+            "end": np.asarray(target_q, dtype=float).copy(),
+            "s_values": _trapezoid_profile(n_steps, ik_motion[arm].vel_ramp_frac),
+            "i": 0,
+            "kind": kind,
+        }
+
+    def start_gripper_wait(arm, open_gripper, n_steps, next_stage, after=None):
+        ik_motion[arm].set_gripper(open=open_gripper)
+        gripper_wait[arm] = {
+            "remaining": n_steps,
+            "next_stage": next_stage,
+            "after": after,
+        }
+
+    def finish_ik_plan(arm, kind):
+        nonlocal goal_z, priority_arm
+        if kind == "reach":
+            stage[arm] = Stage.GRASP
+        elif kind == "grasp":
+            start_gripper_wait(arm, open_gripper=False,
+                               n_steps=cfg["sim"]["gripper_steps"],
+                               next_stage=Stage.LIFT)
+        elif kind == "lift":
+            transport_steps[arm] = 0
+            ik_fail_streak[arm] = 0
+            stage[arm] = Stage.TRANSPORT
+        elif kind == "place":
+            start_gripper_wait(arm, open_gripper=True,
+                               n_steps=cfg["sim"]["gripper_steps"],
+                               next_stage=Stage.RETRACT,
+                               after="place_open")
+        elif kind == "retract":
+            block_idx[arm] += 1
+            if arm_done(arm):
+                print(f"  [{arm}] All cubes done; moving to nominal pose")
+                ik_motion[arm].set_gripper(open=True)
+                start_joint_plan(arm, default_q[arm], n_steps=120, kind="home")
+            else:
+                stage[arm] = Stage.REACH
+
+    def finish_gripper_wait(arm, wait):
+        nonlocal goal_z, priority_arm
+        if wait["after"] == "place_open":
+            goal_z += block_h + 0.002
+            priority_arm = other_arm(arm)
+            if not args.no_modulation:
+                print(f"  [COORD] Priority passed to {priority_arm}")
+        stage[arm] = wait["next_stage"]
+
+    def step_nontransport_plans():
+        """Apply all active IK/gripper/home actions for this simulation tick."""
+        moved_arms = set()
+        ee_now = {a: ik_motion[a].ik.get_world_pose()[0].copy() for a in ARMS}
+        next_waypoint = {}
+
+        for arm in ARMS:
+            plan = ik_plan[arm]
+            if plan is None:
+                next_waypoint[arm] = None
+                continue
+            s = plan["s_values"][plan["i"]]
+            next_waypoint[arm] = plan["start"] + s * (plan["end"] - plan["start"])
+
+        for arm in ARMS:
+            plan = ik_plan[arm]
+            if plan is None:
+                continue
+            waypoint = next_waypoint[arm]
+            w = avoidance_weight(arm)
+            if w > 0.0:
+                other = other_arm(arm)
+                v_nom = waypoint - ee_now[arm]
+                v_mod = mod.huber.modulate_cartesian(v_nom, ee_now[arm], ee_now[other])
+                v_cmd = (1.0 - w) * v_nom + w * v_mod
+                # Keep smooth avoidance from erasing primitive progress.
+                if np.dot(v_cmd, v_nom) <= 0.0:
+                    v_cmd = v_nom
+                waypoint = ee_now[arm] + v_cmd
+            ik_ok = ik_motion[arm].step_to(waypoint, target_quat=plan["quat"])
+            moved_arms.add(arm)
+            if ik_ok:
+                ik_plan_fail_streak[arm] = 0
+                plan["i"] += 1
+            else:
+                ik_plan_fail_streak[arm] += 1
+                if ik_plan_fail_streak[arm] == 25:
+                    print(f"  [WARN] {arm} {plan['kind']} IK failed for 25 consecutive steps")
+                if ik_plan_fail_streak[arm] >= 60:
+                    fallback = next_waypoint[arm]
+                    if ik_motion[arm].step_to(fallback, target_quat=plan["quat"]):
+                        print(f"  [WARN] {arm} {plan['kind']} using unmodulated IK waypoint")
+                        ik_plan_fail_streak[arm] = 0
+                        plan["i"] += 1
+            if plan["i"] >= len(plan["s_values"]):
+                kind = plan["kind"]
+                ik_plan[arm] = None
+                finish_ik_plan(arm, kind)
+
+        for arm in ARMS:
+            wait = gripper_wait[arm]
+            if wait is None:
+                continue
+            q = franka[arm].get_joint_positions()[:7].copy()
+            finger = ik_motion[arm]._finger_width
+            full_cmd = np.concatenate([q, [finger, finger]])
+            franka[arm].apply_action(_articulation_action(full_cmd))
+            moved_arms.add(arm)
+            wait["remaining"] -= 1
+            if wait["remaining"] <= 0:
+                gripper_wait[arm] = None
+                finish_gripper_wait(arm, wait)
+
+        for arm in ARMS:
+            plan = joint_plan[arm]
+            if plan is None:
+                continue
+            s = plan["s_values"][plan["i"]]
+            q = plan["start"] + s * (plan["end"] - plan["start"])
+            finger = ik_motion[arm]._finger_width
+            full_cmd = np.concatenate([q, [finger, finger]])
+            franka[arm].apply_action(_articulation_action(full_cmd))
+            moved_arms.add(arm)
+            plan["i"] += 1
+            if plan["i"] >= len(plan["s_values"]):
+                joint_plan[arm] = None
+                ik_motion[arm].reset()
+                stage[arm] = Stage.DONE
+
+        return moved_arms
 
     # ── Main loop ─────────────────────────────────────────────────────────────
-    # Arms that are in IK stages (reach/grasp/lift/place/retract) run
-    # synchronously inside this loop iteration. Arms in transport run the
-    # DS step-by-step so both can be modulated against each other.
+    # IK primitives and DS transport are both stepped tick-by-tick.  Each tick
+    # gathers all arm commands first, then advances the world once.
 
     global_step = 0
     MAX_GLOBAL  = 100_000
+    idle_ticks = 0
 
     while global_step < MAX_GLOBAL:
         if not simulation_app.is_running():
             break
-        if all(arm_done(a) for a in ARMS):
+        if all(stage[a] == Stage.DONE for a in ARMS):
             print("[DEPLOY] Both arms finished.")
             break
 
         for arm in ARMS:
-            if arm_done(arm):
+            if (arm_done(arm) or ik_plan[arm] is not None or
+                    joint_plan[arm] is not None or gripper_wait[arm] is not None):
                 continue
 
             blk = current_block(arm)
+            if blk is None:
+                continue
             bpos = env.get_block_positions()[blk].copy()
             bx, by = bpos[0], bpos[1]
 
-            # ── IK stages (synchronous, consume many sim steps internally) ──
+            # ── Start IK stages; execution happens below one tick at a time ──
             if stage[arm] == Stage.REACH:
                 ee_grasp[arm] = env.get_block_grasp_quat(blk)
-                ik_move(arm, np.array([bx, by, hover_h]),
-                        ee_grasp[arm], steps["reach"])
-                stage[arm] = Stage.GRASP
+                start_ik_plan(arm, np.array([bx, by, hover_h]),
+                              ee_grasp[arm], sped_steps(steps["reach"]),
+                              kind="reach")
                 continue
 
             if stage[arm] == Stage.GRASP:
-                ik_move(arm, np.array([bx, by, grasp_h]),
-                        ee_grasp[arm], steps["grasp"])
-                ik_motion[arm].set_gripper(open=False)
-                for _ in range(cfg["sim"]["gripper_steps"]):
-                    env.world.step(render=not args.headless)
-                stage[arm] = Stage.LIFT
+                start_ik_plan(arm, np.array([bx, by, grasp_h]),
+                              ee_grasp[arm], sped_steps(steps["grasp"]),
+                              kind="grasp")
                 continue
 
             if stage[arm] == Stage.LIFT:
-                ik_move(arm, np.array([bx, by, lift_h]),
-                        ee_down, steps["lift"])
-                transport_steps[arm] = 0
-                ik_fail_streak[arm] = 0
-                stage[arm] = Stage.TRANSPORT
+                start_ik_plan(arm, np.array([bx, by, lift_h]),
+                              ee_down, sped_steps(steps["lift"]), kind="lift")
                 continue
 
             if stage[arm] == Stage.PLACE:
@@ -358,28 +549,16 @@ def main():
                 else:
                     place_pos = np.array([goal_xy[0], goal_xy[1],
                                           goal_z + 0.02])
-                    ik_move(arm, place_pos, ee_down, steps["place"])
-                    ik_motion[arm].set_gripper(open=True)
-                    for _ in range(cfg["sim"]["gripper_steps"]):
-                        env.world.step(render=not args.headless)
-                    goal_z += block_h + 0.002
-                    priority_arm = other_arm(arm)
-                    if not args.no_modulation:
-                        print(f"  [COORD] Priority passed to {priority_arm}")
-                    stage[arm] = Stage.RETRACT
+                    start_ik_plan(arm, place_pos, ee_down,
+                                  sped_steps(steps["place"]), kind="place")
                 continue
 
             if stage[arm] == Stage.RETRACT:
-                ik_move(arm, transport_pos, ee_down, 60)
-                block_idx[arm] += 1
-                if arm_done(arm):
-                    print(f"  [{arm}] All cubes done; moving to nominal pose")
-                    ik_motion[arm].set_gripper(open=True)
-                    joint_move(arm, default_q[arm], n_steps=120)
-                    stage[arm] = Stage.DONE
-                else:
-                    stage[arm] = Stage.REACH
+                start_ik_plan(arm, transport_pos, ee_down,
+                              sped_steps(60), kind="retract")
                 continue
+
+        moved_arms = step_nontransport_plans()
 
         # ── DS transport step (both arms simultaneously) ───────────────────
         # Snapshot EE positions before any commands this tick
@@ -390,7 +569,8 @@ def main():
             cart_nominal = {}
             cart_modulated = {}
             for arm in ARMS:
-                if stage[arm] != Stage.TRANSPORT or arm_done(arm):
+                if (stage[arm] != Stage.TRANSPORT or arm_done(arm) or
+                        arm in moved_arms):
                     cart_vels[arm] = None
                     cart_nominal[arm] = None
                     cart_modulated[arm] = None
@@ -433,10 +613,12 @@ def main():
             for arm in ARMS:
                 if cart_vels[arm] is None:
                     continue
-                cart_vels[arm] = args.cart_gain * cart_vels[arm]
+                cart_vels[arm] = args.speedup * args.cart_gain * cart_vels[arm]
                 speed = np.linalg.norm(cart_vels[arm])
-                if speed > args.max_cart_speed:
-                    cart_vels[arm] *= args.max_cart_speed / speed
+                max_cart_speed = args.speedup * args.max_cart_speed
+                if speed > max_cart_speed:
+                    cart_vels[arm] *= max_cart_speed / speed
+            sync_vector_norms(cart_vels)
 
             any_transport = False
             for arm in ARMS:
@@ -472,14 +654,21 @@ def main():
                 if ik_fail_streak[arm] == 25:
                     print(f"  [WARN] {arm} LPVDS IK has failed for 25 consecutive steps")
 
-            if any_transport:
+            if any_transport or moved_arms:
                 env.step(render=not args.headless)
                 global_step += 1
+                idle_ticks = 0
+                if args.status_every > 0 and global_step % args.status_every == 0:
+                    print_status()
+            else:
+                idle_ticks += 1
+                if idle_ticks % 240 == 0:
+                    print_status(prefix="[IDLE]")
             continue
 
         q_dots = {}
         for arm in ARMS:
-            if stage[arm] != Stage.TRANSPORT or arm_done(arm):
+            if stage[arm] != Stage.TRANSPORT or arm_done(arm) or arm in moved_arms:
                 q_dots[arm] = None
                 continue
 
@@ -509,7 +698,8 @@ def main():
                 with torch.no_grad():
                     qd_n = ds[arm]["model"](x_t)
 
-            q_dots[arm] = qd_n.cpu().numpy().squeeze(0) * ds[arm]["vel_scale"]
+            q_dots[arm] = (args.speedup * qd_n.cpu().numpy().squeeze(0) *
+                           ds[arm]["vel_scale"])
 
         # Apply inter-arm modulation
         for arm in ARMS:
@@ -527,6 +717,8 @@ def main():
             )
             q_dots[arm] = (1.0 - w) * q_dot_nom + w * q_dot_mod
 
+        sync_vector_norms(q_dots)
+
         # Command arms in transport
         any_transport = False
         for arm in ARMS:
@@ -539,11 +731,18 @@ def main():
             full_cmd = np.concatenate([q_cmd, [finger, finger]])
             franka[arm].apply_action(_articulation_action(full_cmd))
 
-        if any_transport:
+        if any_transport or moved_arms:
             env.step(render=not args.headless)
             global_step += 1
+            idle_ticks = 0
+            if args.status_every > 0 and global_step % args.status_every == 0:
+                print_status()
+        else:
+            idle_ticks += 1
+            if idle_ticks % 240 == 0:
+                print_status(prefix="[IDLE]")
 
-    print(f"[DEPLOY] Finished after {global_step} DS steps.")
+    print(f"[DEPLOY] Finished after {global_step} sim steps.")
     if args.diag_out:
         diag_path = Path(args.diag_out)
         diag_path.parent.mkdir(parents=True, exist_ok=True)
@@ -557,6 +756,8 @@ def main():
                     "yield_mod_weight": args.yield_mod_weight,
                     "cart_gain": args.cart_gain,
                     "max_cart_speed": args.max_cart_speed,
+                    "speedup": args.speedup,
+                    "speed_sync": args.sync_speeds,
                 },
                 "rows": diag_log,
             }, f)

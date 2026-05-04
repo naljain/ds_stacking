@@ -125,6 +125,24 @@ python scripts/deploy_single_arm.py --arm left --model lpvds
 # 5. Deploy both arms with Cartesian modulation
 python scripts/deploy_dual_arm.py --model lpvds
 
+# Faster, less stall-prone rollout
+python scripts/deploy_dual_arm.py --model lpvds \
+  --speedup 1.5 \
+  --done_tol 0.07 \
+  --max_transport 4000 \
+  --mod_radius 0.25 \
+  --yield_mod_weight 0.7
+
+# More conservative modulation-only avoidance rollout
+python scripts/deploy_dual_arm.py --model lpvds \
+  --speedup 1.0 \
+  --done_tol 0.07 \
+  --max_transport 4000 \
+  --mod_radius 0.45 \
+  --mod_reactivity 1.0 \
+  --priority_mod_weight 1.0 \
+  --yield_mod_weight 1.0
+
 # 6. Ablation: run the same dual-arm deployment without modulation
 python scripts/deploy_dual_arm.py --model lpvds --no_modulation
 ```
@@ -136,6 +154,19 @@ and alternates after each placed block. A transporting arm treats the other
 arm's EE as a moving obstacle even when the other arm is reaching, grasping,
 placing, or retracting. Blocks are randomized at deploy startup, and an arm
 that has placed all of its cubes returns to its configured nominal joint pose.
+
+The faster rollout command above is a good first command when the arms seem to
+stall near the shared stack. `--speedup` raises IK and transport speeds,
+`--done_tol 0.07` accepts transport completion a little earlier, and the smaller
+`--mod_radius` / `--yield_mod_weight` pair makes avoidance less conservative
+while still keeping the non-priority arm responsive. If the arms still slow each
+other too much, reduce `--mod_radius` or increase `--mod_reactivity`; if they
+move too aggressively, reduce `--speedup` back toward `1.0`.
+
+Use the conservative command if the EEs get too close. It avoids duplicate
+flags, starts modulation earlier with lower `--mod_reactivity`, and modulates
+both arms fully during transport and IK primitives.
+
 To start with the right arm as priority:
 
 ```bash
@@ -264,3 +295,15 @@ Across arms: modulation preserves the stability of each arm's DS individually
 because `M(x)` is diagonal in the basis aligned with the obstacle normal and
 the radial scaling is non-negative — so `dV/dt` of each arm's individual
 Lyapunov function remains non-positive after modulation.
+
+```
+python scripts/deploy_dual_arm.py --model lpvds \
+  --speedup 1.0 \
+  --done_tol 0.07 \
+  --max_transport 4000 \
+  --mod_radius 0.25 \
+  --mod_reactivity 2.0 \
+  --priority_mod_weight 0.25 \
+  --yield_mod_weight 0.8 \
+  --status_every 120
+```
