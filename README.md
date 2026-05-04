@@ -240,6 +240,9 @@ python scripts/animate_lpvds_interaction.py --diag data/results/lpvds_interactio
 
 # If ffmpeg is unavailable, write a GIF instead
 python scripts/animate_lpvds_interaction.py --diag data/results/lpvds_interaction.pkl --out data/results/lpvds_interaction.gif
+
+# Report-style homework figures: demos, GMM regions, modulation slice, diagnostics
+MPLCONFIGDIR=/tmp/mpl python scripts/plot_homework_figures.py
 ```
 
 ## Setup
