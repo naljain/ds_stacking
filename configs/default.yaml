@@ -11,19 +11,23 @@ table:
 block:
   size: 0.045
   mass: 0.05
+  # World-frame XY correction applied to pick targets. Use this to calibrate
+  # the controlled Lula gripper frame to the visual center of the cube.
+  grasp_xy_offset:
+    left:  [0.0, 0.0]
+    right: [0.0, 0.0]
 
 arms:
   spacing: 0.60     # distance between left and right arm base in X
   y:       0.0      # Y position of arm bases
   face_table_quat: [0.7071, 0.0, 0.0, 0.7071]   # 90° around Z
 
-  # Default joint poses in radians (raw values).
-  # Left arm: exact values from reference pose.
-  # Right arm: j0 and j1 mirrored (sign flipped); j2-j6 kept the same
-  #            until confirmed by testing.
+  # Default joint poses in radians. With both bases using the same table-facing
+  # orientation, the visual side-by-side mirror keeps shoulder pitch j1, elbow
+  # j3, and wrist pitch j5 the same while flipping the yaw/roll joints.
   #   j0       j1       j2        j3       j4      j5      j6
   default_joints_left:  [ 1.93,  1.10, -1.8639, -2.6820,  1.0833,  1.9480, -0.1237]
-  default_joints_right: [-1.93, 1.10, 1.8639, -2.6820,  -1.0833,  1.9480, 0.1237]
+  default_joints_right: [-1.93,  1.10,  1.8639, -2.6820, -1.0833,  1.9480,  0.1237]
 
 # ── Block layout ───────────────────────────────────────────────────────────────
 # Fixed colors and names. Positions are randomised each demo within the
@@ -62,6 +66,11 @@ heights:
 sim:
   physics_dt:    0.00833    # 1/120
   rendering_dt:  0.01667    # 1/60
+  camera:
+    # Front-of-table view: camera sits at +Y and looks back toward the arms
+    # at y=0, so the Frankas appear behind the tabletop on either side.
+    eye:    [0.0, 2.25, 1.45]
+    target: [0.0, 0.25, 0.80]
   steps_per_primitive:
     reach:     120
     grasp:     80
@@ -87,6 +96,16 @@ training:
 coordination:
   ee_safety_radius:    0.30    # spherical modulation radius around each EE
   modulation_reactivity: 2.0   # Γ=(d/R)^p; lower p makes avoidance start earlier
+  modulation_isoline:  1.0     # Γ contour tracked by modulation; >1 expands effective boundary
+  preserve_mod_speed:  true    # rescale modulated velocity to nominal speed
+  priority_policy:     fixed   # fixed or closest_to_stack
+  priority_hysteresis: 0.04    # metres before closest-to-stack priority switches
+  link_proxy_spheres:  3       # extra wrist/last-link spheres behind the EE
+  link_proxy_spacing:  0.055   # metres between EE and each proxy sphere
+  link_proxy_frames:   [panda_link5, panda_link6, panda_link7, right_gripper]
+  link_proxy_samples_per_segment: 2  # extra spheres between consecutive FK frames
+  gripper_proxy_lateral_offsets: [-0.065, 0.065]  # cover left/right gripper-body width
+  gripper_proxy_body_offsets: [0.075, 0.13, 0.185]  # stations up the gripper hand body
   hold_threshold:      0.30    # wait if other arm is closer than this to my goal
   collision_check_hz:  60
   yield_radius:        0.12    # arm waits to place if other EE is within this

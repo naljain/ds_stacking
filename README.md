@@ -64,6 +64,23 @@ tangential component, deflecting motion around the other arm's EE.
 When close but already moving outward, `M` falls back to identity (tail
 effect), letting the arm separate cleanly.
 
+The implementation also mirrors the MEAM homework `apply_modulation.m` step:
+after the modulation matrix changes the direction of the Cartesian velocity,
+the result is rescaled back to the nominal speed by default. This keeps the
+three homework modulation ingredients visible in the rollout:
+
+  - `Gamma` — the distance/level-set term around the other EE's safety sphere.
+  - `E` — the reference-direction basis with radial and tangential axes.
+  - `D` — the radial/tangential eigenvalue scaling; diagnostics log
+    `lambda_r`, `lambda_t`, and `tail_active`.
+
+By default, each arm is represented by the EE plus three proxy spheres along
+the wrist/hand link before the EE. Modulation uses the closest active sphere
+pairs, so the last link is protected instead of only the gripper point.
+
+Use `--no_preserve_mod_speed` only for an ablation where modulation is allowed
+to change speed magnitude as well as direction.
+
 ## Directory Layout
 
 ```
@@ -125,6 +142,9 @@ python scripts/deploy_single_arm.py --arm left --model lpvds
 # 5. Deploy both arms with Cartesian modulation
 python scripts/deploy_dual_arm.py --model lpvds
 
+# Current LPVDS visual rollout preset; saves diagnostics and renders a DS video
+python scripts/deploy_dual_arm.py --deploy_config configs/deploy_lpvds_visual.yaml
+
 # Faster, less stall-prone rollout
 python scripts/deploy_dual_arm.py --model lpvds \
   --speedup 1.5 \
@@ -138,9 +158,12 @@ python scripts/deploy_dual_arm.py --model lpvds \
   --speedup 1.0 \
   --done_tol 0.07 \
   --max_transport 4000 \
-  --mod_radius 0.45 \
-  --mod_reactivity 1.0 \
-  --priority_mod_weight 1.0 \
+  --mod_radius 0.35 \
+  --mod_reactivity 2.0 \
+  --mod_isoline 2.0 \
+  --link_spheres 3 \
+  --link_sphere_spacing 0.055 \
+  --priority_mod_weight 0.5 \
   --yield_mod_weight 1.0
 
 # 6. Ablation: run the same dual-arm deployment without modulation
@@ -164,8 +187,10 @@ other too much, reduce `--mod_radius` or increase `--mod_reactivity`; if they
 move too aggressively, reduce `--speedup` back toward `1.0`.
 
 Use the conservative command if the EEs get too close. It avoids duplicate
-flags, starts modulation earlier with lower `--mod_reactivity`, and modulates
-both arms fully during transport and IK primitives.
+flags, tracks a larger `Gamma` contour with `--mod_isoline`, and gives the
+priority arm a stronger share of the same smooth modulation. Increasing
+`--mod_radius` grows the actual safety sphere; increasing `--mod_isoline`
+keeps that sphere the same size but tracks an outer level set.
 
 To start with the right arm as priority:
 
@@ -179,9 +204,22 @@ To tune the balance:
 python scripts/deploy_dual_arm.py --model lpvds \
   --mod_radius 0.35 \
   --mod_reactivity 2.0 \
+  --mod_isoline 1.5 \
+  --link_spheres 3 \
   --priority_mod_weight 0.25 \
   --yield_mod_weight 1.0
 ```
+
+If the gripper is consistently picking off-center, calibrate the pick target
+with a small world-frame XY offset. For example:
+
+```bash
+python scripts/deploy_dual_arm.py --model lpvds --grasp_offset 0.005 -0.003
+```
+
+Once the offset looks right, put it in `configs/default.yaml` under
+`block.grasp_xy_offset.left/right` so collection and deployment use the same
+pick center.
 
 `train_lpvds.py` defaults to `data/demonstrations/{arm}_demos.pkl`. If you run
 `scripts/clean_demos.py`, train on that file explicitly:
@@ -235,11 +273,33 @@ python scripts/plot_lpvds_3d.py --arm left --modulated --other_ee 0.0 0.45 0.99 
 python scripts/deploy_dual_arm.py --model lpvds --diag_out data/results/lpvds_interaction.pkl
 python scripts/plot_lpvds_interaction.py --diag data/results/lpvds_interaction.pkl
 
+# Or use the preset to run deploy, save diagnostics, and render the radial-field video
+python scripts/deploy_dual_arm.py --deploy_config configs/deploy_lpvds_visual.yaml
+
+The generated `ds_interaction_radial.mp4` is a diagnostic Matplotlib
+visualization of the DS, modulation spheres, and velocities. It is not the
+Isaac Sim viewport render of the robot meshes.
+
 # Animate the same interaction in 3D over time
 python scripts/animate_lpvds_interaction.py --diag data/results/lpvds_interaction.pkl
 
 # If ffmpeg is unavailable, write a GIF instead
 python scripts/animate_lpvds_interaction.py --diag data/results/lpvds_interaction.pkl --out data/results/lpvds_interaction.gif
+
+# DS interaction view with radial field around each moving EE obstacle
+python scripts/animate_lpvds_interaction.py \
+  --diag data/results/lpvds_interaction.pkl \
+  --out data/results/ds_interaction_radial.mp4 \
+  --radial_field
+
+# Compose an Isaac viewport recording next to the DS interaction video.
+# First record a non-headless deploy window with a screen recorder/ffmpeg as
+# data/results/isaac_render.mp4, then stack the two videos:
+python scripts/compose_isaac_ds_video.py \
+  --isaac data/results/isaac_render.mp4 \
+  --ds data/results/ds_interaction_radial.mp4 \
+  --out data/results/isaac_vs_ds_interaction.mp4 \
+  --label
 
 # Report-style homework figures; demo_variant=auto matches demo target to LPVDS attractor
 MPLCONFIGDIR=/tmp/mpl python scripts/plot_homework_figures.py

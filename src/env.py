@@ -38,6 +38,7 @@ class DualArmEnv:
 
         self.world.reset()
         self._apply_default_joints(settle_steps=30)
+        self._set_viewport_camera()
 
     # ── Config ────────────────────────────────────────────────────────────────
     @staticmethod
@@ -151,6 +152,27 @@ class DualArmEnv:
                 scale=np.array([0.08, 0.08, 0.002]),
                 color=color,
             ))
+
+    def _set_viewport_camera(self):
+        camera_cfg = self.cfg.get("sim", {}).get("camera")
+        if not camera_cfg:
+            return
+
+        eye = np.array(camera_cfg.get("eye", [0.0, 1.85, 1.18]), dtype=float)
+        target = np.array(camera_cfg.get("target", [0.0, 0.22, 0.83]), dtype=float)
+
+        try:
+            from isaacsim.core.utils.viewports import set_camera_view
+        except ImportError:
+            try:
+                from omni.isaac.core.utils.viewports import set_camera_view
+            except ImportError:
+                return
+
+        try:
+            set_camera_view(eye=eye, target=target)
+        except TypeError:
+            set_camera_view(eye=eye.tolist(), target=target.tolist())
 
     # ── Public utilities ──────────────────────────────────────────────────────
     def step(self, render=True):

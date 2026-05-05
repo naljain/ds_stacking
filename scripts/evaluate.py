@@ -332,6 +332,8 @@ def main():
     mod = InterArmModulation(
         safe_radius=cfg["coordination"]["ee_safety_radius"],
         reactivity=cfg["coordination"].get("modulation_reactivity", 2.0),
+        preserve_speed=cfg["coordination"].get("preserve_mod_speed", True),
+        isoline=cfg["coordination"].get("modulation_isoline", 1.0),
     )
 
     results = {cond: [] for cond in args.conditions}

@@ -29,6 +29,14 @@ os.environ["OMNI_KIT_ACCEPT_EULA"] = "YES"
 os.environ["CARB_LOG_LEVEL"] = "error"
 
 
+def _grasp_xy(block_xy, arm, cfg, cli_offset=None):
+    offset = np.array(cfg["block"].get("grasp_xy_offset", {}).get(arm, [0.0, 0.0]),
+                      dtype=float)
+    if cli_offset is not None:
+        offset = offset + np.asarray(cli_offset, dtype=float)
+    return np.asarray(block_xy, dtype=float) + offset
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--arm",      type=str, default="left", choices=["left", "right"])
@@ -37,6 +45,9 @@ def main():
     parser.add_argument("--seed",     type=int, default=42,
                         help="Random seed for block placement during collection")
     parser.add_argument("--headless", action="store_true")
+    parser.add_argument("--grasp_offset", type=float, nargs=2, default=None,
+                        metavar=("DX", "DY"),
+                        help="Extra world-frame XY pick offset in metres")
 
     args = parser.parse_args()
 
@@ -94,15 +105,16 @@ def main():
             # Block position is known perfectly — no noise
             block_pos = env.get_block_positions()[block_name].copy()
             bx, by = block_pos[0], block_pos[1]
+            pick_xy = _grasp_xy([bx, by], args.arm, cfg, args.grasp_offset)
 
             # ── 1. Reach: hover above block, EE aligned to block face ──
             ee_grasp = env.get_block_grasp_quat(block_name)
-            ik_motion.move_to(env.world, np.array([bx, by, hover_h]),
+            ik_motion.move_to(env.world, np.array([pick_xy[0], pick_xy[1], hover_h]),
                               target_quat=ee_grasp,
                               steps=steps["reach"], render=not args.headless)
 
             # ── 2. Grasp: descend to exact block centre ───────────────────
-            ik_motion.move_to(env.world, np.array([bx, by, grasp_h]),
+            ik_motion.move_to(env.world, np.array([pick_xy[0], pick_xy[1], grasp_h]),
                               target_quat=ee_grasp,
                               steps=steps["grasp"], render=not args.headless)
             ik_motion.set_gripper(open=False)
@@ -110,7 +122,7 @@ def main():
                 env.world.step(render=not args.headless)
 
             # ── 3. Lift straight up to transport height ───────────────────
-            ik_motion.move_to(env.world, np.array([bx, by, lift_h]),
+            ik_motion.move_to(env.world, np.array([pick_xy[0], pick_xy[1], lift_h]),
                               target_quat=ee_down,
                               steps=steps["lift"], render=not args.headless)
 

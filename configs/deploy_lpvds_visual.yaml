@@ -1,0 +1,43 @@
+deploy:
+  model: lpvds
+  speedup: 1.0
+  sync_speeds: false
+  yield_max_cart_speed: 0.18
+  min_transport_progress: 0.35
+  parked_obstacle_weight: 0.35
+  done_tol: 0.07
+  ik_done_tol: 0.01
+  max_transport: 4000
+
+  mod_radius: 0.25
+  mod_reactivity: 2.0
+  mod_isoline: 1.25
+  priority_policy: closest_to_stack
+  priority_hysteresis: 0.04
+  priority_mod_weight:
+    left: 0.30
+    right: 0.25
+  yield_mod_weight:
+    left: 0.85
+    right: 0.60
+  no_preserve_mod_speed: false
+
+  link_spheres: 3
+  link_sphere_spacing: 0.055
+  link_frames: [panda_link6, panda_link7, right_gripper]
+  link_samples_per_segment: 2
+  gripper_lateral_offsets: [-0.065, 0.065]
+  gripper_lateral_body_offsets: [0.075, 0.13, 0.185]
+  show_proxy_spheres: true
+  proxy_sphere_radius: 0.025
+
+  status_every: 120
+  diag_out: data/results/lpvds_interaction.pkl
+  isaac_record_out: ""
+  isaac_record_fps: 30
+  isaac_record_size: 1280x720
+  video_out: data/results/ds_interaction_radial.mp4
+  video_fps: 20
+  video_stride: 6
+  video_views: both
+  video_radial_field: true

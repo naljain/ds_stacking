@@ -105,6 +105,26 @@ class FrankaIK:
             quat_wxyz = None
         return np.asarray(pos), quat_wxyz
 
+    def get_frame_world_pose(self, frame_name, q=None):
+        """Return a named Lula frame pose in world coordinates.
+
+        This is useful for building link-level collision proxies from FK
+        frames such as panda_link5, panda_link6, panda_link7, and right_gripper.
+        """
+        if q is None:
+            q = self.franka.get_joint_positions()[:7].copy()
+        base_pos, base_rot = self.franka.get_world_pose()
+        self.solver.set_robot_base_pose(base_pos, base_rot)
+        pos, rot = self.solver.compute_forward_kinematics(frame_name, q)
+        try:
+            from scipy.spatial.transform import Rotation
+            quat_xyzw = Rotation.from_matrix(rot).as_quat()
+            quat_wxyz = np.array([quat_xyzw[3], quat_xyzw[0],
+                                  quat_xyzw[1], quat_xyzw[2]])
+        except Exception:
+            quat_wxyz = None
+        return np.asarray(pos), quat_wxyz
+
     def _solve_once(self, target_pos, target_quat, q_seed):
         """Single Lula IK call. Returns (q, success)."""
         base_pos, base_rot = self.franka.get_world_pose()

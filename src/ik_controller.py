@@ -7,8 +7,7 @@ Replaces RMPflow with a precise straight-line Cartesian interpolator:
   - Tracks gripper state internally and writes all 9 joints (7 arm + 2
     fingers) in a single apply_action call, avoiding fights between
     franka.apply_action and franka.gripper.apply_action.
-  - Rest pose is arm-aware: joint 1 is biased outward so left and right
-    arms keep their elbows away from each other.
+  - Rest pose is arm-aware and mirrored for the side-by-side Franka bases.
 """
 
 import numpy as np
@@ -22,19 +21,9 @@ DEFAULT_DOWN_QUAT = np.array([0.0, 1.0, 0.0, 0.0])
 GRIPPER_OPEN   = 0.04
 GRIPPER_CLOSED = 0.00
 
-# Per-arm start poses.  Only joints 0 and 1 are specified by you — the rest
-# are filled from the remaining values you provided.  The right arm mirrors
-# joint 0 and joint 1 so the two arms are symmetric about the table centre.
-#
-#   Your values: j0=1.93, j1=1.1, j2=-1.8639, j3=-2.6820, j4=1.0833, j5=1.9480, j6=-0.1237
-#
-#   Left arm  : j0=-1.93 (mirrored), j1=-1.1 (elbow out left), rest unchanged
-#   Right arm : j0= 1.93,            j1= 1.1 (elbow out right), rest unchanged
-
-# Left arm: exact reference values.
-# Right arm: j0 and j1 mirrored; j2-j6 unchanged until confirmed by testing.
+# Per-arm start poses mirrored for side-by-side table-facing bases.
 _REST_LEFT  = np.array([ 1.93,  1.10, -1.8639, -2.6820,  1.0833,  1.9480, -0.1237])
-_REST_RIGHT = np.array([-1.93, 1.10, 1.8639, -2.6820,  -1.0833,  1.9480, 0.1237])
+_REST_RIGHT = np.array([-1.93,  1.10,  1.8639, -2.6820, -1.0833,  1.9480,  0.1237])
 
 
 def _rest_pose(arm: str) -> np.ndarray:

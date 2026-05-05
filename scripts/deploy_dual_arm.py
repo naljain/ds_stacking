@@ -24,8 +24,10 @@ import os
 import sys
 import argparse
 import pickle
+import subprocess
 import numpy as np
 import torch
+import yaml
 from pathlib import Path
 from enum import Enum, auto
 
@@ -88,8 +90,224 @@ def _articulation_action(positions):
     return ArticulationAction(joint_positions=positions)
 
 
+def _quat_wxyz_to_matrix(q):
+    q = np.asarray(q, dtype=float)
+    if q.shape != (4,):
+        return np.eye(3)
+    w, x, y, z = q / (np.linalg.norm(q) + 1e-12)
+    return np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+        [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+        [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+    ])
+
+
+def _protected_points(ee_pos, ee_quat, n_link_spheres, spacing):
+    """EE plus proxy spheres along the wrist/hand link before the EE."""
+    points = [np.asarray(ee_pos, dtype=float)]
+    if n_link_spheres <= 0:
+        return np.asarray(points)
+
+    # The Lula right_gripper frame uses local -Z as the direction back from the
+    # gripper tip toward the wrist for the default down-facing grasp pose.
+    R = _quat_wxyz_to_matrix(ee_quat)
+    link_axis = R @ np.array([0.0, 0.0, -1.0])
+    if np.linalg.norm(link_axis) < 1e-9:
+        link_axis = np.array([0.0, 0.0, 1.0])
+    link_axis = link_axis / (np.linalg.norm(link_axis) + 1e-12)
+
+    for i in range(1, n_link_spheres + 1):
+        points.append(points[0] + i * spacing * link_axis)
+    return np.asarray(points)
+
+
+def _add_gripper_width_points(points, ee_pos, ee_quat, lateral_offsets,
+                              body_offsets):
+    """Add left/right finger-width proxy points on the gripper body."""
+    points = [np.asarray(p, dtype=float) for p in points]
+    if not lateral_offsets:
+        return np.asarray(points)
+    R = _quat_wxyz_to_matrix(ee_quat)
+    # Franka's hand body is wide across the gripper-frame Y direction.
+    lateral_axis = R @ np.array([0.0, 1.0, 0.0])
+    if np.linalg.norm(lateral_axis) < 1e-9:
+        lateral_axis = np.array([1.0, 0.0, 0.0])
+    lateral_axis = lateral_axis / (np.linalg.norm(lateral_axis) + 1e-12)
+    # The gripper body sits back from the EE/tool frame along local -Z for the
+    # down-facing pose. Body offsets put the lateral protection on the mesh
+    # instead of only at the tool centre.
+    body_axis = R @ np.array([0.0, 0.0, -1.0])
+    if np.linalg.norm(body_axis) < 1e-9:
+        body_axis = np.array([0.0, 0.0, 1.0])
+    body_axis = body_axis / (np.linalg.norm(body_axis) + 1e-12)
+    ee_pos = np.asarray(ee_pos, dtype=float)
+    body_offsets = body_offsets if body_offsets else [0.0]
+    for body_offset in body_offsets:
+        body_center = ee_pos + float(body_offset) * body_axis
+        points.append(body_center)
+        for offset in lateral_offsets:
+            points.append(body_center + float(offset) * lateral_axis)
+    return np.asarray(points)
+
+
+def _protected_points_from_links(ik, q, fallback_ee_pos, fallback_ee_quat,
+                                 frames, samples_per_segment,
+                                 n_fallback_spheres, fallback_spacing,
+                                 gripper_lateral_offsets,
+                                 gripper_lateral_body_offsets):
+    """Protected sphere centers sampled on distal FK frames.
+
+    Uses Lula FK frame positions when available. If the configured frame names
+    are not available in this Isaac install, falls back to EE-axis proxies.
+    """
+    frame_points = []
+    for frame in frames or []:
+        try:
+            pos, _ = ik.get_frame_world_pose(frame, q=q)
+            frame_points.append(np.asarray(pos, dtype=float))
+        except Exception:
+            continue
+
+    if len(frame_points) < 2:
+        points = _protected_points(
+            fallback_ee_pos, fallback_ee_quat, n_fallback_spheres,
+            fallback_spacing
+        )
+        return _add_gripper_width_points(
+            points, fallback_ee_pos, fallback_ee_quat,
+            gripper_lateral_offsets, gripper_lateral_body_offsets
+        )
+
+    points = [frame_points[0]]
+    samples_per_segment = max(0, int(samples_per_segment))
+    for a, b in zip(frame_points[:-1], frame_points[1:]):
+        for i in range(1, samples_per_segment + 2):
+            s = i / (samples_per_segment + 1)
+            points.append((1.0 - s) * a + s * b)
+    return _add_gripper_width_points(
+        points, fallback_ee_pos, fallback_ee_quat,
+        gripper_lateral_offsets, gripper_lateral_body_offsets
+    )
+
+
+def _grasp_xy(block_xy, arm, cfg, cli_offset=None):
+    offset = np.array(cfg["block"].get("grasp_xy_offset", {}).get(arm, [0.0, 0.0]),
+                      dtype=float)
+    if cli_offset is not None:
+        offset = offset + np.asarray(cli_offset, dtype=float)
+    return np.asarray(block_xy, dtype=float) + offset
+
+
+def _load_deploy_config(path):
+    if path is None:
+        return {}
+    with open(path, "r") as f:
+        payload = yaml.safe_load(f) or {}
+    return payload.get("deploy", payload)
+
+
+def _arm_param(value, arm, default=None):
+    """Read a scalar deploy parameter that may be overridden per arm."""
+    if isinstance(value, dict):
+        if arm in value:
+            return value[arm]
+        return value.get("default", default)
+    return value
+
+
+class IsaacProxySphereViz:
+    """Small USD sphere markers that follow protected modulation points."""
+
+    def __init__(self, radius=0.025, max_points=32):
+        self.radius = float(radius)
+        self.max_points = int(max_points)
+        self.prims = {}
+        self.enabled = False
+        try:
+            import omni.usd
+            from pxr import Gf, UsdGeom
+            self.stage = omni.usd.get_context().get_stage()
+            self.Gf = Gf
+            self.UsdGeom = UsdGeom
+            self.enabled = self.stage is not None
+        except Exception as exc:
+            print(f"[WARN] Proxy sphere visualization unavailable: {exc}")
+
+    def _make(self, arm, idx):
+        path = f"/World/ModulationSpheres/{arm}_{idx:02d}"
+        sphere = self.UsdGeom.Sphere.Define(self.stage, path)
+        sphere.CreateRadiusAttr(self.radius)
+        color = (1.0, 0.05, 0.05) if arm == "left" else (0.05, 0.20, 1.0)
+        sphere.CreateDisplayColorAttr([self.Gf.Vec3f(*color)])
+        sphere.CreateDisplayOpacityAttr([0.45])
+        xform = self.UsdGeom.Xformable(sphere.GetPrim())
+        xform.ClearXformOpOrder()
+        translate = xform.AddTranslateOp()
+        self.prims[(arm, idx)] = translate
+        return translate
+
+    def update(self, points_by_arm):
+        if not self.enabled:
+            return
+        hidden = self.Gf.Vec3d(0.0, 0.0, -10.0)
+        for arm, points in points_by_arm.items():
+            points = np.asarray(points, dtype=float).reshape(-1, 3)
+            for idx in range(self.max_points):
+                op = self.prims.get((arm, idx)) or self._make(arm, idx)
+                pos = points[idx] if idx < len(points) else hidden
+                op.Set(self.Gf.Vec3d(float(pos[0]), float(pos[1]), float(pos[2])))
+
+
+def _start_screen_record(path, fps=30, size="1280x720"):
+    """Record the visible Isaac window/screen using ffmpeg/x11grab."""
+    if not path:
+        return None
+    display = os.environ.get("DISPLAY")
+    if not display:
+        print("[WARN] DISPLAY is not set; cannot start Isaac viewport recording")
+        return None
+    out = Path(path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        "ffmpeg", "-y",
+        "-video_size", size,
+        "-framerate", str(fps),
+        "-f", "x11grab",
+        "-i", f"{display}+0,0",
+        "-pix_fmt", "yuv420p",
+        str(out),
+    ]
+    try:
+        proc = subprocess.Popen(
+            cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+        print(f"[DEPLOY] Recording Isaac viewport to {out}")
+        return proc
+    except FileNotFoundError:
+        print("[WARN] ffmpeg not found; Isaac viewport recording disabled")
+        return None
+
+
+def _stop_screen_record(proc):
+    if proc is None:
+        return
+    try:
+        proc.communicate(input=b"q", timeout=5)
+    except Exception:
+        proc.terminate()
+
+
 def main():
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--deploy_config", type=str, default=None,
+                     help="YAML file with deploy_dual_arm argument defaults")
+    pre_args, _ = pre.parse_known_args()
+    deploy_defaults = _load_deploy_config(pre_args.deploy_config)
+
     parser = argparse.ArgumentParser()
+    parser.add_argument("--deploy_config", type=str, default=pre_args.deploy_config,
+                        help="YAML file with deploy_dual_arm argument defaults")
     parser.add_argument("--config",        type=str, default="configs/default.yaml")
     parser.add_argument("--ckpt_arm",      type=str, default=None,
                         help="Checkpoint label for both arms (default: per-arm)")
@@ -100,6 +318,11 @@ def main():
     parser.add_argument("--priority_arm",  type=str, default="left",
                         choices=["left", "right"],
                         help="Arm that starts as the unmodulated priority arm")
+    parser.add_argument("--priority_policy", type=str, default="fixed",
+                        choices=["fixed", "closest_to_stack"],
+                        help="How to choose which arm gets lower modulation weight")
+    parser.add_argument("--priority_hysteresis", type=float, default=0.04,
+                        help="Closest-to-stack priority switches only past this distance margin")
     parser.add_argument("--priority_mod_weight", type=float, default=0.25,
                         help="Blend weight for modulation on the priority arm")
     parser.add_argument("--yield_mod_weight", type=float, default=1.0,
@@ -108,6 +331,27 @@ def main():
                         help="Spherical modulation radius around each EE")
     parser.add_argument("--mod_reactivity", type=float, default=None,
                         help="Gamma exponent; lower values make modulation start earlier")
+    parser.add_argument("--mod_isoline", type=float, default=None,
+                        help="Gamma contour to track; >1 expands the effective modulation boundary")
+    parser.add_argument("--no_preserve_mod_speed", action="store_true",
+                        help="Do not rescale modulated Cartesian velocity back to nominal speed")
+    parser.add_argument("--link_spheres", type=int, default=None,
+                        help="Extra proxy spheres along the last link before the EE")
+    parser.add_argument("--link_sphere_spacing", type=float, default=None,
+                        help="Spacing in metres between wrist/last-link proxy spheres")
+    parser.add_argument("--link_frames", nargs="+", default=None,
+                        help="Lula FK frames used for distal-link proxy spheres")
+    parser.add_argument("--link_samples_per_segment", type=int, default=None,
+                        help="Extra proxy spheres between consecutive link_frames")
+    parser.add_argument("--gripper_lateral_offsets", nargs="*", type=float,
+                        default=None,
+                        help="Extra gripper-body half-width proxy offsets in local gripper Y, metres")
+    parser.add_argument("--gripper_lateral_body_offsets", nargs="*", type=float,
+                        default=None,
+                        help="Offsets back from the EE along local -Z for gripper-width proxies")
+    parser.add_argument("--grasp_offset", type=float, nargs=2, default=None,
+                        metavar=("DX", "DY"),
+                        help="Extra world-frame XY pick offset in metres for both arms")
     parser.add_argument("--model",         type=str, default="neural",
                         choices=["neural", "lpvds"],
                         help="Transport DS model: neural joint-space or Cartesian LPVDS")
@@ -115,6 +359,12 @@ def main():
                         help="LPVDS IK target = ee_pos + x_dot * lookahead * dt")
     parser.add_argument("--max_cart_speed", type=float, default=0.25,
                         help="Clip LPVDS Cartesian speed before IK retargeting")
+    parser.add_argument("--yield_max_cart_speed", type=float, default=None,
+                        help="Optional LPVDS speed cap applied only to the non-priority arm")
+    parser.add_argument("--min_transport_progress", type=float, default=0.0,
+                        help="Minimum fraction of nominal LPVDS progress preserved after modulation")
+    parser.add_argument("--parked_obstacle_weight", type=float, default=1.0,
+                        help="Scale modulation caused by an arm that is fully parked/DONE")
     parser.add_argument("--cart_gain", type=float, default=1.0,
                         help="Scale LPVDS Cartesian velocity before speed clipping")
     parser.add_argument("--speedup", type=float, default=1.0,
@@ -129,15 +379,38 @@ def main():
                         help="LPVDS target z clamp around lift height when workspace clamp is enabled")
     parser.add_argument("--headless",      action="store_true")
     parser.add_argument("--done_tol",      type=float, default=0.05)
+    parser.add_argument("--ik_done_tol", type=float, default=0.005,
+                        help="Cartesian tolerance for finishing IK primitives before grasp/place")
+    parser.add_argument("--ik_settle_steps", type=int, default=120,
+                        help="Max extra ticks to hold final IK waypoint while waiting for tolerance")
     parser.add_argument("--seed", type=int, default=None,
                         help="Random seed for deploy-time block randomization")
     parser.add_argument("--no_randomize_blocks", action="store_true",
                         help="Use the scene's initial block positions")
     parser.add_argument("--diag_out", type=str, default=None,
                         help="Optional path to save LPVDS interaction diagnostics")
+    parser.add_argument("--video_out", type=str, default=None,
+                        help="Optional path to render DS interaction video after deploy")
+    parser.add_argument("--video_fps", type=int, default=20)
+    parser.add_argument("--video_stride", type=int, default=6)
+    parser.add_argument("--video_views", choices=["original", "top", "both"],
+                        default="original")
+    parser.add_argument("--video_radial_field", action="store_true",
+                        help="Show radial field samples in the generated DS video")
+    parser.add_argument("--show_proxy_spheres", action="store_true",
+                        help="Show protected modulation proxy spheres in Isaac viewport")
+    parser.add_argument("--proxy_sphere_radius", type=float, default=0.025)
+    parser.add_argument("--isaac_record_out", type=str, default=None,
+                        help="Record the actual Isaac viewport with ffmpeg/x11grab")
+    parser.add_argument("--isaac_record_fps", type=int, default=30)
+    parser.add_argument("--isaac_record_size", type=str, default="1280x720")
     parser.add_argument("--status_every", type=int, default=240,
                         help="Print deployment progress every N sim steps")
+    if deploy_defaults:
+        parser.set_defaults(**deploy_defaults)
     args = parser.parse_args()
+    if args.video_out and not args.diag_out:
+        args.diag_out = "data/results/lpvds_interaction.pkl"
 
     from isaacsim import SimulationApp
     simulation_app = SimulationApp({"headless": args.headless,
@@ -152,6 +425,17 @@ def main():
 
     env = DualArmEnv(config_path=args.config, arms=("left", "right"))
     cfg = env.cfg
+    proxy_viz = IsaacProxySphereViz(radius=args.proxy_sphere_radius) \
+        if args.show_proxy_spheres else None
+    screen_recorder = None
+    if args.isaac_record_out and args.headless:
+        print("[WARN] --isaac_record_out needs non-headless rendering; disabling --headless recording")
+    elif args.isaac_record_out:
+        screen_recorder = _start_screen_record(
+            args.isaac_record_out,
+            fps=args.isaac_record_fps,
+            size=args.isaac_record_size,
+        )
 
     ARMS = ("left", "right")
     physics_dt  = cfg["sim"]["physics_dt"]
@@ -222,10 +506,42 @@ def main():
     mod_reactivity = args.mod_reactivity
     if mod_reactivity is None:
         mod_reactivity = cfg["coordination"].get("modulation_reactivity", 2.0)
+    mod_isoline = args.mod_isoline
+    if mod_isoline is None:
+        mod_isoline = cfg["coordination"].get("modulation_isoline", 1.0)
     mod = InterArmModulation(
         safe_radius=mod_radius,
         reactivity=mod_reactivity,
+        preserve_speed=not args.no_preserve_mod_speed,
+        isoline=mod_isoline,
     )
+    link_spheres = args.link_spheres
+    if link_spheres is None:
+        link_spheres = cfg["coordination"].get("link_proxy_spheres", 3)
+    link_sphere_spacing = args.link_sphere_spacing
+    if link_sphere_spacing is None:
+        link_sphere_spacing = cfg["coordination"].get("link_proxy_spacing", 0.055)
+    link_frames = args.link_frames
+    if link_frames is None:
+        link_frames = cfg["coordination"].get(
+            "link_proxy_frames",
+            ["panda_link5", "panda_link6", "panda_link7", "right_gripper"],
+        )
+    link_samples_per_segment = args.link_samples_per_segment
+    if link_samples_per_segment is None:
+        link_samples_per_segment = cfg["coordination"].get(
+            "link_proxy_samples_per_segment", 2
+        )
+    gripper_lateral_offsets = args.gripper_lateral_offsets
+    if gripper_lateral_offsets is None:
+        gripper_lateral_offsets = cfg["coordination"].get(
+            "gripper_proxy_lateral_offsets", [-0.045, 0.045]
+        )
+    gripper_lateral_body_offsets = args.gripper_lateral_body_offsets
+    if gripper_lateral_body_offsets is None:
+        gripper_lateral_body_offsets = cfg["coordination"].get(
+            "gripper_proxy_body_offsets", [0.055, 0.11]
+        )
 
     block_names = {a: [b["name"] for b in cfg[f"{a}_blocks"]] for a in ARMS}
     goal_z      = cfg["table"]["height"] + block_h / 2
@@ -255,20 +571,54 @@ def main():
         """Blend weight for this arm's smooth avoidance correction."""
         if args.no_modulation:
             return 0.0
-        if arm_done(arm):
+        if stage[arm] == Stage.DONE:
             return 0.0
         other = other_arm(arm)
-        if arm_done(other):
-            return 0.0
+        obstacle_scale = (
+            float(args.parked_obstacle_weight)
+            if stage[other] == Stage.DONE else 1.0
+        )
         if arm == priority_arm:
-            return args.priority_mod_weight
-        return args.yield_mod_weight
+            return obstacle_scale * float(_arm_param(args.priority_mod_weight, arm, 0.25))
+        return obstacle_scale * float(_arm_param(args.yield_mod_weight, arm, 1.0))
 
     def modulation_weight(arm):
         """Transport-only alias used by diagnostics and DS modulation."""
         if stage[arm] != Stage.TRANSPORT:
             return 0.0
         return avoidance_weight(arm)
+
+    def update_priority():
+        """Give right-of-way to the active arm closer to the shared stack."""
+        nonlocal priority_arm
+        if args.priority_policy != "closest_to_stack" or args.no_modulation:
+            return
+        candidates = [
+            a for a in ARMS
+            if stage[a] in (Stage.TRANSPORT, Stage.PLACE, Stage.RETRACT)
+        ]
+        if len(candidates) == 1:
+            if priority_arm != candidates[0]:
+                priority_arm = candidates[0]
+                print(f"  [COORD] Priority -> {priority_arm} (sole active arm)")
+            return
+        if len(candidates) < 2:
+            return
+        goal = np.asarray(goal_xy, dtype=float)
+        ee_xy = {
+            a: ik_motion[a].ik.get_world_pose()[0][:2].copy()
+            for a in candidates
+        }
+        dist = {a: float(np.linalg.norm(ee_xy[a] - goal)) for a in candidates}
+        closest = min(candidates, key=lambda a: dist[a])
+        if closest == priority_arm:
+            return
+        current = priority_arm if priority_arm in candidates else None
+        margin = args.priority_hysteresis
+        if current is None or dist[closest] + margin < dist[current]:
+            priority_arm = closest
+            print(f"  [COORD] Priority -> {priority_arm} "
+                  f"(closer to stack: {dist[closest]:.3f}m)")
 
     def can_place(arm):
         """Yield if other arm is also near the stack goal."""
@@ -298,6 +648,18 @@ def main():
             if norms[arm] > target:
                 vectors[arm] *= target / norms[arm]
 
+    def cap_yield_cart_speed(vectors):
+        """Limit only non-priority Cartesian transport speed."""
+        if args.yield_max_cart_speed is None:
+            return
+        cap = args.speedup * float(args.yield_max_cart_speed)
+        for arm in ARMS:
+            if arm == priority_arm or vectors.get(arm) is None:
+                continue
+            speed = float(np.linalg.norm(vectors[arm]))
+            if speed > cap > 1e-9:
+                vectors[arm] *= cap / speed
+
     def sped_steps(n_steps):
         return max(1, int(round(n_steps / max(args.speedup, 1e-6))))
 
@@ -323,12 +685,20 @@ def main():
 
     mod_mode = "OFF" if args.no_modulation else (
         f"weighted priority={priority_arm} "
+        f"policy={args.priority_policy} "
         f"priority_w={args.priority_mod_weight} yield_w={args.yield_mod_weight}"
     )
     print(f"[DEPLOY] Dual-arm transport DS  model={args.model}  safe={args.use_safe}  "
           f"modulation={mod_mode}")
     print(f"[DEPLOY] Modulation sphere radius={mod_radius:.3f}m "
-          f"reactivity={mod_reactivity:.2f}")
+          f"reactivity={mod_reactivity:.2f} "
+          f"isoline={mod_isoline:.2f} "
+          f"preserve_speed={not args.no_preserve_mod_speed}")
+    print(f"[DEPLOY] Protected points per arm={1 + max(0, link_spheres)} "
+          f"fallback points; FK frames={link_frames}, "
+          f"samples/segment={link_samples_per_segment})")
+    print(f"[DEPLOY] Gripper-width proxy offsets={gripper_lateral_offsets}")
+    print(f"[DEPLOY] Gripper-width body offsets={gripper_lateral_body_offsets}")
     if not args.no_modulation:
         print("[DEPLOY] IK primitives use smooth Cartesian EE modulation")
     print(f"[DEPLOY] IK frame={ik_motion['left'].ik.ee_frame}")
@@ -359,6 +729,7 @@ def main():
             "quat": quat.copy(),
             "s_values": _trapezoid_profile(n_steps, ik_motion[arm].vel_ramp_frac),
             "i": 0,
+            "settle": 0,
             "kind": kind,
         }
 
@@ -401,7 +772,7 @@ def main():
         elif kind == "retract":
             block_idx[arm] += 1
             if arm_done(arm):
-                print(f"  [{arm}] All cubes done; moving to nominal pose")
+                print(f"  [{arm}] Post-place lift clear; moving to nominal pose")
                 ik_motion[arm].set_gripper(open=True)
                 start_joint_plan(arm, default_q[arm], n_steps=120, kind="home")
             else:
@@ -411,15 +782,29 @@ def main():
         nonlocal goal_z, priority_arm
         if wait["after"] == "place_open":
             goal_z += block_h + 0.002
-            priority_arm = other_arm(arm)
-            if not args.no_modulation:
+            if args.priority_policy == "fixed":
+                priority_arm = other_arm(arm)
+            if not args.no_modulation and args.priority_policy == "fixed":
                 print(f"  [COORD] Priority passed to {priority_arm}")
         stage[arm] = wait["next_stage"]
 
     def step_nontransport_plans():
         """Apply all active IK/gripper/home actions for this simulation tick."""
         moved_arms = set()
-        ee_now = {a: ik_motion[a].ik.get_world_pose()[0].copy() for a in ARMS}
+        ee_pose_now = {a: ik_motion[a].ik.get_world_pose() for a in ARMS}
+        ee_now = {a: ee_pose_now[a][0].copy() for a in ARMS}
+        q_now = {a: franka[a].get_joint_positions()[:7].copy() for a in ARMS}
+        protected_now = {
+            a: _protected_points_from_links(
+                ik_motion[a].ik, q_now[a], ee_now[a], ee_pose_now[a][1],
+                link_frames, link_samples_per_segment, max(0, link_spheres),
+                link_sphere_spacing, gripper_lateral_offsets,
+                gripper_lateral_body_offsets
+            )
+            for a in ARMS
+        }
+        if proxy_viz is not None:
+            proxy_viz.update(protected_now)
         next_waypoint = {}
 
         for arm in ARMS:
@@ -439,7 +824,9 @@ def main():
             if w > 0.0:
                 other = other_arm(arm)
                 v_nom = waypoint - ee_now[arm]
-                v_mod = mod.huber.modulate_cartesian(v_nom, ee_now[arm], ee_now[other])
+                v_mod = mod.huber.modulate_cartesian_points(
+                    v_nom, protected_now[arm], protected_now[other]
+                )
                 v_cmd = (1.0 - w) * v_nom + w * v_mod
                 # Keep smooth avoidance from erasing primitive progress.
                 if np.dot(v_cmd, v_nom) <= 0.0:
@@ -449,7 +836,24 @@ def main():
             moved_arms.add(arm)
             if ik_ok:
                 ik_plan_fail_streak[arm] = 0
-                plan["i"] += 1
+                if plan["i"] < len(plan["s_values"]) - 1:
+                    plan["i"] += 1
+                else:
+                    ee_err = np.linalg.norm(ee_now[arm] - plan["end"])
+                    if ee_err <= args.ik_done_tol:
+                        kind = plan["kind"]
+                        ik_plan[arm] = None
+                        finish_ik_plan(arm, kind)
+                        continue
+                    plan["settle"] += 1
+                    if plan["settle"] == args.ik_settle_steps:
+                        print(f"  [WARN] {arm} {plan['kind']} final EE error "
+                              f"{ee_err:.4f}m > {args.ik_done_tol:.4f}m")
+                    if plan["settle"] >= args.ik_settle_steps:
+                        kind = plan["kind"]
+                        ik_plan[arm] = None
+                        finish_ik_plan(arm, kind)
+                        continue
             else:
                 ik_plan_fail_streak[arm] += 1
                 if ik_plan_fail_streak[arm] == 25:
@@ -459,11 +863,8 @@ def main():
                     if ik_motion[arm].step_to(fallback, target_quat=plan["quat"]):
                         print(f"  [WARN] {arm} {plan['kind']} using unmodulated IK waypoint")
                         ik_plan_fail_streak[arm] = 0
-                        plan["i"] += 1
-            if plan["i"] >= len(plan["s_values"]):
-                kind = plan["kind"]
-                ik_plan[arm] = None
-                finish_ik_plan(arm, kind)
+                        if plan["i"] < len(plan["s_values"]) - 1:
+                            plan["i"] += 1
 
         for arm in ARMS:
             wait = gripper_wait[arm]
@@ -484,7 +885,25 @@ def main():
             if plan is None:
                 continue
             s = plan["s_values"][plan["i"]]
-            q = plan["start"] + s * (plan["end"] - plan["start"])
+            q_nom = plan["start"] + s * (plan["end"] - plan["start"])
+            q_now_arm = franka[arm].get_joint_positions()[:7].copy()
+            q_step = q_nom - q_now_arm
+            w = avoidance_weight(arm)
+            if w > 0.0 and np.linalg.norm(q_step) > 1e-9:
+                other = other_arm(arm)
+                J = jacobian_finite_difference(franka[arm])
+                q_step_mod = mod.modulate_joint_velocity_points(
+                    q_dot_nominal=q_step,
+                    self_points=protected_now[arm],
+                    obstacle_points=protected_now[other],
+                    jacobian=J,
+                )
+                q_step_cmd = (1.0 - w) * q_step + w * q_step_mod
+                if np.dot(q_step_cmd, q_step) <= 0.0:
+                    q_step_cmd = q_step
+                q = q_now_arm + q_step_cmd
+            else:
+                q = q_nom
             finger = ik_motion[arm]._finger_width
             full_cmd = np.concatenate([q, [finger, finger]])
             franka[arm].apply_action(_articulation_action(full_cmd))
@@ -511,6 +930,7 @@ def main():
         if all(stage[a] == Stage.DONE for a in ARMS):
             print("[DEPLOY] Both arms finished.")
             break
+        update_priority()
 
         for arm in ARMS:
             if (arm_done(arm) or ik_plan[arm] is not None or
@@ -522,23 +942,24 @@ def main():
                 continue
             bpos = env.get_block_positions()[blk].copy()
             bx, by = bpos[0], bpos[1]
+            pick_xy = _grasp_xy([bx, by], arm, cfg, args.grasp_offset)
 
             # ── Start IK stages; execution happens below one tick at a time ──
             if stage[arm] == Stage.REACH:
                 ee_grasp[arm] = env.get_block_grasp_quat(blk)
-                start_ik_plan(arm, np.array([bx, by, hover_h]),
+                start_ik_plan(arm, np.array([pick_xy[0], pick_xy[1], hover_h]),
                               ee_grasp[arm], sped_steps(steps["reach"]),
                               kind="reach")
                 continue
 
             if stage[arm] == Stage.GRASP:
-                start_ik_plan(arm, np.array([bx, by, grasp_h]),
+                start_ik_plan(arm, np.array([pick_xy[0], pick_xy[1], grasp_h]),
                               ee_grasp[arm], sped_steps(steps["grasp"]),
                               kind="grasp")
                 continue
 
             if stage[arm] == Stage.LIFT:
-                start_ik_plan(arm, np.array([bx, by, lift_h]),
+                start_ik_plan(arm, np.array([pick_xy[0], pick_xy[1], lift_h]),
                               ee_down, sped_steps(steps["lift"]), kind="lift")
                 continue
 
@@ -554,15 +975,30 @@ def main():
                 continue
 
             if stage[arm] == Stage.RETRACT:
-                start_ik_plan(arm, transport_pos, ee_down,
+                post_place_lift = np.array([goal_xy[0], goal_xy[1], lift_h])
+                start_ik_plan(arm, post_place_lift, ee_down,
                               sped_steps(60), kind="retract")
                 continue
 
         moved_arms = step_nontransport_plans()
 
         # ── DS transport step (both arms simultaneously) ───────────────────
-        # Snapshot EE positions before any commands this tick
-        ee_pos = {a: ik_motion[a].ik.get_world_pose()[0].copy() for a in ARMS}
+        # Snapshot EE and wrist/last-link proxy spheres before commands.
+        ee_pose = {a: ik_motion[a].ik.get_world_pose() for a in ARMS}
+        ee_pos = {a: ee_pose[a][0].copy() for a in ARMS}
+        ee_quat = {a: ee_pose[a][1] for a in ARMS}
+        q_snapshot = {a: franka[a].get_joint_positions()[:7].copy() for a in ARMS}
+        protected_points = {
+            a: _protected_points_from_links(
+                ik_motion[a].ik, q_snapshot[a], ee_pos[a], ee_quat[a],
+                link_frames, link_samples_per_segment, max(0, link_spheres),
+                link_sphere_spacing, gripper_lateral_offsets,
+                gripper_lateral_body_offsets
+            )
+            for a in ARMS
+        }
+        if proxy_viz is not None:
+            proxy_viz.update(protected_points)
 
         if args.model == "lpvds":
             cart_vels = {}
@@ -606,8 +1042,16 @@ def main():
                     continue
                 other = other_arm(arm)
                 v_nom = cart_vels[arm]
-                v_mod = mod.huber.modulate_cartesian(v_nom, ee_pos[arm], ee_pos[other])
+                v_mod = mod.huber.modulate_cartesian_points(
+                    v_nom, protected_points[arm], protected_points[other]
+                )
                 cart_vels[arm] = (1.0 - w) * v_nom + w * v_mod
+                nom_sq = float(np.dot(v_nom, v_nom))
+                if nom_sq > 1e-12 and args.min_transport_progress > 0.0:
+                    min_dot = float(args.min_transport_progress) * nom_sq
+                    cmd_dot = float(np.dot(cart_vels[arm], v_nom))
+                    if cmd_dot < min_dot:
+                        cart_vels[arm] += ((min_dot - cmd_dot) / nom_sq) * v_nom
                 cart_modulated[arm] = cart_vels[arm].copy()
 
             for arm in ARMS:
@@ -618,6 +1062,7 @@ def main():
                 max_cart_speed = args.speedup * args.max_cart_speed
                 if speed > max_cart_speed:
                     cart_vels[arm] *= max_cart_speed / speed
+            cap_yield_cart_speed(cart_vels)
             sync_vector_norms(cart_vels)
 
             any_transport = False
@@ -630,22 +1075,44 @@ def main():
                     ee_target = np.clip(ee_target, lpv_min[arm], lpv_max[arm])
                 ik_ok = ik_motion[arm].step_to(ee_target, target_quat=ee_down)
                 other = other_arm(arm)
+                comp = mod.huber.closest_components(
+                    protected_points[arm], protected_points[other],
+                    v_nom=cart_nominal[arm]
+                )
+                if comp is None:
+                    comp = mod.huber.components(
+                        ee_pos[arm], ee_pos[other], v_nom=cart_nominal[arm]
+                    )
                 diag_log.append({
                     "t": global_step * physics_dt,
                     "step": global_step,
                     "arm": arm,
                     "stage": stage[arm].name,
                     "priority_arm": priority_arm,
+                    "priority_policy": args.priority_policy,
                     "mod_weight": float(modulation_weight(arm)),
                     "ee": ee_pos[arm].tolist(),
                     "ee_other": ee_pos[other].tolist(),
+                    "protected_points": protected_points[arm].tolist(),
+                    "protected_points_other": protected_points[other].tolist(),
                     "goal": lpv_model[arm].x_goal.tolist(),
                     "v_nom": cart_nominal[arm].tolist(),
                     "v_mod": cart_modulated[arm].tolist(),
                     "v_cmd": cart_vels[arm].tolist(),
                     "target": ee_target.tolist(),
-                    "gamma": float(mod.huber.gamma(ee_pos[arm], ee_pos[other])),
-                    "distance": float(np.linalg.norm(ee_pos[arm] - ee_pos[other])),
+                    "gamma": comp["gamma"],
+                    "gamma_eff": comp["gamma_eff"],
+                    "mod_isoline": comp["isoline"],
+                    "lambda_r": comp["lambda_r"],
+                    "lambda_t": comp["lambda_t"],
+                    "tail_active": comp["tail_active"],
+                    "preserve_speed": comp["preserve_speed"],
+                    "closest_self_point_index": int(comp.get("self_point_index", 0)),
+                    "closest_other_point_index": int(comp.get("obstacle_point_index", 0)),
+                    "distance": float(comp.get(
+                        "distance", np.linalg.norm(ee_pos[arm] - ee_pos[other])
+                    )),
+                    "ee_distance": float(np.linalg.norm(ee_pos[arm] - ee_pos[other])),
                     "safe_radius": float(mod_radius),
                     "reactivity": float(mod_reactivity),
                     "ik_ok": bool(ik_ok),
@@ -709,10 +1176,10 @@ def main():
             other = other_arm(arm)
             J = jacobian_finite_difference(franka[arm])
             q_dot_nom = q_dots[arm]
-            q_dot_mod = mod.modulate_joint_velocity(
+            q_dot_mod = mod.modulate_joint_velocity_points(
                 q_dot_nominal=q_dot_nom,
-                ee_pos_self=ee_pos[arm],
-                ee_pos_other=ee_pos[other],
+                self_points=protected_points[arm],
+                obstacle_points=protected_points[other],
                 jacobian=J,
             )
             q_dots[arm] = (1.0 - w) * q_dot_nom + w * q_dot_mod
@@ -743,8 +1210,8 @@ def main():
                 print_status(prefix="[IDLE]")
 
     print(f"[DEPLOY] Finished after {global_step} sim steps.")
-    if args.diag_out:
-        diag_path = Path(args.diag_out)
+    diag_path = Path(args.diag_out) if args.diag_out else None
+    if diag_path:
         diag_path.parent.mkdir(parents=True, exist_ok=True)
         with open(diag_path, "wb") as f:
             pickle.dump({
@@ -752,17 +1219,50 @@ def main():
                     "model": args.model,
                     "mod_radius": mod_radius,
                     "mod_reactivity": mod_reactivity,
+                    "mod_isoline": mod_isoline,
                     "priority_mod_weight": args.priority_mod_weight,
+                    "priority_policy": args.priority_policy,
+                    "priority_hysteresis": args.priority_hysteresis,
                     "yield_mod_weight": args.yield_mod_weight,
+                    "preserve_mod_speed": not args.no_preserve_mod_speed,
+                    "link_spheres": int(max(0, link_spheres)),
+                    "link_sphere_spacing": float(link_sphere_spacing),
+                    "link_frames": list(link_frames),
+                    "link_samples_per_segment": int(link_samples_per_segment),
+                    "gripper_lateral_offsets": list(gripper_lateral_offsets),
+                    "gripper_lateral_body_offsets": list(gripper_lateral_body_offsets),
+                    "show_proxy_spheres": bool(args.show_proxy_spheres),
+                    "proxy_sphere_radius": float(args.proxy_sphere_radius),
+                    "isaac_record_out": args.isaac_record_out,
+                    "grasp_xy_offset": cfg["block"].get("grasp_xy_offset", {}),
+                    "grasp_offset_cli": args.grasp_offset,
                     "cart_gain": args.cart_gain,
                     "max_cart_speed": args.max_cart_speed,
+                    "yield_max_cart_speed": args.yield_max_cart_speed,
+                    "min_transport_progress": args.min_transport_progress,
+                    "parked_obstacle_weight": args.parked_obstacle_weight,
                     "speedup": args.speedup,
                     "speed_sync": args.sync_speeds,
                 },
                 "rows": diag_log,
             }, f)
         print(f"[DEPLOY] Saved diagnostics to {diag_path}")
+    _stop_screen_record(screen_recorder)
     simulation_app.close()
+    if args.video_out:
+        video_cmd = [
+            sys.executable,
+            "scripts/animate_lpvds_interaction.py",
+            "--diag", str(diag_path),
+            "--out", args.video_out,
+            "--fps", str(args.video_fps),
+            "--stride", str(args.video_stride),
+            "--views", args.video_views,
+        ]
+        if args.video_radial_field:
+            video_cmd.append("--radial_field")
+        print(f"[DEPLOY] Rendering DS visualization video to {args.video_out}")
+        subprocess.run(video_cmd, check=True)
 
 
 if __name__ == "__main__":
