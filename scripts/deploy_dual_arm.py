@@ -75,11 +75,31 @@ def main():
                         help="Scale learned DS velocity. Use 0 with "
                              "--goal_gain for a pure joint-space attractor "
                              "sanity check.")
+    parser.add_argument("--transport_ds_scale", type=float, default=None,
+                        help="Optional DS velocity scale used only for the "
+                             "transport primitive. Defaults to --ds_scale.")
+    parser.add_argument("--transport_goal_gain", type=float, default=0.0,
+                        help="Additional joint-space attraction gain used only "
+                             "for the transport primitive. This keeps transport "
+                             "DS in the loop while stabilizing a divergent "
+                             "transport field.")
+    parser.add_argument("--transport_min_radial_speed", type=float, default=0.0,
+                        help="For transport only, enforce a minimum inward "
+                             "joint-space radial speed toward q_goal in rad/s. "
+                             "This is a diagnostic flow guard for divergent "
+                             "transport checkpoints; 0 leaves the DS unchanged.")
     parser.add_argument("--max_joint_vel", type=float, default=None,
                         help="Deployment joint velocity clamp in rad/s. "
                              "Defaults to training.max_joint_vel from config.")
     parser.add_argument("--no_modulation", action="store_true",
                         help="Disable DS modulation (ablation).")
+    parser.add_argument("--mod_safe_radius", type=float, default=None,
+                        help="Override inter-arm EE modulation safety radius "
+                             "in meters. Larger values create earlier, more "
+                             "conservative avoidance.")
+    parser.add_argument("--mod_reactivity", type=float, default=4.0,
+                        help="Exponent for inter-arm modulation. Lower values "
+                             "make modulation act earlier over a wider range.")
     parser.add_argument("--stagger_steps", type=int, default=None,
                         help="Initial right-arm launch delay in physics steps. "
                              "Defaults to coordination.start_stagger_steps.")
@@ -90,9 +110,61 @@ def main():
     parser.add_argument("--advance_on_timeout", action="store_true",
                         help="Legacy debug behavior: advance a primitive on "
                              "timeout even when q has not reached q_goal.")
+    parser.add_argument("--ik_primitives", type=str, default="",
+                        help="Comma-separated primitives to execute with the "
+                             "RMPflow IK controller instead of the learned DS, "
+                             "for example 'grasp,place'. This is a practical "
+                             "deployment fallback/ablation; leave empty for "
+                             "pure learned-DS execution.")
+    parser.add_argument("--ik_motion_source", type=str, default="joint_lula",
+                        choices=["joint_lula", "rmpflow"],
+                        help="Controller for --ik_primitives. 'joint_lula' "
+                             "moves toward the same Lula q_goal with clamped "
+                             "joint velocities that still pass through dual-arm "
+                             "modulation. 'rmpflow' uses Cartesian RMPflow and "
+                             "bypasses modulation for those primitives.")
+    parser.add_argument("--ik_goal_gain", type=float, default=3.0,
+                        help="Joint-space attraction gain for "
+                             "--ik_motion_source joint_lula.")
     parser.add_argument("--headless", action="store_true")
-    parser.add_argument("--done_tol", type=float, default=0.05)
+    parser.add_argument("--done_tol", type=float, default=0.05,
+                        help="Legacy completion tolerance. Used as the default "
+                             "joint-space tolerance unless --joint_done_tol is set.")
+    parser.add_argument("--joint_done_tol", type=float, default=None,
+                        help="L2 joint-space tolerance for DS primitive completion. "
+                             "Defaults to --done_tol.")
+    parser.add_argument("--cart_done_tol", type=float, default=0.02,
+                        help="Cartesian EE tolerance in meters for IK primitive "
+                             "completion.")
+    parser.add_argument("--ds_reach_cart_done_tol", type=float, default=0.03,
+                        help="Cartesian EE tolerance in meters that can complete "
+                             "a DS reach primitive even when the redundant joint "
+                             "configuration does not match q_goal exactly.")
+    parser.add_argument("--grasp_cart_done_tol", type=float, default=None,
+                        help="Optional Cartesian tolerance in meters for IK grasp "
+                             "completion. Defaults to --cart_done_tol.")
+    parser.add_argument("--lift_cart_done_tol", type=float, default=None,
+                        help="Optional Cartesian tolerance in meters for IK lift "
+                             "completion. Defaults to --cart_done_tol.")
+    parser.add_argument("--transport_cart_done_tol", type=float, default=None,
+                        help="Optional Cartesian tolerance in meters for IK transport "
+                             "completion. Defaults to --cart_done_tol.")
+    parser.add_argument("--place_cart_done_tol", type=float, default=None,
+                        help="Optional Cartesian tolerance in meters for IK place "
+                             "completion. Defaults to --cart_done_tol.")
     args = parser.parse_args()
+    joint_done_tol = args.done_tol if args.joint_done_tol is None else args.joint_done_tol
+
+    def cart_done_tol_for(primitive):
+        if primitive == "grasp" and args.grasp_cart_done_tol is not None:
+            return args.grasp_cart_done_tol
+        if primitive == "lift" and args.lift_cart_done_tol is not None:
+            return args.lift_cart_done_tol
+        if primitive == "transport" and args.transport_cart_done_tol is not None:
+            return args.transport_cart_done_tol
+        if primitive == "place" and args.place_cart_done_tol is not None:
+            return args.place_cart_done_tol
+        return args.cart_done_tol
 
     from isaacsim import SimulationApp
     _app_cfg = {"headless": args.headless}
@@ -104,6 +176,7 @@ def main():
     from src.env import DualArmEnv
     from src.coordinator import TaskSequencer
     from src.franka_ik import FrankaIK
+    from src.ik_controller import IKController
     from src.modulation import InterArmModulation, jacobian_finite_difference
     from src.primitives import gripper_action_for_primitive
 
@@ -113,6 +186,13 @@ def main():
     cfg = env.cfg
     franka = {"left": env.frankas["left"], "right": env.frankas["right"]}
     ik_kin = {arm: FrankaIK(franka[arm]) for arm in franka}
+    ik_motion = {arm: IKController(franka[arm], name=f"{arm}_rmpflow")
+                 for arm in franka}
+    ik_primitives = {p.strip() for p in args.ik_primitives.split(",") if p.strip()}
+    valid_primitives = {"reach", "grasp", "lift", "transport", "place"}
+    bad_primitives = ik_primitives - valid_primitives
+    if bad_primitives:
+        raise ValueError(f"Unknown --ik_primitives entries: {sorted(bad_primitives)}")
 
     ckpt_dir = Path(cfg["paths"]["checkpoints"])
     ds_set = load_ds_set(ckpt_dir, args.ckpt_arm, device)
@@ -125,8 +205,9 @@ def main():
 
     seq = TaskSequencer(env, cfg)
     mod = InterArmModulation(
-        safe_radius=cfg["coordination"]["ee_safety_radius"],
-        reactivity=4.0,
+        safe_radius=(cfg["coordination"]["ee_safety_radius"]
+                     if args.mod_safe_radius is None else args.mod_safe_radius),
+        reactivity=args.mod_reactivity,
     )
 
     physics_dt = cfg["sim"]["physics_dt"]
@@ -170,6 +251,8 @@ def main():
           f"modulation={'OFF' if args.no_modulation else 'ON'}, "
           f"goal_gain={args.goal_gain}, ds_scale={args.ds_scale}, "
           f"max_joint_vel={max_joint_vel}")
+    if ik_primitives:
+        print(f"[DEPLOY] IK primitives: {', '.join(sorted(ik_primitives))}")
     if stagger_steps > 0:
         print(f"[DEPLOY] Initial stagger: right arm starts after "
               f"{stagger_steps} steps ({stagger_steps * physics_dt:.2f}s)")
@@ -216,10 +299,25 @@ def main():
                 update_q_goal(arm)
                 last_prim[arm] = task.current_primitive
                 prim_steps[arm] = 0
+                ik_motion[arm].reset()
 
             prim_steps[arm] += 1
 
             q = franka[arm].get_joint_positions()[:7].copy()
+            if task.current_primitive in ik_primitives:
+                if args.ik_motion_source == "rmpflow":
+                    ik_motion[arm].step_to(seq.cartesian_target(arm),
+                                           seq.ee_orientation(arm))
+                    q_dots[arm] = None
+                else:
+                    x = q - task.q_goal
+                    q_dots[arm] = np.clip(
+                        -args.ik_goal_gain * x,
+                        -max_joint_vel,
+                        max_joint_vel,
+                    )
+                continue
+
             ds = ds_set[task.current_primitive]
             x = q - task.q_goal
             x_n = (x - ds["state_mean"]) / ds["state_std"]
@@ -233,9 +331,24 @@ def main():
             else:
                 with torch.no_grad():
                     qd_n = ds["model"](x_t)
-            q_dots[arm] = args.ds_scale * qd_n.cpu().numpy().squeeze(0) * ds["vel_scale"]
-            if args.goal_gain > 0:
-                q_dots[arm] = q_dots[arm] - args.goal_gain * x
+            ds_scale = args.ds_scale
+            goal_gain = args.goal_gain
+            if task.current_primitive == "transport":
+                ds_scale = (args.transport_ds_scale
+                            if args.transport_ds_scale is not None else ds_scale)
+                goal_gain += args.transport_goal_gain
+            q_dots[arm] = ds_scale * qd_n.cpu().numpy().squeeze(0) * ds["vel_scale"]
+            if goal_gain > 0:
+                q_dots[arm] = q_dots[arm] - goal_gain * x
+            if (task.current_primitive == "transport"
+                    and args.transport_min_radial_speed > 0
+                    and np.linalg.norm(x) > 1e-9):
+                inward = -x / np.linalg.norm(x)
+                radial_speed = float(np.dot(q_dots[arm], inward))
+                if radial_speed < args.transport_min_radial_speed:
+                    q_dots[arm] = q_dots[arm] + (
+                        args.transport_min_radial_speed - radial_speed
+                    ) * inward
             q_dots[arm] = np.clip(q_dots[arm], -max_joint_vel, max_joint_vel)
 
         # Apply modulation between the two arms
@@ -271,12 +384,42 @@ def main():
                 continue
             q = franka[arm].get_joint_positions()[:7]
             timed_out = prim_steps[arm] >= prim_timeout[task.current_primitive]
-            converged = np.linalg.norm(q - task.q_goal) < args.done_tol
+            if task.current_primitive in ik_primitives:
+                if args.ik_motion_source == "joint_lula":
+                    done_err = np.linalg.norm(q - task.q_goal)
+                    converged = done_err < joint_done_tol
+                    done_label = "||q-q_goal||"
+                else:
+                    ee_pos_now = env.get_ee_pose(arm)[0]
+                    target_now = seq.cartesian_target(arm)
+                    done_err = np.linalg.norm(ee_pos_now - target_now)
+                    converged = done_err < cart_done_tol_for(task.current_primitive)
+                    done_label = "||ee-target||"
+            else:
+                joint_err = np.linalg.norm(q - task.q_goal)
+                cart_err = np.linalg.norm(env.get_ee_pose(arm)[0] - seq.cartesian_target(arm))
+                if (task.current_primitive == "reach"
+                        and cart_err < args.ds_reach_cart_done_tol):
+                    done_err = cart_err
+                    converged = True
+                    done_label = "||ee-target||"
+                else:
+                    done_err = joint_err
+                    converged = done_err < joint_done_tol
+                    done_label = "||q-q_goal||"
             if converged or timed_out:
                 if timed_out and not converged:
+                    cart_timeout_err = np.linalg.norm(
+                        env.get_ee_pose(arm)[0] - seq.cartesian_target(arm)
+                    )
+                    joint_timeout_err = np.linalg.norm(
+                        franka[arm].get_joint_positions()[:7] - task.q_goal
+                    )
                     print(f"[WARN] {arm}/{task.current_primitive} timed out "
                           f"after {prim_steps[arm]} steps "
-                          f"(||q-q_goal||={np.linalg.norm(q - task.q_goal):.3f})")
+                          f"({done_label}={done_err:.3f}, "
+                          f"cart_err={cart_timeout_err:.3f}, "
+                          f"joint_err={joint_timeout_err:.3f})")
                     if not args.advance_on_timeout:
                         print("[DEPLOY] Aborting instead of advancing. Use "
                               "--advance_on_timeout only for phase-flow debugging.")

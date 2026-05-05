@@ -93,6 +93,10 @@ def main():
     parser.add_argument("--joint_done_tol", type=float, default=0.03,
                         help="Joint-space tolerance for early stopping in "
                              "--motion_source joint_lula.")
+    parser.add_argument("--max_q_goal_error", type=float, default=0.08,
+                        help="Discard a demo attempt if a joint_lula primitive "
+                             "settles farther than this L2 joint error from "
+                             "its Lula q_goal.")
     parser.add_argument("--direct_joint_set", action="store_true", default=True,
                         help="For --motion_source joint_lula, set joint "
                              "positions directly along the generated demo "
@@ -251,10 +255,12 @@ def main():
                 # primitive attractor is known.
                 prim_buf = []
 
-                def record():
+                def record(q_override=None, q_dot_override=None):
                     nonlocal prev_q
-                    q = franka.get_joint_positions()[:7].copy()
-                    q_dot = (q - prev_q) / physics_dt
+                    q = (franka.get_joint_positions()[:7].copy()
+                         if q_override is None else q_override.copy())
+                    q_dot = ((q - prev_q) / physics_dt
+                             if q_dot_override is None else q_dot_override.copy())
                     prim_buf.append({
                         "q":         q,
                         "q_dot":     q_dot,
@@ -280,22 +286,42 @@ def main():
                     q_goal_lula = q_seed
 
                 if args.motion_source == "joint_lula":
-                    # Generate the expert in the same joint-error space used by
-                    # deployment. This avoids training on RMPflow's null-space
-                    # choice while deploying to a different Lula q_goal.
+                    # Proportional-decay expert: q_dot = -k * (q - q_goal),
+                    # clipped to max_joint_vel. Velocity scales with the error
+                    # and goes to zero at the attractor — required for the DS
+                    # architecture's f(0)=0 to be consistent with the data near
+                    # the goal. The earlier linear-time interpolator made q_dot
+                    # constant across the whole primitive, which trains a
+                    # near-discontinuous (and divergent) flow.
                     max_joint_vel = cfg["training"]["max_joint_vel"]
+                    k = float(args.joint_goal_gain)
+                    # Worst-case decay budget: reach within done_tol from the
+                    # initial error under proportional control. Guard against
+                    # tiny errors (log explodes) and tiny gains.
                     q_start = franka.get_joint_positions().copy()
-                    dist = float(np.max(np.abs(q_goal_lula - q_start[:7])))
-                    min_steps = int(np.ceil(dist / (max_joint_vel * physics_dt)))
-                    n_steps = max(steps[primitive], min_steps) + args.settle_extra_steps
+                    e0 = np.linalg.norm(q_start[:7] - q_goal_lula)
+                    if e0 > args.joint_done_tol and k > 1e-3:
+                        decay_steps = int(np.ceil(
+                            np.log(e0 / args.joint_done_tol) / (k * physics_dt)
+                        ))
+                    else:
+                        decay_steps = 0
+                    n_steps = max(steps[primitive], decay_steps) + args.settle_extra_steps
                     n_steps = max(n_steps, 2)
-                    prev_q = q_start[:7].copy()
+                    q_demo = q_start[:7].copy()
+                    prev_q = q_demo.copy()
 
                     for i in range(1, n_steps + 1):
-                        s = i / n_steps
-                        q_cmd = q_start.copy()
-                        q_cmd[:7] = q_start[:7] + s * (q_goal_lula - q_start[:7])
+                        q_now = (q_demo.copy() if args.direct_joint_set
+                                 else franka.get_joint_positions()[:7].copy())
+                        e = q_now - q_goal_lula
+                        if np.linalg.norm(e) < args.joint_done_tol:
+                            break
+                        q_dot_des = np.clip(-k * e, -max_joint_vel, max_joint_vel)
+                        q_cmd = franka.get_joint_positions().copy()
+                        q_cmd[:7] = q_now + q_dot_des * physics_dt
                         if args.direct_joint_set:
+                            q_demo = q_cmd[:7].copy()
                             franka.set_joint_positions(q_cmd)
                         else:
                             franka.apply_action(
@@ -303,15 +329,13 @@ def main():
                             )
                         env.world.step(render=not args.headless)
                         carry_held_block()
-                        record()
-                    if args.direct_joint_set:
-                        q_final = franka.get_joint_positions().copy()
-                        q_final[:7] = q_goal_lula
-                        franka.set_joint_positions(q_final)
-                        env.world.step(render=not args.headless)
-                        carry_held_block()
-                        record()
-                    q_settled = franka.get_joint_positions()[:7].copy()
+                        if args.direct_joint_set:
+                            record(q_override=q_demo, q_dot_override=q_dot_des)
+                            prev_q = q_demo.copy()
+                        else:
+                            record()
+                    q_settled = (q_demo.copy() if args.direct_joint_set
+                                 else franka.get_joint_positions()[:7].copy())
                 else:
                     ik_motion.move_to(
                         world=env.world,
@@ -336,6 +360,12 @@ def main():
 
                 q_goal = q_settled if args.q_goal_source == "settled" else q_goal_lula
                 q_goal_lula_error = float(np.linalg.norm(q_settled - q_goal_lula))
+                if (args.motion_source == "joint_lula"
+                        and q_goal_lula_error > args.max_q_goal_error):
+                    print(f"    [WARN] {primitive} settled {q_goal_lula_error:.3f} "
+                          f"rad from Lula q_goal; discarding this demo attempt")
+                    demo_failed = True
+                    break
                 if q_goal_lula_error > 0.25:
                     print(f"    [WARN] {primitive} Lula q_goal differs from "
                           f"expert settled q by {q_goal_lula_error:.3f} rad; "

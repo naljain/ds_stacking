@@ -74,8 +74,10 @@ class DualArmEnv:
         camera.CreateFocalLengthAttr(24.0)
         camera.CreateClippingRangeAttr(Gf.Vec2f(0.01, 1000.0))
         xform = UsdGeom.Xformable(camera.GetPrim())
-        xform.AddTranslateOp().Set(Gf.Vec3d(0.0, -1.45, 1.55))
-        xform.AddRotateXYZOp().Set(Gf.Vec3f(62.0, 0.0, 0.0))
+        # Front-of-table view: camera is on the far side of the table looking
+        # back toward the robots, with enough height to see the stack.
+        xform.AddTranslateOp().Set(Gf.Vec3d(0.0, 1.65, 1.45))
+        xform.AddRotateXYZOp().Set(Gf.Vec3f(62.0, 0.0, 180.0))
         stage.SetDefaultPrim(stage.GetPrimAtPath("/World"))
 
     def _build_ground(self):

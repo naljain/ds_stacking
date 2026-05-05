@@ -12,10 +12,23 @@ block:
   size: 0.05
   mass: 0.05
 
+# arms:
+#   spacing: 0.60     # distance between left and right arm base in X
+#   y:       0.0      # Y position of arm bases
+#   face_table_quat: [0.7071, 0.0, 0.0, 0.7071]   # 90° around Z
+
 arms:
   spacing: 0.60     # distance between left and right arm base in X
   y:       0.0      # Y position of arm bases
   face_table_quat: [0.7071, 0.0, 0.0, 0.7071]   # 90° around Z
+
+  # Default joint poses in radians (raw values).
+  # Left arm: exact values from reference pose.
+  # Right arm: j0 and j1 mirrored (sign flipped); j2-j6 kept the same
+  #            until confirmed by testing.
+  #   j0       j1       j2        j3       j4      j5      j6
+  default_joints_left:  [ 1.93,  1.10, -1.8639, -2.6820,  1.0833,  1.9480, -0.1237]
+  default_joints_right: [-1.93, 1.10, 1.8639, -2.6820,  -1.0833,  1.9480, 0.1237]
 
 # ── Initial block layout ───────────────────────────────────────────────────────
 left_blocks:
@@ -34,7 +47,7 @@ goals:
 
 # ── Motion primitive heights ──────────────────────────────────────────────────
 heights:
-  hover:  0.89    # table_height + 0.15 — pre-grasp hover
+  hover:  0.95    # table_height + 0.21 — pre-grasp hover
   grasp:  0.77    # table_height + 0.03 — fingertips at mid-block
   lift:   0.99    # table_height + 0.25 — transport altitude
 
@@ -44,7 +57,7 @@ sim:
   rendering_dt:  0.01667    # 1/60
   steps_per_primitive:
     reach:     120
-    grasp:     60m
+    grasp:     60
     lift:      80
     transport: 150
     place:     80
@@ -58,9 +71,12 @@ training:
   lyapunov_hidden:  64
   alpha:            1.0      # Lyapunov decay rate
   lambda_stab:      0.05     # light Lyapunov regularizer; do not let it dominate imitation
+  stable_skip_gain: 1.0      # convergent linear prior baked into the architecture
+                             # (f(e) = residual(e) - gain * e). 0 means pure NN
+                             # residual, which trains poorly when demos are noisy.
   lr:               1.0e-3
   batch_size:       256
-  epochs:           2000
+  epochs:           1200
   device:           cuda
   max_joint_vel:    1.5      # rad/s clamp applied at deployment (per joint)
 

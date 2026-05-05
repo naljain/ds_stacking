@@ -37,6 +37,7 @@ class ArmTaskState:
         self.gripper_open      = True
         self.q_goal = None    # set by the deployment loop after IK
         self.reserved_goal_z = None
+        self.source_block_pos = None
 
     @property
     def current_block(self):
@@ -51,6 +52,7 @@ class ArmTaskState:
         else:
             self.current_block_idx += 1
             self.current_primitive = "reach"
+            self.source_block_pos = None
 
     def is_done(self):
         return self.current_block_idx >= len(self.block_order)
@@ -84,6 +86,10 @@ class TaskSequencer:
         if task.is_done():
             return None
         block_pos = self.env.get_block_positions()[task.current_block]
+        if task.current_primitive in ("reach", "grasp"):
+            task.source_block_pos = block_pos.copy()
+        elif task.current_primitive == "lift" and task.source_block_pos is not None:
+            block_pos = task.source_block_pos
         goal_z = self._goal_z_for_task(task)
         return primitive_target(
             primitive=task.current_primitive,
