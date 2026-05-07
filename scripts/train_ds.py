@@ -24,6 +24,7 @@ from torch.utils.data import DataLoader, TensorDataset
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from src.neural_ds import StableNeuralDS, total_loss, N_JOINTS
+from src.primitives import DS_PRIMITIVES
 
 
 def load_trajectories(demo_paths, primitive):
@@ -42,6 +43,7 @@ def load_trajectories(demo_paths, primitive):
         "per_file": {},
         "per_arm": {},
         "per_block": {},
+        "per_stack_slot": {},
         "per_q_goal_source": {},
         "per_motion_source": {},
         "q_goal_lula_error": {},
@@ -66,12 +68,16 @@ def load_trajectories(demo_paths, primitive):
 
                 arm = step.get("arm", demo.get("arm", "unknown"))
                 block = step.get("block", "unknown")
+                stack_slot = step.get("stack_slot", "unknown")
                 q_goal_source = step.get("q_goal_source", "legacy_unknown")
                 motion_source = step.get("motion_source", "legacy_unknown")
                 manifest["total_samples"] += 1
                 manifest["per_file"][path_key]["samples"] += 1
                 manifest["per_arm"][arm] = manifest["per_arm"].get(arm, 0) + 1
                 manifest["per_block"][block] = manifest["per_block"].get(block, 0) + 1
+                manifest["per_stack_slot"][stack_slot] = (
+                    manifest["per_stack_slot"].get(stack_slot, 0) + 1
+                )
                 manifest["per_q_goal_source"][q_goal_source] = (
                     manifest["per_q_goal_source"].get(q_goal_source, 0) + 1
                 )
@@ -94,7 +100,7 @@ def load_trajectories(demo_paths, primitive):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--primitive", type=str, required=True,
-                        choices=["reach", "grasp", "lift", "transport", "place"])
+                        choices=DS_PRIMITIVES)
     parser.add_argument("--arm", type=str, default="both",
                         choices=["left", "right", "both"])
     parser.add_argument("--config", type=str, default="configs/default.yaml")
@@ -122,6 +128,7 @@ def main():
     print(f"[TRAIN]   source demo files    : {data_manifest['demo_files']}")
     print(f"[TRAIN]   samples by arm       : {data_manifest['per_arm']}")
     print(f"[TRAIN]   samples by block     : {data_manifest['per_block']}")
+    print(f"[TRAIN]   samples by stack slot: {data_manifest['per_stack_slot']}")
     print(f"[TRAIN]   q_goal source counts : {data_manifest['per_q_goal_source']}")
     print(f"[TRAIN]   motion source counts : {data_manifest['per_motion_source']}")
     if data_manifest["q_goal_lula_error"].get("count", 0):

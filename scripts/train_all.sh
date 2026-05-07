@@ -1,10 +1,10 @@
 #!/bin/bash
-# Train all five primitives across both arms.
+# Train learned DS primitives across both arms.
 # Run after collect_ik.py has been run for both arms.
 
 set -e
 
-PRIMITIVES=("reach" "grasp" "lift" "transport" "place")
+PRIMITIVES=("reach" "transport")
 
 for p in "${PRIMITIVES[@]}"; do
     echo ""
@@ -15,4 +15,4 @@ for p in "${PRIMITIVES[@]}"; do
 done
 
 echo ""
-echo "[DONE] All primitives trained. Checkpoints in data/checkpoints/"
+echo "[DONE] Learned DS primitives trained. Checkpoints in data/checkpoints/"

@@ -14,7 +14,10 @@ e = q - q_goal       q, q_goal ∈ R^7
 `q` is the current Franka arm configuration (7 joints; fingers are handled
 separately by the gripper). `q_goal` is the joint configuration produced by a
 single Lula IK call at each primitive transition. While the primitive is
-running, the DS — not IK — is what drives motion.
+running, `reach` and `transport` are driven by the DS. The short constrained
+primitives, `grasp`, `lift`, and `place`, use the same `q_goal` convention but
+are executed by the Lula joint-space controller instead of learned DS
+checkpoints.
 
 Using `e` (rather than concatenating `[q, q_goal] ∈ R^14`) is deliberate: the
 distribution of `e` is the same regardless of which IK solver computed
@@ -55,10 +58,10 @@ Two pieces:
 
 1. **Learned residual** $f_\text{res}(e) = \text{net}(e) - \text{net}(0)$.
    By subtracting `net(0)` we force $f_\text{res}(0) = 0$ exactly.
-2. **Optional linear prior** $-k_{\text{skip}} e$ (controlled by
+2. **Linear prior** $-k_{\text{skip}} e$ (controlled by
    `stable_skip_gain`). When non-zero, this adds a globally-attracting linear
-   field around which the residual learns. Default is `0`, so the DS is
-   purely the learned residual.
+   field around which the residual learns. The current default is `1.0`, so
+   the learned residual is trained around a stable linear joint-error field.
 
 Either way, the equilibrium at `e = 0` is **guaranteed by construction**:
 $f_\theta(0) = 0$ regardless of weights.
@@ -162,6 +165,13 @@ learned PSD parameterisation needed.
 
 ## Training
 
+The current pipeline trains DS checkpoints only for `reach` and `transport`.
+Demonstrations still contain labels for `grasp`, `lift`, and `place` so those
+segments can be audited, but the deployment controller executes them with Lula.
+Collection is Lula-only, slower than the early debug runs, includes non-recorded
+settling pauses between primitives, and uses the same dynamic transport stack
+clearance that deployment uses.
+
 `total_loss` (`src/neural_ds.py:162`) combines two terms:
 
 $$
@@ -179,7 +189,8 @@ $$
   real-time `dV/dt`, not the dot product in the network's normalised
   coordinates.
 
-`λ_stab` (default 0.5) trades off imitation fidelity against stability margin.
+`λ_stab` (default `0.05` in `configs/default.yaml`) trades off imitation
+fidelity against stability margin.
 
 ## Safe velocity (hard projection at deploy)
 

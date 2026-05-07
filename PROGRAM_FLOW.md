@@ -1,20 +1,25 @@
 # Program Flow: Data Collection to Deployment
 
-This project trains and deploys joint-space Neural Dynamical Systems (DS) for
-Franka block stacking in Isaac Sim. The full pipeline is:
+This project trains and deploys a hybrid joint-space controller for Franka
+block stacking in Isaac Sim. The long free-space primitives, `reach` and
+`transport`, use learned Neural Dynamical Systems (DS). The short constrained
+primitives, `grasp`, `lift`, and `place`, use a Lula joint-space controller.
+The full pipeline is:
 
 1. Build an Isaac Sim scene with one or two Franka arms, a table, blocks, and
    stack goals.
 2. Collect demonstrations with a joint-space Lula-goal expert.
 3. Convert demonstrations into joint-error and joint-velocity training pairs.
-4. Train one Neural DS per primitive.
-5. Deploy the trained DS models by switching between primitive goals.
+4. Train Neural DS models for `reach` and `transport`.
+5. Deploy by switching between learned DS primitives and scripted Lula
+   primitives.
 6. Optionally evaluate the full dual-arm system under perturbations.
 
-The important idea is that IK is used to generate and label demonstrations, but
-deployment is meant to be a learned joint-space DS. At deployment time, the
-program computes a joint goal `q_goal` for the active primitive, then the learned
-DS outputs `q_dot` commands that should drive the robot toward that goal.
+The important idea is that every primitive is labeled with the same Lula
+`q_goal` convention used at deployment. At deployment time, the program computes
+`q_goal` for the active primitive. `reach` and `transport` pass the joint error
+through the learned DS; `grasp`, `lift`, and `place` follow the same target with
+a clamped joint-space Lula controller.
 
 ## Main Files
 
@@ -22,13 +27,12 @@ DS outputs `q_dot` commands that should drive the robot toward that goal.
   timing, training hyperparameters, and output paths.
 - `src/env.py` builds the Isaac Sim environment.
 - `src/primitives.py` defines the primitive order and Cartesian targets.
-- `src/ik_controller.py` wraps RMPflow for the legacy collection option.
 - `src/franka_ik.py` wraps Lula IK for computing joint goals.
 - `scripts/collect_ik.py` records demonstration trajectories.
 - `scripts/audit_demo_labels.py` checks that primitive labels and `q_goal`
   attractor labels are consistent before training.
-- `scripts/train_ds.py` trains a Neural DS for one primitive.
-- `scripts/train_all.sh` trains all primitive models.
+- `scripts/train_ds.py` trains a Neural DS for one learned primitive.
+- `scripts/train_all.sh` trains the `reach` and `transport` DS models.
 - `src/neural_ds.py` defines the DS and Lyapunov networks.
 - `src/coordinator.py` manages primitive sequencing and stack slots.
 - `scripts/deploy_single_arm.py` deploys one arm.
@@ -45,10 +49,14 @@ The config defines:
 - Block size, mass, colors, and initial positions.
 - Franka arm spacing and base orientation.
 - Stack goal locations.
+- Dynamic stack clearance:
+  - `stack.clearance_above_top`
 - Primitive heights:
   - `hover`: height for `reach`
   - `grasp`: height for descending to the block
   - `lift`: height for carrying blocks
+- Inter-primitive settling:
+  - `sim.inter_primitive_pause_steps`
 - Simulation timestep:
   - `physics_dt`
   - `rendering_dt`
@@ -70,8 +78,9 @@ The config defines:
   - checkpoints go to `data/checkpoints`
   - evaluation results go to `data/results`
 
-The scene and scripts all read this same config, so changing a height or block
-layout changes both collection and deployment behavior.
+The scene and scripts all read this same config, so changing a height, stack
+clearance, collection speed, or block layout changes both collection and
+deployment behavior.
 
 ## 2. Environment Construction
 
@@ -120,7 +129,8 @@ Each primitive maps the current task state to a Cartesian target:
 - `reach`: move above the source block at hover height.
 - `grasp`: descend to the block at grasp height.
 - `lift`: raise the block to lift height.
-- `transport`: move above the stack goal at lift height.
+- `transport`: move above the stack goal at a clearance height that rises with
+  the current stack.
 - `place`: descend to the stack height.
 
 The gripper only actuates at the end of two primitives:
@@ -138,19 +148,14 @@ Data collection is handled by `scripts/collect_ik.py`.
 Typical commands:
 
 ```bash
-python scripts/collect_ik.py --arm left --n_demos 50 --headless
-python scripts/collect_ik.py --arm right --n_demos 50 --headless
+python scripts/collect_ik.py --arm left --n_demos 50 --headless --block_xy_jitter 0.02 --start_jitter 0.15
+python scripts/collect_ik.py --arm right --n_demos 50 --headless --block_xy_jitter 0.02 --start_jitter 0.15
 ```
 
-The collector defaults to `--motion_source joint_lula`. For each primitive, it
-computes the same Lula `q_goal` that deployment will use, then records a
-joint-space expert trajectory moving toward that target. This keeps the
-demonstrated velocity and the saved attractor label in the same joint-space DS.
-
-The older Cartesian RMPflow collection path is still available with
-`--motion_source rmpflow`, but it is diagnostic for the pure joint-space DS
-pipeline because RMPflow can settle in a different redundant-arm null-space
-configuration than a fresh Lula solve.
+The collector computes the same Lula `q_goal` that deployment will use, then
+records a joint-space expert trajectory moving toward that target. This keeps
+the demonstrated velocity and the saved attractor label in the same joint-space
+convention.
 
 For each demo, the script:
 
@@ -165,9 +170,11 @@ For each demo, the script:
    - `lift`
    - `transport`
    - `place`
-7. Records joint positions and finite-difference joint velocities at every
-   controller step.
-8. Saves all successful demos to a pickle file.
+7. Pauses between primitives without recording, so the arm settles without
+   teaching the DS to stop at non-goal states.
+8. Records joint positions and finite-difference joint velocities during the
+   primitive controller steps.
+9. Saves all successful demos to a pickle file.
 
 The saved paths are:
 
@@ -186,12 +193,29 @@ Each recorded step stores:
 - `arm`: left or right
 - `target`: Cartesian primitive target
 - `q_goal`: joint-space attractor for the primitive
+- `stack_slot`: reserved stack slot, when applicable
+- `stack_goal_z`: desired block-center stack height, when applicable
+- collection speed metadata, including joint goal gain and joint velocity cap
+
+Collection defaults are deliberately slower and cleaner than early debugging
+runs:
+
+```text
+--joint_goal_gain 2.0
+--collection_max_joint_vel 1.2
+sim.inter_primitive_pause_steps: 120
+```
+
+Transport collection uses the same stack-clearance rule as deployment:
+
+```text
+transport_z = max(lift_h, existing_stack_top + stack.clearance_above_top)
+```
 
 ### How `q_goal` Is Labeled
 
-At the start of each primitive, the collector labels `q_goal`. By default,
-`--motion_source joint_lula --q_goal_source lula` uses the same Lula IK target
-that deployment uses for that primitive transition.
+At the start of each primitive, the collector labels `q_goal` with the same
+Lula IK target that deployment uses for that primitive transition.
 
 This is important. The DS is trained on:
 
@@ -297,28 +321,25 @@ for demo_file in demo_paths:
             velocities.append(step["q_dot"])
 ```
 
-So `both_reach.pt` is trained only from timesteps labeled `reach`.
-`both_grasp.pt` is trained only from timesteps labeled `grasp`, and so on.
+So `both_reach.pt` is trained only from timesteps labeled `reach`, and
+`both_transport.pt` is trained only from timesteps labeled `transport`.
 
 The primitive split is therefore:
 
 | Checkpoint | Training samples used |
 |---|---|
 | `both_reach.pt` | all `reach` timesteps |
-| `both_grasp.pt` | all `grasp` timesteps |
-| `both_lift.pt` | all `lift` timesteps |
 | `both_transport.pt` | all `transport` timesteps |
-| `both_place.pt` | all `place` timesteps |
 
-This means each DS learns a different local vector field:
+This means each learned DS covers one of the longer free-space motions:
 
 - `reach` learns how to move from the current arm pose to a hover pose above a
   source block.
-- `grasp` learns how to descend from hover to grasp height.
-- `lift` learns how to raise from grasp height to carry height.
 - `transport` learns how to move from source-side lift pose to goal-side lift
   pose.
-- `place` learns how to descend from carry height to stack placement height.
+
+`grasp`, `lift`, and `place` are short constrained motions and are executed
+with the Lula joint-space controller instead of learned DS checkpoints.
 
 ### Arm Partitioning
 
@@ -392,24 +413,26 @@ checkpoint, it prints and saves a `data_manifest` containing:
 - samples by source file
 - samples by arm
 - samples by block
+- samples by stack slot
+- label-source counts
 
 For example, when training:
 
 ```bash
-python scripts/train_ds.py --primitive grasp --arm left
+python scripts/train_ds.py --primitive reach --arm left
 ```
 
-the checkpoint should explicitly say that `left_grasp.pt` was trained only from
-`grasp` timesteps in `data/demonstrations/left_demos.pkl`.
+the checkpoint should explicitly say that `left_reach.pt` was trained only from
+`reach` timesteps in `data/demonstrations/left_demos.pkl`.
 
 When training:
 
 ```bash
-python scripts/train_ds.py --primitive grasp --arm both
+python scripts/train_ds.py --primitive transport --arm both
 ```
 
-the checkpoint should explicitly say that `both_grasp.pt` was trained only from
-`grasp` timesteps pooled from:
+the checkpoint should explicitly say that `both_transport.pt` was trained only from
+`transport` timesteps pooled from:
 
 ```text
 data/demonstrations/left_demos.pkl
@@ -453,13 +476,13 @@ The current DS architecture includes a stable error-space prior:
 f(e_n) = residual_theta(e_n) - stable_skip_gain * e_n
 ```
 
-This is still a pure DS: the stabilizing term is inside the learned primitive
-model and is used during training. It is not the same as deployment
+This is still part of the learned DS: the stabilizing term is inside the
+learned primitive model and is used during training. It is not the same as deployment
 `--goal_gain`, which adds an external controller after the network output and
 is only for diagnostics.
 
-One model is trained per primitive. The standard training command for all five
-primitive models is:
+One model is trained for each learned DS primitive. The standard training
+command is:
 
 ```bash
 bash scripts/train_all.sh
@@ -469,20 +492,14 @@ That runs:
 
 ```bash
 python scripts/train_ds.py --primitive reach --arm both
-python scripts/train_ds.py --primitive grasp --arm both
-python scripts/train_ds.py --primitive lift --arm both
 python scripts/train_ds.py --primitive transport --arm both
-python scripts/train_ds.py --primitive place --arm both
 ```
 
 The output checkpoints are:
 
 ```text
 data/checkpoints/both_reach.pt
-data/checkpoints/both_grasp.pt
-data/checkpoints/both_lift.pt
 data/checkpoints/both_transport.pt
-data/checkpoints/both_place.pt
 ```
 
 Each checkpoint contains:
@@ -505,7 +522,8 @@ bookkeeping:
 
 - which block each arm is working on
 - which primitive is active
-- which stack height is reserved
+- which stack slot is reserved
+- whether a finished arm should return home
 - when to move to the next primitive
 
 For each arm, `ArmTaskState` tracks:
@@ -514,7 +532,7 @@ For each arm, `ArmTaskState` tracks:
 - current block index
 - current primitive
 - current `q_goal`
-- reserved stack height
+- reserved stack slot
 
 The sequence is:
 
@@ -527,21 +545,26 @@ After `place`, the arm advances to the next block and returns to `reach`.
 For `transport` and `place`, the sequencer reserves a stack slot. This prevents
 two arms from targeting the same stack layer during dual-arm operation.
 
+After the final `place` for an arm, deployment sends that arm back to its
+initial home pose by default. This keeps a completed arm from lingering beside
+the stack and blocking the remaining arm.
+
 ## 9. Single-Arm Deployment
 
-`scripts/deploy_single_arm.py` runs the learned DS on one arm.
+`scripts/deploy_single_arm.py` runs one arm with learned DS for `reach` and
+`transport`, and scripted Lula control for `grasp`, `lift`, and `place`.
 
-Pure learned-DS debug command:
+Single-arm debug command:
 
 ```bash
-python scripts/deploy_single_arm.py --arm left --kinematic_carry --use_safe --ds_scale 1.0 --goal_gain 0.0 --done_tol 0.25 --print_every 25 --debug_ik --log_csv data/results/left_pure_ds.csv
+python scripts/deploy_single_arm.py --arm left --kinematic_carry --use_safe --ds_scale 1.0 --goal_gain 0.0 --done_tol 0.25 --cart_done_tol 0.02 --place_cart_done_tol 0.01 --print_every 25 --debug_ik --log_csv data/results/left_ds_lula_scripted.csv
 ```
 
 At startup, the script:
 
 1. Creates the Isaac simulation.
 2. Builds a single-arm environment.
-3. Loads all five primitive checkpoints.
+3. Loads the learned `reach` and `transport` checkpoints.
 4. Creates a `TaskSequencer`.
 5. Computes the first primitive's `q_goal`.
 6. Opens the gripper.
@@ -557,7 +580,7 @@ At every control step:
    ```
 
 3. Normalize the error using checkpoint statistics.
-4. Call the current primitive's DS model.
+4. For `reach` and `transport`, call the current primitive's DS model.
 5. Optionally apply Lyapunov safe projection with `--use_safe`.
 6. Optionally add linear goal attraction:
 
@@ -575,11 +598,18 @@ At every control step:
 9. Send `q_cmd` to Isaac's articulation controller.
 10. Step the simulation.
 
-The primitive completes only when:
+For `grasp`, `lift`, and `place`, the script skips the network call and follows
+the primitive `q_goal` with the clamped Lula joint-space controller.
+
+Learned DS primitives complete when:
 
 ```python
 ||q - q_goal|| < done_tol
 ```
+
+Scripted primitives also use Cartesian completion checks. `place` should use a
+tighter Cartesian tolerance, for example `--place_cart_done_tol 0.01`, so the
+block is released close to the desired stack pose.
 
 If a timeout happens before convergence, single-arm deployment now aborts by
 default. That is the right behavior for pickup tests because advancing from a
@@ -594,10 +624,15 @@ Use `--advance_on_timeout` only for debugging phase flow.
 - `--use_safe`: project the learned velocity so it satisfies the Lyapunov
   decrease condition.
 - `--goal_gain`: add a direct linear attraction toward `q_goal`. Keep this at
-  `0.0` for pure learned-DS runs.
-- `--ds_scale`: scale the learned DS output. Keep this at `1.0` for pure
-  learned-DS runs. Use `--ds_scale 0 --goal_gain 3.0` only as a joint-attractor
-  sanity check when isolating IK or actuation.
+  `0.0` when evaluating the learned `reach`/`transport` DS.
+- `--ds_scale`: scale the learned DS output. Keep this at `1.0` when
+  evaluating the learned `reach`/`transport` DS. Use `--ds_scale 0
+  --goal_gain 3.0` only as a joint-attractor sanity check when isolating IK or
+  actuation.
+- `--cart_done_tol`: Cartesian completion tolerance for scripted IK
+  primitives.
+- `--place_cart_done_tol`: tighter Cartesian completion tolerance before
+  releasing a block at the stack.
 - `--debug_ik`: print Cartesian targets, IK success, seeds, and `q_goal`.
 - `--print_every`: print convergence diagnostics every N steps.
 
@@ -615,15 +650,27 @@ Each arm has its own:
 - task state
 - current primitive
 - current `q_goal`
-- DS velocity
+- DS or scripted Lula velocity
 
 The coordinator reserves stack heights so both arms do not place blocks on the
 same layer. The right arm can also start after a small stagger from the config
 so both arms do not move symmetrically into the shared stack at the same time.
 
 Dual-arm deployment can use DS modulation from `src/modulation.py` to alter
-joint velocities when end-effectors get close. The goal is to keep the system
-continuous rather than adding explicit finite-state collision holds.
+joint velocities when end-effectors get close. Because EE-only modulation does
+not protect elbows and forearms, deployment also samples arm link poses and
+holds one arm if the sampled link/link distance drops below
+`--link_safety_radius`. The hold releases after the distance clears
+`--link_safety_radius + --link_safety_hysteresis`.
+
+Important dual-arm flags:
+
+- `--mod_safe_radius`: end-effector modulation radius.
+- `--mod_reactivity`: end-effector modulation strength.
+- `--link_safety_radius`: sampled-link hold threshold.
+- `--link_safety_hysteresis`: release margin for sampled-link hold.
+- `--no_link_safety_hold`: disables the sampled-link hold for ablation.
+- `--no_return_home_after_done`: leaves completed arms where they finish.
 
 ## 11. Evaluation
 
@@ -670,7 +717,7 @@ primitive attractor. It usually means one of these is true:
 
 The recommended debugging order is:
 
-1. Run the pure learned DS with `--debug_ik --print_every 25`.
+1. Run the hybrid controller with `--debug_ik --print_every 25`.
 2. Check whether `reach` converges before timeout.
 3. Check `cos->goal`.
 4. If it fails, run pure attractor mode only as a diagnostic:
@@ -689,8 +736,8 @@ The recommended debugging order is:
 Collect demonstrations:
 
 ```bash
-python scripts/collect_ik.py --arm left --n_demos 50 --headless
-python scripts/collect_ik.py --arm right --n_demos 50 --headless
+python scripts/collect_ik.py --arm left --n_demos 50 --headless --block_xy_jitter 0.02 --start_jitter 0.15
+python scripts/collect_ik.py --arm right --n_demos 50 --headless --block_xy_jitter 0.02 --start_jitter 0.15
 ```
 
 Audit labels:
@@ -705,25 +752,25 @@ Train all DS models:
 bash scripts/train_all.sh
 ```
 
-Run single-arm pure learned-DS deployment:
+Run single-arm DS + Lula deployment:
 
 ```bash
-python scripts/deploy_single_arm.py --arm left --kinematic_carry --use_safe --ds_scale 1.0 --goal_gain 0.0 --done_tol 0.25 --print_every 25 --debug_ik --log_csv data/results/left_pure_ds.csv
+python scripts/deploy_single_arm.py --arm left --kinematic_carry --use_safe --ds_scale 1.0 --goal_gain 0.0 --done_tol 0.25 --cart_done_tol 0.02 --place_cart_done_tol 0.01 --print_every 25 --debug_ik --log_csv data/results/left_ds_lula_scripted.csv
 ```
 
-Run left-only pure learned-DS deployment after left-only retraining:
+Run left-only deployment after left-only retraining:
 
 ```bash
-python scripts/deploy_single_arm.py --arm left --ckpt_arm left --kinematic_carry --use_safe --ds_scale 1.0 --goal_gain 0.0 --done_tol 0.25 --print_every 25 --debug_ik --log_csv data/results/left_pure_ds.csv
+python scripts/deploy_single_arm.py --arm left --ckpt_arm left --kinematic_carry --use_safe --ds_scale 1.0 --goal_gain 0.0 --done_tol 0.25 --cart_done_tol 0.02 --place_cart_done_tol 0.01 --print_every 25 --debug_ik --log_csv data/results/left_ds_lula_scripted.csv
 ```
 
-Run pure dual-arm deployment:
+Run dual-arm deployment:
 
 ```bash
-python scripts/deploy_dual_arm.py --kinematic_carry --use_safe --ds_scale 1.0 --goal_gain 0.0 --done_tol 0.25
+python scripts/deploy_dual_arm.py --kinematic_carry --use_safe --ds_scale 1.0 --goal_gain 0.0 --done_tol 0.25 --cart_done_tol 0.02 --place_cart_done_tol 0.01 --mod_safe_radius 0.25 --mod_reactivity 2.0 --link_safety_radius 0.20
 ```
 
-Plot all learned primitive DS fields:
+Plot learned DS fields:
 
 ```bash
 python scripts/plot_ds.py --all --ckpt_arm both --use_safe --joints 0 1 --out_dir data/results/ds_plots
@@ -741,7 +788,7 @@ pairs to inspect different 2D slices through the 7D error-space DS.
 
 Diagnostic commands such as `--ds_scale 0`, `--ds_scale 0.2`, or
 `--goal_gain > 0` are useful for isolating IK, actuation, or data issues. They
-are not pure learned-DS runs.
+are not the learned `reach`/`transport` DS setting.
 
 ## 14. Mental Model
 
@@ -756,9 +803,10 @@ which block -> which primitive -> which Cartesian target -> which q_goal
 The continuous layer decides how joints move:
 
 ```text
-q - q_goal -> Neural DS -> q_dot -> q_cmd
+q - q_goal -> Neural DS or Lula joint controller -> q_dot -> q_cmd
 ```
 
-The DS is successful only when the continuous layer reliably drives the current
-joint state to the primitive's `q_goal`. The task should only switch primitives
-after that convergence happens.
+The DS part is successful only when the continuous layer reliably drives the
+current joint state to the primitive's `q_goal` for `reach` and `transport`.
+The task should only switch primitives after the relevant joint or Cartesian
+completion check passes.

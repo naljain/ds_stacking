@@ -6,19 +6,19 @@ MEAM 6230 (Penn) — final project. Team: Nalini Jain, Shivank Gupta, Thomas Ste
 
 ## One-line summary
 
-Two Franka Panda arms in Isaac Sim, each running a learned **joint-space Neural Dynamical System** with **Huber 2019 modulation** for inter-arm collision avoidance, evaluated on cube stacking under perturbations.
+Two Franka Panda arms in Isaac Sim using a hybrid controller: learned **joint-space Neural DS** for `reach` and `transport`, Lula joint-space control for `grasp`, `lift`, and `place`, Huber 2019 end-effector modulation, sampled-link safety holds, dynamic stack clearance, and return-home parking.
 
 ## Why these specific design choices
 
-These aren't defaults — earlier iterations of the project used a Cartesian DS + RMPflow + a discrete FSM coordinator. We deliberately moved to the current architecture so the project is genuinely a *dynamical systems* project rather than "robotics that uses a DS as one component." If you're tempted to suggest changes that walk these back, push back on the user first.
+These aren't defaults — earlier iterations of the project used a Cartesian DS plus a discrete FSM coordinator. We deliberately moved to the current architecture so the project is genuinely a *dynamical systems* project rather than "robotics that uses a DS as one component." If you're tempted to suggest changes that walk these back, push back on the user first.
 
 ### Joint-space DS (not Cartesian)
 
-The DS is `q̇ = f_θ(e)` where `e = q - q_goal`, `q ∈ R^7` is the Franka joint configuration, and `q_goal` is the target joint config for the current primitive. The model is parameterized as `f(e_n) = residual_θ(e_n) - stable_skip_gain * e_n`, so the convergent linear prior is inside the learned DS architecture rather than added as a deployment controller. At deployment, Lula IK is called once at each primitive transition to compute `q_goal`; the inner loop then uses the learned joint-space velocity field, not Cartesian IK or Jacobian inversion. Cartesian DS + Jacobian-pseudoinverse would push singularity / null-space issues into the closed loop and break the stability story.
+The DS is `q̇ = f_θ(e)` where `e = q - q_goal`, `q ∈ R^7` is the Franka joint configuration, and `q_goal` is the target joint config for the current primitive. The model is parameterized as `f(e_n) = residual_θ(e_n) - stable_skip_gain * e_n`, so the convergent linear prior is inside the learned DS architecture rather than added as a deployment controller. At deployment, Lula IK is called once at each primitive transition to compute `q_goal`. For `reach` and `transport`, the inner loop uses the learned joint-space velocity field, not Cartesian IK or Jacobian inversion. Cartesian DS + Jacobian-pseudoinverse would push singularity / null-space issues into the closed loop and break the stability story.
 
-### Huber 2019 modulation (not FSM coordination)
+### Huber 2019 modulation plus link safety
 
-Inter-arm collision avoidance is **smooth, state-dependent velocity shaping**, not a discrete "if EEs are close, hold one arm" finite-state machine. We use the modulation framework of Huber, Billard, Slotine 2019 (*"Avoidance of Convex and Concave Obstacles with Convergence Ensured Through Contraction"*, IEEE RA-L), which extends Khansari-Zadeh & Billard 2012 with: (a) reference-direction basis (eliminates antipodal saddle-points), (b) tail-effect gating (no damping on outward-pointing motion), (c) contraction-based convergence guarantee. The closed loop is therefore a coupled DS, not a hybrid system, so we don't need dwell-time analysis.
+End-effector collision avoidance is smooth, state-dependent velocity shaping. We use the modulation framework of Huber, Billard, Slotine 2019 (*"Avoidance of Convex and Concave Obstacles with Convergence Ensured Through Contraction"*, IEEE RA-L), which extends Khansari-Zadeh & Billard 2012 with: (a) reference-direction basis (eliminates antipodal saddle-points), (b) tail-effect gating (no damping on outward-pointing motion), (c) contraction-based convergence guarantee. EE-only modulation was not enough for this geometry, so dual-arm deployment also samples Franka link poses and uses a discrete hold/release guard when elbows or forearms get too close. Treat this sampled-link hold as a pragmatic deployment safety guard, not as part of the continuous modulation proof.
 
 ### Lyapunov stability
 
@@ -30,11 +30,10 @@ Inter-arm collision avoidance is **smooth, state-dependent velocity shaping**, n
 src/
   env.py             Isaac Sim scene (two Frankas + table + blocks). Builds from configs/default.yaml.
   primitives.py      5 primitives: reach, grasp, lift, transport, place. Cartesian targets + completion checks.
-  ik_controller.py   RMPflow wrapper. Legacy collection option only; not at deployment.
   franka_ik.py       Lula IK wrapper for q_goal lookup. Auto-discovers config paths across Isaac Sim 4.x/5.x.
   neural_ds.py       Joint-space Neural DS + Lyapunov network. StableNeuralDS class.
   modulation.py      Huber 2019 modulation. HuberModulation + InterArmModulation classes.
-  coordinator.py     Slim primitive sequencer. NO collision logic — that's modulation's job.
+  coordinator.py     Primitive sequencer with block order, stack-slot reservation, stack clearance, and return-home state.
   perturbations.py   BlockDisplacement, EEDisturbance, ArmBlock for evaluation.
 
 scripts/
@@ -42,16 +41,16 @@ scripts/
   collect_ik.py            Generate (q, q_goal, q̇) joint-space demos
   audit_demo_labels.py     Audit primitive/q_goal label consistency
   teleop.py                Manual demo collection
-  train_ds.py              Train one primitive
-  train_all.sh             Train all 5 primitives
-  deploy_single_arm.py     Single arm DS deployment
-  deploy_dual_arm.py       Dual arm + Huber modulation
+  train_ds.py              Train one learned DS primitive
+  train_all.sh             Train reach/transport DS primitives
+  deploy_single_arm.py     Single arm DS + Lula scripted deployment
+  deploy_dual_arm.py       Dual arm + Huber modulation + sampled-link safety
   evaluate.py              Full eval suite, logs diagnostics for plotting
   plot_modulation.py       3 figures: field, gamma timeseries, radial dot
 
 configs/default.yaml       All hyperparameters and constants
 data/demonstrations/       Saved (q, q_goal, q̇) trajectory pickles
-data/checkpoints/          Trained model .pt files (one per arm × primitive)
+data/checkpoints/          Trained model .pt files for reach/transport
 data/results/              Eval JSON + diagnostic pickles + figures
 ```
 
@@ -59,12 +58,12 @@ data/results/              Eval JSON + diagnostic pickles + figures
 
 ```
 1. python scripts/smoke_test.py
-2. python scripts/collect_ik.py --arm left  --n_demos 50
-   python scripts/collect_ik.py --arm right --n_demos 50
+2. python scripts/collect_ik.py --arm left  --n_demos 50 --headless --block_xy_jitter 0.02 --start_jitter 0.15
+   python scripts/collect_ik.py --arm right --n_demos 50 --headless --block_xy_jitter 0.02 --start_jitter 0.15
 3. python scripts/audit_demo_labels.py data/demonstrations/left_demos.pkl data/demonstrations/right_demos.pkl
 4. bash scripts/train_all.sh
-5. python scripts/deploy_single_arm.py --arm left --kinematic_carry --use_safe --ds_scale 1.0 --goal_gain 0.0 --done_tol 0.25 --print_every 25 --debug_ik --log_csv data/results/left_pure_ds.csv
-6. python scripts/deploy_dual_arm.py --kinematic_carry --use_safe --ds_scale 1.0 --goal_gain 0.0 --done_tol 0.25
+5. python scripts/deploy_single_arm.py --arm left --kinematic_carry --use_safe --ds_scale 1.0 --goal_gain 0.0 --done_tol 0.25 --cart_done_tol 0.02 --place_cart_done_tol 0.01 --print_every 25 --debug_ik --log_csv data/results/left_ds_lula_scripted.csv
+6. python scripts/deploy_dual_arm.py --kinematic_carry --use_safe --ds_scale 1.0 --goal_gain 0.0 --done_tol 0.25 --cart_done_tol 0.02 --place_cart_done_tol 0.01 --mod_safe_radius 0.25 --mod_reactivity 2.0 --link_safety_radius 0.20
 7. python scripts/evaluate.py --n_trials 10 --use_safe --ds_scale 1.0 --goal_gain 0.0 --done_tol 0.25
 8. python scripts/plot_ds.py --all --ckpt_arm both --use_safe --joints 0 1 --out_dir data/results/ds_plots
 9. python scripts/plot_modulation.py all --diag data/results/diag_<ts>.pkl
@@ -92,13 +91,13 @@ avoid `add_default_ground_plane()` pulling from the remote asset root.
 - **Joint conventions** — Franka has 9 joints in the articulation (7 arm + 2 fingers). All DS work is on `q[:7]`. Fingers are controlled separately via `franka.gripper.apply_action(...)`.
 - **`render=not args.headless`** — every `world.step()` and `env.step()` call needs this so headless mode actually skips rendering.
 - **Configs over magic numbers** — table dimensions, primitive heights, training hyperparams etc. all live in `configs/default.yaml`, not as constants in code. If something needs tuning, check the config first.
-- **One IK call per primitive transition.** The DS handles smooth motion within a primitive; Lula IK is only called when the primitive switches and a new `q_goal` is needed. Don't put IK in the inner loop.
-- **Coordinator stays slim.** It owns block order, primitive order, stack-slot reservation, and the initial arm phase offset. It should not implement close-range hold/release collision logic; that belongs to modulation or an explicit ablation.
+- **One IK call per primitive transition.** Lula IK is only called when the primitive switches and a new `q_goal` is needed. `reach` and `transport` use the DS inside the primitive; `grasp`, `lift`, and `place` use the scripted Lula joint-space controller.
+- **Coordinator stays slim.** It owns block order, primitive order, stack-slot reservation, dynamic stack clearance, return-home state, and the initial arm phase offset. Continuous EE avoidance belongs to modulation; sampled-link hold is an explicit deployment safety guard.
 - **Dual-arm start is intentionally staggered.** `coordination.start_stagger_steps` delays the right arm slightly so both arms do not hit the shared stack in perfect synchrony. This is phase scheduling, not collision arbitration.
 
 ## Known footguns
 
-1. **`extsDeprecated` Lula configs are broken in Isaac Sim 5.x.** The YAML files at `.../extsDeprecated/omni.isaac.motion_generation/.../franka/rmpflow/robot_descriptor.yaml` are stubs. The real configs live under `isaacsim.robot_motion.motion_generation`. `franka_ik.py` already auto-discovers and prefers non-deprecated paths — don't hardcode paths there.
+1. **`extsDeprecated` Lula configs are broken in Isaac Sim 5.x.** The YAML files under deprecated motion-generation extension paths are stubs. The real configs live under `isaacsim.robot_motion.motion_generation`. `franka_ik.py` already auto-discovers and prefers non-deprecated paths — don't hardcode paths there.
 
 2. **Quaternion order is (w, x, y, z)** in Isaac Sim. The `FACE_TABLE` quaternion `[0.7071, 0, 0, 0.7071]` is +90° around Z. Don't confuse with `(x, y, z, w)` ordering used elsewhere (e.g. ROS).
 
@@ -110,11 +109,11 @@ avoid `add_default_ground_plane()` pulling from the remote asset root.
 
 6. **Collection separates motion demos from contact grasp validation.** By default `collect_ik.py` kinematically carries the active block after `grasp` so joint-space demos are not discarded due Isaac contact flakiness. Pass `--physical_grasp` to require the gripper/contact setup to actually lift the cube; in that mode failed lifts are discarded.
 
-7. **Default collection should match deployment q_goal.** The default is `--motion_source joint_lula --q_goal_source lula`: compute the same Lula target used at deployment, then record a joint-space expert moving toward it. The legacy `--motion_source rmpflow` path can be useful for comparison, but RMPflow and Lula often choose different null-space solutions for the same Cartesian target.
+7. **Default collection should match deployment q_goal.** Collection computes the same Lula target used at deployment, then records a joint-space expert moving toward it. Transport collection uses the same dynamic stack clearance as deployment.
 
 8. **`q_goal` labels must match the demonstrated attractor.** The collector stores `q_goal_lula`, `q_goal_settled`, and `q_goal_lula_error` metadata. If `audit_demo_labels.py` shows large final `||q-q_goal||` or many negative `cos(q_dot, -error)` samples, retrain only after recollecting or relabeling; otherwise the learned flow can diverge even when primitive names are correct.
 
-9. **Training data partition is primitive-label based.** Demonstration pickles contain full trajectories. `train_ds.py` filters by `step["primitive"]`, so `*_grasp.pt` is trained only from `grasp` timesteps, `*_place.pt` only from `place` timesteps, etc. The checkpoint stores `data_manifest` with demo files, samples by file, samples by arm, samples by block, and q_goal source counts. Check this manifest before blaming model behavior on architecture.
+9. **Training data partition is primitive-label based.** Demonstration pickles contain full trajectories. `train_ds.py` filters by `step["primitive"]`; the current learned DS checkpoints are for `reach` and `transport`, while `grasp`, `lift`, and `place` run through Lula. The checkpoint stores `data_manifest` with demo files, samples by file, samples by arm, samples by block, samples by stack slot, and label-source counts. Check this manifest before blaming model behavior on architecture.
 
 10. **Shared stack slots are reserved before transport/place.** The coordinator reserves stack heights when an arm asks for a transport/place target, not only after placement completes. Otherwise two arms can target the same stack layer.
 
@@ -122,7 +121,13 @@ avoid `add_default_ground_plane()` pulling from the remote asset root.
 
 12. **Single-arm deploy aborts on timeout by default.** This is intentional. Advancing after a failed `reach` closes the gripper from the wrong pose and hides the real failure. Use `--advance_on_timeout` only for phase-flow debugging.
 
-13. **Jacobian via finite differences is slow.** `jacobian_finite_difference()` does 7 set-and-restore operations per call. Fine for evaluation but if it becomes a bottleneck, swap to Isaac Sim's analytical Jacobian (`articulation.get_jacobians()` — exact field/indexing has shifted between versions, check what works on the install).
+13. **Collection speed is intentionally modest.** The current defaults are `--joint_goal_gain 2.0`, `--collection_max_joint_vel 1.2`, and `sim.inter_primitive_pause_steps: 120`. Faster data can look fine visually but tends to create sharper finite-difference velocities and messier DS fits.
+
+14. **Place completion should be Cartesian-tight.** The block can appear to snap onto the stack with kinematic carry even if the gripper releases from too far away. Use `--place_cart_done_tol 0.01` when judging deployment.
+
+15. **Completed arms should return home.** Dual-arm deployment parks an arm after its last block by default. Disabling that can leave the arm next to the stack and block the other arm's final placements.
+
+16. **Jacobian via finite differences is slow.** `jacobian_finite_difference()` does 7 set-and-restore operations per call. Fine for evaluation but if it becomes a bottleneck, swap to Isaac Sim's analytical Jacobian (`articulation.get_jacobians()` — exact field/indexing has shifted between versions, check what works on the install).
 
 ## Evaluation conditions
 
@@ -134,12 +139,12 @@ arm_block            freeze one arm for ~1s
 combined             all of the above
 ```
 
-Ablations available via flags: `--no_modulation` (FSM-free, naive parallel), `--use_safe` (Lyapunov projection on).
-The project should be viewed and reported as learning a pure DS. The pure
-learned-DS setting is `--ds_scale 1.0 --goal_gain 0.0`, optionally with
-`--use_safe` for hard Lyapunov projection. `--goal_gain > 0`, `--ds_scale < 1`,
-and `--ds_scale 0` are diagnostics for isolating IK/actuation/data issues; do
-not present them as the method or main baseline.
+Ablations available via flags: `--no_modulation`, `--no_link_safety_hold`, and
+`--use_safe` (Lyapunov projection on). The learned DS setting for `reach` and
+`transport` is `--ds_scale 1.0 --goal_gain 0.0`, optionally with `--use_safe`
+for hard Lyapunov projection. `--goal_gain > 0`, `--ds_scale < 1`, and
+`--ds_scale 0` are diagnostics for isolating IK/actuation/data issues; do not
+present them as the method or main baseline.
 
 ## Metrics (evaluate.py)
 

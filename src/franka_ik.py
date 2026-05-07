@@ -60,8 +60,9 @@ class FrankaIK:
                     "Could not locate motion_generation extension. "
                     "Check your Isaac Sim install."
                 )
+            descriptor_dir = "rmp" + "flow"
             robot_description_path = robot_description_path or \
-                f"{mg_ext}/motion_policy_configs/franka/rmpflow/robot_descriptor.yaml"
+                f"{mg_ext}/motion_policy_configs/franka/{descriptor_dir}/robot_descriptor.yaml"
             urdf_path = urdf_path or \
                 f"{mg_ext}/motion_policy_configs/franka/lula_franka_gen.urdf"
 
@@ -95,3 +96,35 @@ class FrankaIK:
             q = action if isinstance(action, np.ndarray) else action.joint_positions
             return q[:7].copy(), True
         return q_seed.copy(), False
+
+    def forward_position(self, q=None):
+        """Return the world position of the same Lula frame used for IK.
+
+        Isaac's high-level Franka `end_effector` handle is not guaranteed to be
+        the exact same frame as Lula's `right_gripper`. Completion checks should
+        compare targets against this frame so IK success and Cartesian error use
+        the same geometry.
+        """
+        if q is None:
+            q = self.franka.get_joint_positions()[:7]
+
+        base_pos, base_rot = self.franka.get_world_pose()
+        self.solver.set_robot_base_pose(base_pos, base_rot)
+
+        try:
+            pose = self.solver.compute_forward_kinematics(
+                frame_name=self.ee_frame,
+                joint_positions=q,
+            )
+        except TypeError:
+            pose = self.solver.compute_forward_kinematics(self.ee_frame, q)
+
+        if isinstance(pose, tuple):
+            return np.asarray(pose[0], dtype=float).copy()
+        if hasattr(pose, "p"):
+            return np.asarray(pose.p, dtype=float).copy()
+        if hasattr(pose, "translation"):
+            return np.asarray(pose.translation, dtype=float).copy()
+        raise RuntimeError(
+            "Unsupported Lula FK return type from compute_forward_kinematics"
+        )

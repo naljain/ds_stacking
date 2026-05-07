@@ -49,6 +49,7 @@ class DualArmEnv:
         self._build_goal_markers()
 
         self.world.reset()
+        self._configure_viewport_camera()
 
     # ── Loading ───────────────────────────────────────────────────────────────
     @staticmethod
@@ -74,11 +75,34 @@ class DualArmEnv:
         camera.CreateFocalLengthAttr(24.0)
         camera.CreateClippingRangeAttr(Gf.Vec2f(0.01, 1000.0))
         xform = UsdGeom.Xformable(camera.GetPrim())
-        # Front-of-table view: camera is on the far side of the table looking
-        # back toward the robots, with enough height to see the stack.
+        # Head-on table-side view: camera is across the table looking back at
+        # the arms, so the shared stack and both grippers stay visible.
         xform.AddTranslateOp().Set(Gf.Vec3d(0.0, 1.65, 1.45))
         xform.AddRotateXYZOp().Set(Gf.Vec3f(62.0, 0.0, 180.0))
         stage.SetDefaultPrim(stage.GetPrimAtPath("/World"))
+
+    def _configure_viewport_camera(self):
+        """Point the interactive viewport at the same head-on view.
+
+        The USD camera above is useful for render products, but Isaac's active
+        perspective viewport can keep its previous camera unless we explicitly
+        set it.
+        """
+        try:
+            from isaacsim.core.utils.viewports import set_camera_view
+            from omni.kit.viewport.utility import get_active_viewport
+
+            viewport = get_active_viewport()
+            if viewport is None:
+                return
+            set_camera_view(
+                eye=np.array([0.0, 1.65, 1.45]),
+                target=np.array([0.0, 0.05, 0.82]),
+                camera_prim_path="/OmniverseKit_Persp",
+                viewport_api=viewport,
+            )
+        except Exception as exc:
+            print(f"[WARN] Could not configure viewport camera: {exc}")
 
     def _build_ground(self):
         """Local ground collider.
@@ -230,6 +254,26 @@ class DualArmEnv:
 
     def get_ee_pose(self, arm):
         return self.frankas[arm].end_effector.get_world_pose()
+
+    def get_arm_link_positions(self, arm):
+        """Return representative Franka link positions for coarse safety checks.
+
+        Isaac's high-level Franka wrapper exposes the end effector directly but
+        not a stable link-distance API across versions. The USD link prims are
+        stable enough for a conservative sampled-link clearance check.
+        """
+        stage = self.world.stage
+        positions = []
+        for i in range(8):
+            prim = stage.GetPrimAtPath(f"/World/Franka_{arm}/panda_link{i}")
+            if not prim or not prim.IsValid():
+                continue
+            mat = UsdGeom.Xformable(prim).ComputeLocalToWorldTransform(0.0)
+            p = mat.ExtractTranslation()
+            positions.append(np.array([p[0], p[1], p[2]], dtype=float))
+        ee_pos = self.get_ee_pose(arm)[0]
+        positions.append(ee_pos.copy())
+        return positions
 
     def get_block_obj(self, name):
         return self.blocks[name]

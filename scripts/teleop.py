@@ -48,14 +48,20 @@ def main():
     import carb
     import omni.appwindow
 
+    try:
+        from isaacsim.core.utils.types import ArticulationAction
+    except ImportError:
+        from omni.isaac.core.utils.types import ArticulationAction
     from src.env import DualArmEnv
-    from src.ik_controller import IKController
+    from src.franka_ik import FrankaIK
 
     env = DualArmEnv(config_path=args.config, arms=(args.arm,))
     cfg = env.cfg
     franka = env.frankas[args.arm]
-    ik = IKController(franka)
-    ik.set_gripper(open=True)
+    ik = FrankaIK(franka)
+    franka.gripper.apply_action(
+        ArticulationAction(joint_positions=np.array([0.04, 0.04]))
+    )
 
     out_dir = Path(cfg["paths"]["demos"])
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -88,7 +94,10 @@ def main():
 
             if event.input == carb.input.KeyboardInput.F:
                 state["gripper_open"] = not state["gripper_open"]
-                ik.set_gripper(open=state["gripper_open"])
+                width = 0.04 if state["gripper_open"] else 0.0
+                franka.gripper.apply_action(
+                    ArticulationAction(joint_positions=np.array([width, width]))
+                )
                 print(f"[TELEOP] Gripper {'open' if state['gripper_open'] else 'closed'}")
 
             elif event.input == carb.input.KeyboardInput.R:
@@ -145,7 +154,17 @@ def main():
             if key in state["keys_held"]:
                 target_pos = target_pos + direction * args.step
 
-        ik.step_to(target_pos)
+        q_seed = franka.get_joint_positions()[:7].copy()
+        q_goal, ok = ik.solve(target_pos, q_seed=q_seed)
+        if ok:
+            q_dot = np.clip(
+                -3.0 * (q_seed - q_goal),
+                -cfg["training"]["max_joint_vel"],
+                cfg["training"]["max_joint_vel"],
+            )
+            q_cmd = franka.get_joint_positions().copy()
+            q_cmd[:7] = q_seed + q_dot * physics_dt
+            franka.apply_action(ArticulationAction(joint_positions=q_cmd))
         env.step(render=True)
 
         if state["recording"]:

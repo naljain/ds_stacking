@@ -273,13 +273,14 @@ def plot_deploy_log(csv_path, out_path):
 
 def checkpoint_paths(args):
     if args.all:
+        from src.primitives import DS_PRIMITIVES
         ckpt_dir = Path(args.ckpt_dir)
         if args.ckpt_arm == "all":
             paths = sorted(ckpt_dir.glob("*.pt"))
         else:
             paths = [
                 ckpt_dir / f"{args.ckpt_arm}_{primitive}.pt"
-                for primitive in ("reach", "grasp", "lift", "transport", "place")
+                for primitive in DS_PRIMITIVES
             ]
         missing = [p for p in paths if not p.exists()]
         if missing:

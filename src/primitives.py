@@ -18,6 +18,11 @@ import numpy as np
 
 PRIMITIVE_ORDER = ["reach", "grasp", "lift", "transport", "place"]
 
+# Only the longer free-space motions are represented by learned DS models.
+# Short constrained motions are cleaner and more reliable as scripted IK moves.
+DS_PRIMITIVES = ["reach", "transport"]
+SCRIPTED_PRIMITIVES = ["grasp", "lift", "place"]
+
 # Gripper pointing straight down, no Z rotation (w,x,y,z Isaac Sim convention)
 DEFAULT_DOWN_QUAT = np.array([0.0, 1.0, 0.0, 0.0])
 

@@ -2,9 +2,8 @@
 Joint-space trajectory collection for joint-space Neural DS training.
 
 For each demo, scripts the arm through the full pick-and-stack sequence on its
-3 blocks. By default it computes the same Lula q_goal used at deployment and
-records a joint-space expert moving toward that attractor. The older Cartesian
-RMPflow expert remains available with --motion_source rmpflow.
+3 blocks. It computes the same Lula q_goal used at deployment and records a
+joint-space expert moving toward that attractor.
 
     q       (7,)   joint positions  (excludes finger joints)
     q_dot   (7,)   joint velocities (finite-diff)
@@ -58,14 +57,13 @@ def main():
                         help="Per-joint random start-pose perturbation (rad). "
                              "Widens the demonstrated trajectory manifold so "
                              "the DS doesn't overfit to one path.")
-    parser.add_argument("--settle_tol", type=float, default=0.01,
-                        help="Extra settling tolerance before switching "
-                             "primitives. Cartesian EE tolerance for rmpflow; "
-                             "joint tolerance is controlled by --joint_done_tol "
-                             "for joint_lula.")
     parser.add_argument("--settle_extra_steps", type=int, default=60,
                         help="Max extra controller steps used to settle at each "
                              "primitive target.")
+    parser.add_argument("--inter_primitive_pause_steps", type=int, default=None,
+                        help="Non-recorded hold steps inserted after each "
+                             "primitive so segment boundaries are clean. "
+                             "Defaults to sim.inter_primitive_pause_steps.")
     parser.add_argument("--lift_check_margin", type=float, default=0.01,
                         help="Block must rise above table + block size + this "
                              "margin after lift, otherwise the demo is retried.")
@@ -74,38 +72,29 @@ def main():
                              "Default collection kinematically carries the "
                              "active block after grasp so DS demos are not "
                              "discarded due contact-grasp flakiness.")
-    parser.add_argument("--motion_source", type=str, default="joint_lula",
-                        choices=["joint_lula", "rmpflow"],
-                        help="Expert used to generate joint-space demos. "
-                             "'joint_lula' computes the same Lula q_goal used "
-                             "at deployment, then records joint-space motion "
-                             "toward that attractor. 'rmpflow' preserves the "
-                             "older Cartesian RMPflow collection path.")
-    parser.add_argument("--q_goal_source", type=str, default="lula",
-                        choices=["settled", "lula"],
-                        help="How to label q_goal in collected samples. "
-                             "'lula' uses the deployment-style Lula IK target. "
-                             "'settled' uses the terminal expert joint state "
-                             "and is mainly useful when auditing rmpflow.")
-    parser.add_argument("--joint_goal_gain", type=float, default=3.0,
-                        help="First-order joint-space expert gain used by "
-                             "--motion_source joint_lula.")
+    parser.add_argument("--joint_goal_gain", type=float, default=2.0,
+                        help="First-order Lula joint-space expert gain.")
+    parser.add_argument("--collection_max_joint_vel", type=float, default=1.2,
+                        help="Per-joint velocity cap in rad/s for collection "
+                             "experts. Kept separate from training.max_joint_vel "
+                             "so demos can be slower without changing "
+                             "deployment clamps.")
     parser.add_argument("--joint_done_tol", type=float, default=0.03,
                         help="Joint-space tolerance for early stopping in "
-                             "--motion_source joint_lula.")
+                             "the Lula joint-space expert.")
     parser.add_argument("--max_q_goal_error", type=float, default=0.08,
                         help="Discard a demo attempt if a joint_lula primitive "
                              "settles farther than this L2 joint error from "
                              "its Lula q_goal.")
     parser.add_argument("--direct_joint_set", action="store_true", default=True,
-                        help="For --motion_source joint_lula, set joint "
+                        help="Set joint "
                              "positions directly along the generated demo "
                              "trajectory instead of relying on articulation "
                              "position-controller tracking. Useful when Isaac "
                              "tracking lags make q_settled differ from q_goal.")
     parser.add_argument("--track_joint_commands", dest="direct_joint_set",
                         action="store_false",
-                        help="For --motion_source joint_lula, use articulation "
+                        help="Use articulation "
                              "position command tracking instead of direct joint "
                              "sets. This is diagnostic only; tracking lag can "
                              "produce inconsistent q_goal labels.")
@@ -118,17 +107,18 @@ def main():
     simulation_app = SimulationApp(_app_cfg)
 
     from src.env import DualArmEnv
-    from src.ik_controller import IKController
     from src.franka_ik import FrankaIK
     from src.primitives import (primitive_target, PRIMITIVE_ORDER,
                                 grasp_quat_from_block)
-    from omni.isaac.core.utils.types import ArticulationAction
+    try:
+        from isaacsim.core.utils.types import ArticulationAction
+    except ImportError:
+        from omni.isaac.core.utils.types import ArticulationAction
 
     env = DualArmEnv(config_path=args.config, arms=(args.arm,))
     cfg = env.cfg
     franka = env.frankas[args.arm]
 
-    ik_motion = IKController(franka)
     ik_kin    = FrankaIK(franka)
 
     block_names = [b["name"] for b in cfg[f"{args.arm}_blocks"]]
@@ -138,9 +128,14 @@ def main():
     lift_h  = cfg["heights"]["lift"]
     grasp_h = cfg["heights"]["grasp"]
     base_z  = cfg["table"]["height"] + cfg["block"]["size"] / 2
+    block_h = cfg["block"]["size"] + 0.002
+    stack_clearance = cfg.get("stack", {}).get("clearance_above_top", 0.12)
     physics_dt = cfg["sim"]["physics_dt"]
 
     steps = cfg["sim"]["steps_per_primitive"]
+    pause_steps = (cfg["sim"].get("inter_primitive_pause_steps", 0)
+                   if args.inter_primitive_pause_steps is None
+                   else args.inter_primitive_pause_steps)
 
     out_dir = Path(cfg["paths"]["demos"])
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -157,17 +152,19 @@ def main():
     if not args.physical_grasp:
         print("[INFO] Kinematic block carry is ON for collection "
               "(use --physical_grasp to require contact grasps).")
-    if args.motion_source == "joint_lula" and args.q_goal_source != "lula":
-        print("[INFO] --motion_source joint_lula requires q_goal_source=lula; "
-              "overriding q_goal_source.")
-        args.q_goal_source = "lula"
+    if pause_steps > 0:
+        print(f"[INFO] Holding {pause_steps} steps between primitives "
+              "without recording.")
+    print(f"[INFO] Lula collection gain={args.joint_goal_gain}, "
+          f"max_joint_vel={args.collection_max_joint_vel} rad/s")
 
     def reset_arm_to_start():
         franka.set_joint_positions(home_q)
         if hasattr(franka, "set_joint_velocities"):
             franka.set_joint_velocities(np.zeros_like(home_q))
-        ik_motion.reset()
-        ik_motion.set_gripper(open=True)
+        franka.gripper.apply_action(
+            ArticulationAction(joint_positions=np.array([0.04, 0.04]))
+        )
         for _ in range(30):
             env.world.step(render=not args.headless)
 
@@ -206,7 +203,6 @@ def main():
                 franka.set_joint_velocities(np.zeros_like(jittered))
             for _ in range(20):
                 env.world.step(render=not args.headless)
-            ik_motion.reset()
 
         demo_traj = []
         prev_q = franka.get_joint_positions()[:7].copy()
@@ -224,8 +220,21 @@ def main():
             obj.set_linear_velocity(np.zeros(3))
             obj.set_angular_velocity(np.zeros(3))
 
+        def hold_between_primitives():
+            if pause_steps <= 0:
+                return
+            if hasattr(franka, "set_joint_velocities"):
+                full_v = np.zeros_like(franka.get_joint_positions())
+                franka.set_joint_velocities(full_v)
+            hold_q = franka.get_joint_positions().copy()
+            for _ in range(pause_steps):
+                franka.apply_action(ArticulationAction(joint_positions=hold_q))
+                env.world.step(render=not args.headless)
+                carry_held_block()
+
         goal_z = base_z
         for block_idx, block_name in enumerate(block_names):
+            stack_slot = block_idx
             block_pos, block_quat = env.get_block_poses()[block_name]
             block_pos = block_pos.copy()
             xy_noise  = rng.uniform(-args.noise, args.noise, size=2)
@@ -246,6 +255,12 @@ def main():
                     lift_h=lift_h,
                     grasp_h=grasp_h,
                 )
+                if primitive == "transport":
+                    existing_stack_top = goal_z - cfg["block"]["size"] / 2
+                    target_cart[2] = max(
+                        target_cart[2],
+                        existing_stack_top + stack_clearance,
+                    )
 
                 # Use block-aligned orientation when approaching; straight down
                 # for lift / transport / place (block orientation no longer matters).
@@ -269,6 +284,11 @@ def main():
                         "block":     block_name,
                         "arm":       args.arm,
                         "target":    target_cart.copy(),
+                        "stack_slot": stack_slot,
+                        "stack_goal_z": goal_z,
+                        "stack_clearance_above_top": stack_clearance,
+                        "collection_joint_goal_gain": args.joint_goal_gain,
+                        "collection_max_joint_vel": args.collection_max_joint_vel,
                     })
                     prev_q = q
 
@@ -285,83 +305,53 @@ def main():
                           "using current q as q_goal.")
                     q_goal_lula = q_seed
 
-                if args.motion_source == "joint_lula":
-                    # Proportional-decay expert: q_dot = -k * (q - q_goal),
-                    # clipped to max_joint_vel. Velocity scales with the error
-                    # and goes to zero at the attractor — required for the DS
-                    # architecture's f(0)=0 to be consistent with the data near
-                    # the goal. The earlier linear-time interpolator made q_dot
-                    # constant across the whole primitive, which trains a
-                    # near-discontinuous (and divergent) flow.
-                    max_joint_vel = cfg["training"]["max_joint_vel"]
-                    k = float(args.joint_goal_gain)
-                    # Worst-case decay budget: reach within done_tol from the
-                    # initial error under proportional control. Guard against
-                    # tiny errors (log explodes) and tiny gains.
-                    q_start = franka.get_joint_positions().copy()
-                    e0 = np.linalg.norm(q_start[:7] - q_goal_lula)
-                    if e0 > args.joint_done_tol and k > 1e-3:
-                        decay_steps = int(np.ceil(
-                            np.log(e0 / args.joint_done_tol) / (k * physics_dt)
-                        ))
-                    else:
-                        decay_steps = 0
-                    n_steps = max(steps[primitive], decay_steps) + args.settle_extra_steps
-                    n_steps = max(n_steps, 2)
-                    q_demo = q_start[:7].copy()
-                    prev_q = q_demo.copy()
-
-                    for i in range(1, n_steps + 1):
-                        q_now = (q_demo.copy() if args.direct_joint_set
-                                 else franka.get_joint_positions()[:7].copy())
-                        e = q_now - q_goal_lula
-                        if np.linalg.norm(e) < args.joint_done_tol:
-                            break
-                        q_dot_des = np.clip(-k * e, -max_joint_vel, max_joint_vel)
-                        q_cmd = franka.get_joint_positions().copy()
-                        q_cmd[:7] = q_now + q_dot_des * physics_dt
-                        if args.direct_joint_set:
-                            q_demo = q_cmd[:7].copy()
-                            franka.set_joint_positions(q_cmd)
-                        else:
-                            franka.apply_action(
-                                ArticulationAction(joint_positions=q_cmd)
-                            )
-                        env.world.step(render=not args.headless)
-                        carry_held_block()
-                        if args.direct_joint_set:
-                            record(q_override=q_demo, q_dot_override=q_dot_des)
-                            prev_q = q_demo.copy()
-                        else:
-                            record()
-                    q_settled = (q_demo.copy() if args.direct_joint_set
-                                 else franka.get_joint_positions()[:7].copy())
+                # Proportional-decay Lula expert: q_dot = -k * (q - q_goal),
+                # clipped to max_joint_vel. Velocity scales with the error and
+                # goes to zero at the attractor, which matches f(0)=0.
+                max_joint_vel = args.collection_max_joint_vel
+                k = float(args.joint_goal_gain)
+                q_start = franka.get_joint_positions().copy()
+                e0 = np.linalg.norm(q_start[:7] - q_goal_lula)
+                if e0 > args.joint_done_tol and k > 1e-3:
+                    decay_steps = int(np.ceil(
+                        np.log(e0 / args.joint_done_tol) / (k * physics_dt)
+                    ))
                 else:
-                    ik_motion.move_to(
-                        world=env.world,
-                        target_pos=target_cart,
-                        target_quat=target_quat,
-                        steps=steps[primitive],
-                        record_callback=record,
-                        render=not args.headless,
-                        stop_tolerance=args.settle_tol,
-                        max_extra_steps=args.settle_extra_steps,
-                        post_step_callback=carry_held_block,
-                    )
+                    decay_steps = 0
+                n_steps = max(steps[primitive], decay_steps) + args.settle_extra_steps
+                n_steps = max(n_steps, 2)
+                q_demo = q_start[:7].copy()
+                prev_q = q_demo.copy()
 
-                    # RMPflow can settle at a different redundant-arm
-                    # null-space configuration than a fresh Lula IK solve.
-                    q_settled = franka.get_joint_positions()[:7].copy()
-                    q_goal_lula_after, ok_after = ik_kin.solve(
-                        target_cart, target_quat=target_quat, q_seed=q_settled)
-                    if ok_after:
-                        q_goal_lula = q_goal_lula_after
-                        ok = ok_after
+                for _ in range(1, n_steps + 1):
+                    q_now = (q_demo.copy() if args.direct_joint_set
+                             else franka.get_joint_positions()[:7].copy())
+                    e = q_now - q_goal_lula
+                    if np.linalg.norm(e) < args.joint_done_tol:
+                        break
+                    q_dot_des = np.clip(-k * e, -max_joint_vel, max_joint_vel)
+                    q_cmd = franka.get_joint_positions().copy()
+                    q_cmd[:7] = q_now + q_dot_des * physics_dt
+                    if args.direct_joint_set:
+                        q_demo = q_cmd[:7].copy()
+                        franka.set_joint_positions(q_cmd)
+                    else:
+                        franka.apply_action(
+                            ArticulationAction(joint_positions=q_cmd)
+                        )
+                    env.world.step(render=not args.headless)
+                    carry_held_block()
+                    if args.direct_joint_set:
+                        record(q_override=q_demo, q_dot_override=q_dot_des)
+                        prev_q = q_demo.copy()
+                    else:
+                        record()
+                q_settled = (q_demo.copy() if args.direct_joint_set
+                             else franka.get_joint_positions()[:7].copy())
 
-                q_goal = q_settled if args.q_goal_source == "settled" else q_goal_lula
+                q_goal = q_goal_lula
                 q_goal_lula_error = float(np.linalg.norm(q_settled - q_goal_lula))
-                if (args.motion_source == "joint_lula"
-                        and q_goal_lula_error > args.max_q_goal_error):
+                if q_goal_lula_error > args.max_q_goal_error:
                     print(f"    [WARN] {primitive} settled {q_goal_lula_error:.3f} "
                           f"rad from Lula q_goal; discarding this demo attempt")
                     demo_failed = True
@@ -369,11 +359,11 @@ def main():
                 if q_goal_lula_error > 0.25:
                     print(f"    [WARN] {primitive} Lula q_goal differs from "
                           f"expert settled q by {q_goal_lula_error:.3f} rad; "
-                          f"label_source={args.q_goal_source}")
+                          "label_source=lula")
                 for step in prim_buf:
                     step["q_goal"] = q_goal
-                    step["q_goal_source"] = args.q_goal_source
-                    step["motion_source"] = args.motion_source
+                    step["q_goal_source"] = "lula"
+                    step["motion_source"] = "lula"
                     step["q_goal_settled"] = q_settled
                     step["q_goal_lula"] = q_goal_lula
                     step["q_goal_lula_ok"] = bool(ok)
@@ -383,7 +373,9 @@ def main():
                 if primitive == "grasp":
                     for _ in range(10):
                         env.world.step(render=not args.headless)
-                    ik_motion.set_gripper(open=False)
+                    franka.gripper.apply_action(
+                        ArticulationAction(joint_positions=np.array([0.0, 0.0]))
+                    )
                     for _ in range(cfg["sim"]["gripper_steps"]):
                         env.world.step(render=not args.headless)
                     if not args.physical_grasp:
@@ -393,7 +385,9 @@ def main():
                         carry_held_block()
                 elif primitive == "place":
                     held_block = None
-                    ik_motion.set_gripper(open=True)
+                    franka.gripper.apply_action(
+                        ArticulationAction(joint_positions=np.array([0.04, 0.04]))
+                    )
                     for _ in range(cfg["sim"]["gripper_steps"]):
                         env.world.step(render=not args.headless)
 
@@ -413,24 +407,44 @@ def main():
                         demo_failed = True
                         break
 
+                hold_between_primitives()
+
             if demo_failed:
                 break
 
             # Retract before next block (not recorded)
-            retract_cart = np.array([goal_xy[0], goal_xy[1], lift_h])
-            ik_motion.move_to(env.world, retract_cart, steps=60,
-                              record_callback=None,
-                              render=not args.headless,
-                              stop_tolerance=args.settle_tol,
-                              max_extra_steps=args.settle_extra_steps,
-                              post_step_callback=carry_held_block)
-            goal_z += cfg["block"]["size"] + 0.002
+            existing_stack_top = goal_z - cfg["block"]["size"] / 2
+            retract_z = max(lift_h, existing_stack_top + stack_clearance)
+            retract_cart = np.array([goal_xy[0], goal_xy[1], retract_z])
+            q_seed = franka.get_joint_positions()[:7].copy()
+            q_goal_retract, ok = ik_kin.solve(
+                retract_cart, target_quat=None, q_seed=q_seed)
+            if ok:
+                for _ in range(60 + args.settle_extra_steps):
+                    q_now = franka.get_joint_positions()[:7].copy()
+                    e = q_now - q_goal_retract
+                    if np.linalg.norm(e) < args.joint_done_tol:
+                        break
+                    q_dot = np.clip(
+                        -args.joint_goal_gain * e,
+                        -args.collection_max_joint_vel,
+                        args.collection_max_joint_vel,
+                    )
+                    q_cmd = franka.get_joint_positions().copy()
+                    q_cmd[:7] = q_now + q_dot * physics_dt
+                    franka.apply_action(ArticulationAction(joint_positions=q_cmd))
+                    env.world.step(render=not args.headless)
+                    carry_held_block()
+            goal_z += block_h
 
         if not demo_failed:
             all_demos.append({
                 "arm":        args.arm,
                 "demo_idx":   demo_idx,
                 "trajectory": demo_traj,
+                "inter_primitive_pause_steps": pause_steps,
+                "collection_joint_goal_gain": args.joint_goal_gain,
+                "collection_max_joint_vel": args.collection_max_joint_vel,
                 "success":    True,
             })
 

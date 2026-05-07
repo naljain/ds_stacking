@@ -1,0 +1,113 @@
+
+
+    njdsa- noural joint sine distance function
+
+
+  bash scripts/train_all.sh
+
+  Plot the updated vector fields:
+
+  python scripts/plot_ds.py \
+    --all \
+    --ckpt_arm both \
+    --use_safe \
+    --joints 0 1 \
+    --out_dir data/results/ds_plots
+
+  Then deploy:
+
+  python scripts/deploy_single_arm.py \
+    --arm left \
+    --kinematic_carry \
+    --use_safe \
+    --ds_scale 1.0 \
+    --goal_gain 0.0 \
+    --done_tol 0.25 \
+    --print_every 25 \
+    --debug_ik \
+    --log_csv data/results/left_ds_lula_scripted.csv
+
+  Since you added jitter, pay close attention to the audit’s final ||q-q_goal|| and cos(q_dot, -error) stats. If those stay clean, the extra data should help
+  robustness.
+
+    python scripts/deploy_single_arm.py \
+    --arm left \
+    --kinematic_carry \
+    --use_safe \
+    --ds_scale 1.0 \
+    --goal_gain 0.0 \
+    --done_tol 0.25 \
+    --print_every 25 \
+    --debug_ik \
+    --log_csv data/results/left_ds_lula_scripted.csv
+
+
+  python scripts/deploy_dual_arm.py \
+    --kinematic_carry \
+    --use_safe \
+    --ds_scale 1.0 \
+    --done_tol 0.2 \
+    --mod_safe_radius 0.25 \
+    --mod_reactivity 2.0 \
+    --stagger_steps 400
+    --log_csv data/results/both_ds.csv
+
+  python scripts/deploy_dual_arm.py \
+    --kinematic_carry \
+    --ds_scale 1.0 \
+    --goal_gain 0.0 \
+    --done_tol 0.25 \
+    --mod_safe_radius 0.25 \
+    --mod_reactivity 2.0 \
+    --link_safety_radius 0.20
+
+  python scripts/deploy_dual_arm.py \
+    --kinematic_carry \
+    --use_safe \
+    --ds_scale 1.0 \
+    --goal_gain 0.0 \
+    --done_tol 0.2 \
+    --cart_done_tol 0.1 \
+    --place_cart_done_tol 0.1 \
+    --grasp_cart_done_tol 0.1 \
+    --lift_cart_done_tol 0.1 \
+    --mod_safe_radius 0.25 \
+    --mod_reactivity 2.0 \
+    --link_safety_radius 0.20
+
+
+  python scripts/collect_ik.py --arm left --n_demos 2 --headless --block_xy_jitter 0.02
+  --start_jitter 0.15
+  python scripts/collect_ik.py --arm right --n_demos 50 --headless --block_xy_jitter 0.02
+  --start_jitter 0.15
+
+  Then:
+
+  python scripts/audit_demo_labels.py \
+    data/demonstrations/left_demos.pkl \
+    data/demonstrations/right_demos.pkl
+
+  Then retrain:
+
+  bash scripts/train_all.sh
+
+    python scripts/plot_ds.py \
+    --all \
+    --ckpt_arm both \
+    --use_safe \
+    --joints 0 1 \
+    --out_dir data/results/ds_plots
+
+
+USE THIS COMMAND: 
+
+
+  python scripts/deploy_dual_arm.py \
+    --kinematic_carry \
+    --use_safe \
+    --ds_scale 1.0 \
+    --goal_gain 0.0 \
+    --done_tol 0.2 \
+    --mod_safe_radius 0.25 \
+    --mod_reactivity 2.0 \
+    --link_safety_radius 0.20

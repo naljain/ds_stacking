@@ -37,6 +37,7 @@ class ArmTaskState:
         self.gripper_open      = True
         self.q_goal = None    # set by the deployment loop after IK
         self.reserved_goal_z = None
+        self.reserved_stack_slot = None
         self.source_block_pos = None
 
     @property
@@ -91,7 +92,7 @@ class TaskSequencer:
         elif task.current_primitive == "lift" and task.source_block_pos is not None:
             block_pos = task.source_block_pos
         goal_z = self._goal_z_for_task(task)
-        return primitive_target(
+        target = primitive_target(
             primitive=task.current_primitive,
             block_pos=block_pos,
             goal_xy=task.goal_xy,
@@ -100,6 +101,25 @@ class TaskSequencer:
             lift_h =self.cfg["heights"]["lift"],
             grasp_h=self.cfg["heights"]["grasp"],
         )
+        if task.current_primitive == "transport":
+            target[2] = max(target[2], self.stack_clearance_z_for_task(task))
+        return target
+
+    def stack_clearance_z_for_task(self, task):
+        """Height that clears the current stack before lateral stack motion."""
+        goal_z = self._goal_z_for_task(task)
+        existing_stack_top = goal_z - self.cfg["block"]["size"] / 2
+        clearance = self.cfg.get("stack", {}).get("clearance_above_top", 0.12)
+        return max(self.cfg["heights"]["lift"], existing_stack_top + clearance)
+
+    def stack_clearance_target(self, arm):
+        """Cartesian clearance pose above the active/reserved stack slot."""
+        task = self.tasks[arm]
+        return np.array([
+            task.goal_xy[0],
+            task.goal_xy[1],
+            self.stack_clearance_z_for_task(task),
+        ])
 
     def ee_orientation(self, arm):
         """EE quaternion (w,x,y,z) for the current primitive.
@@ -124,6 +144,9 @@ class TaskSequencer:
         z = task.reserved_goal_z if task.reserved_goal_z is not None else self.goal_z
         return np.array([task.goal_xy[0], task.goal_xy[1], z])
 
+    def stack_slot_index(self, arm):
+        return self.tasks[arm].reserved_stack_slot
+
     def _goal_z_for_task(self, task):
         """Reserve a unique shared-stack slot before the place primitive.
 
@@ -134,7 +157,10 @@ class TaskSequencer:
         """
         if task.current_primitive in ("transport", "place"):
             if task.reserved_goal_z is None:
-                task.reserved_goal_z = self.goal_z
+                task.reserved_stack_slot = self._next_stack_slot
+                task.reserved_goal_z = (
+                    self.base_z + task.reserved_stack_slot * self.block_h
+                )
                 self._next_stack_slot += 1
             return task.reserved_goal_z
         return self.goal_z
@@ -144,6 +170,7 @@ class TaskSequencer:
         if task.current_primitive == "place":
             self.placed_per_arm[arm] += 1
             task.reserved_goal_z = None
+            task.reserved_stack_slot = None
         task.advance_primitive()
 
     def gripper_action(self, arm):

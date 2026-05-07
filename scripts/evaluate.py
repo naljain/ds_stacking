@@ -49,14 +49,20 @@ def run_one_trial(env, ds_set, seq, ik_kin, mod, franka, cfg,
                   use_modulation=True, use_safe=False,
                   done_tol=0.05, max_steps=8000, render=True,
                   stagger_steps=None, goal_gain=0.0, ds_scale=1.0,
-                  max_joint_vel=None):
+                  max_joint_vel=None, ik_goal_gain=3.0):
     """Run one full trial. Returns metrics dict."""
-    from omni.isaac.core.utils.types import ArticulationAction
+    try:
+        from isaacsim.core.utils.types import ArticulationAction
+    except ImportError:
+        from omni.isaac.core.utils.types import ArticulationAction
     from src.modulation import jacobian_finite_difference
     from src.primitives import gripper_action_for_primitive
 
     physics_dt = cfg["sim"]["physics_dt"]
+    from src.primitives import SCRIPTED_PRIMITIVES
+
     device = next(ds_set["reach"]["model"].parameters()).device
+    scripted_primitives = set(SCRIPTED_PRIMITIVES)
     if stagger_steps is None:
         stagger_steps = cfg["coordination"].get("start_stagger_steps", 0)
     arm_start_step = {"left": 0, "right": max(0, stagger_steps)}
@@ -144,8 +150,16 @@ def run_one_trial(env, ds_set, seq, ik_kin, mod, franka, cfg,
 
             prim_steps[arm] += 1
             q = franka[arm].get_joint_positions()[:7].copy()
-            ds = ds_set[task.current_primitive]
             x = q - task.q_goal
+            if task.current_primitive in scripted_primitives:
+                q_dots[arm] = np.clip(
+                    -ik_goal_gain * x,
+                    -max_joint_vel,
+                    max_joint_vel,
+                )
+                continue
+
+            ds = ds_set[task.current_primitive]
             x_n = (x - ds["state_mean"]) / ds["state_std"]
             x_t = torch.tensor(x_n, dtype=torch.float32,
                                device=device).unsqueeze(0)
@@ -270,6 +284,9 @@ def main():
     parser.add_argument("--max_joint_vel", type=float, default=None,
                         help="Deployment/evaluation joint velocity clamp in "
                              "rad/s. Defaults to training.max_joint_vel.")
+    parser.add_argument("--ik_goal_gain", type=float, default=3.0,
+                        help="Joint-space attraction gain for Lula-controlled "
+                             "grasp/lift/place primitives.")
     parser.add_argument("--stagger_steps", type=int, default=None,
                         help="Initial right-arm launch delay in physics steps. "
                              "Defaults to coordination.start_stagger_steps.")
@@ -334,6 +351,7 @@ def main():
                                     stagger_steps=args.stagger_steps,
                                     goal_gain=args.goal_gain,
                                     ds_scale=args.ds_scale,
+                                    ik_goal_gain=args.ik_goal_gain,
                                     max_joint_vel=args.max_joint_vel,
                                     render=not args.headless)
             results[cond].append(m)
@@ -371,6 +389,7 @@ def main():
                                                     "start_stagger_steps", 0),
                                "goal_gain":     args.goal_gain,
                                "ds_scale":      args.ds_scale,
+                               "ik_goal_gain":  args.ik_goal_gain,
                                "max_joint_vel": args.max_joint_vel
                                                 if args.max_joint_vel is not None
                                                 else cfg["training"]["max_joint_vel"]},

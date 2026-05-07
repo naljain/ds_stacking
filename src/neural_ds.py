@@ -6,10 +6,9 @@ Velocity: q̇ = f_theta(e) ∈ R^7
 
 Using the error e = q - q_goal as input rather than [q, q_goal] ∈ R^14 eliminates
 the null-space distribution mismatch: the error distribution (large at
-primitive start, zero at goal) is the same regardless of which IK solver
-computed q_goal. The [q, q_goal] formulation caused q_goal to appear OOD at deployment
-because RMPflow and Lula IK settle to different null-space configurations,
-making state_std for q_goal dimensions near zero during training.
+primitive start, zero at goal) is stable across Lula IK goals. The [q, q_goal]
+formulation caused q_goal to appear OOD at deployment, making state_std for
+q_goal dimensions near zero during training.
 
 Lyapunov candidate (positive definite around e=0 by construction):
     V(e) = ||g(e) - g(0)||² + epsilon * ||e||²
