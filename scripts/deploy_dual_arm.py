@@ -95,18 +95,6 @@ def main():
     parser.add_argument("--mod_reactivity", type=float, default=4.0,
                         help="Exponent for inter-arm modulation. Lower values "
                              "make modulation act earlier over a wider range.")
-    parser.add_argument("--priority_arm", type=str, default="dynamic",
-                        choices=["dynamic", "left", "right", "none"],
-                        help="Arm priority for asymmetric modulation. The "
-                             "priority arm receives --priority_mod_scale while "
-                             "the other receives --yield_mod_scale. Dynamic "
-                             "priority favors an arm in place, then the arm "
-                             "with fewer completed placements.")
-    parser.add_argument("--priority_mod_scale", type=float, default=0.0,
-                        help="Blend factor for modulation on the priority arm: "
-                             "0 keeps nominal motion, 1 applies full modulation.")
-    parser.add_argument("--yield_mod_scale", type=float, default=1.0,
-                        help="Blend factor for modulation on the yielding arm.")
     parser.add_argument("--link_safety_radius", type=float, default=0.18,
                         help="Minimum sampled link-to-link distance in meters. "
                              "If any sampled links are closer, pause one arm "
@@ -120,10 +108,12 @@ def main():
                              "hold/release transitions.")
     parser.add_argument("--no_link_safety_hold", action="store_true",
                         help="Disable conservative sampled-link safety hold.")
-    parser.add_argument("--no_yield_clearance", action="store_true",
-                        help="When one arm is placing and the other is held by "
-                             "link safety, keep the held arm frozen instead of "
-                             "backing it toward its source-side lift pose.")
+    parser.add_argument("--link_safety_hold", action="store_false",
+                        dest="no_link_safety_hold",
+                        help="Enable conservative sampled-link safety hold. "
+                             "By default dual-arm coordination relies on the "
+                             "start stagger instead.")
+    parser.set_defaults(no_link_safety_hold=True)
     parser.add_argument("--stagger_steps", type=int, default=None,
                         help="Initial right-arm launch delay in physics steps. "
                              "Defaults to coordination.start_stagger_steps.")
@@ -159,7 +149,7 @@ def main():
     parser.add_argument("--joint_done_tol", type=float, default=None,
                         help="L2 joint-space tolerance for DS primitive completion. "
                              "Defaults to --done_tol.")
-    parser.add_argument("--cart_done_tol", type=float, default=0.02,
+    parser.add_argument("--cart_done_tol", type=float, default=0.05,
                         help="Cartesian EE tolerance in meters for IK primitive "
                              "completion.")
     parser.add_argument("--ds_reach_cart_done_tol", type=float, default=0.03,
@@ -169,9 +159,9 @@ def main():
     parser.add_argument("--grasp_cart_done_tol", type=float, default=None,
                         help="Optional Cartesian tolerance in meters for IK grasp "
                              "completion. Defaults to --cart_done_tol.")
-    parser.add_argument("--lift_cart_done_tol", type=float, default=0.03,
+    parser.add_argument("--lift_cart_done_tol", type=float, default=0.05,
                         help="Optional Cartesian tolerance in meters for IK lift "
-                             "completion. Defaults to 0.03 because lift only "
+                             "completion. Defaults to 0.05 because lift only "
                              "needs clearance, not placement precision.")
     parser.add_argument("--transport_cart_done_tol", type=float, default=None,
                         help="Optional Cartesian tolerance in meters for IK transport "
@@ -179,6 +169,11 @@ def main():
     parser.add_argument("--place_cart_done_tol", type=float, default=None,
                         help="Optional Cartesian tolerance in meters for IK place "
                              "completion. Defaults to --cart_done_tol.")
+    parser.add_argument("--ik_joint_done_tol", type=float, default=0.12,
+                        help="Fallback joint-space completion tolerance for "
+                             "scripted IK primitives. This prevents a good "
+                             "Lula q_goal from timing out due to small FK/frame "
+                             "or contact offsets.")
     args = parser.parse_args()
     joint_done_tol = args.done_tol if args.joint_done_tol is None else args.joint_done_tol
 
@@ -345,12 +340,6 @@ def main():
             return "right"
         if right_done and not left_done:
             return "left"
-        left_place = seq.tasks["left"].current_primitive == "place"
-        right_place = seq.tasks["right"].current_primitive == "place"
-        if left_place and not right_place:
-            return "right"
-        if right_place and not left_place:
-            return "left"
         left_count = seq.placed_per_arm["left"]
         right_count = seq.placed_per_arm["right"]
         if left_count < right_count:
@@ -358,26 +347,6 @@ def main():
         if right_count < left_count:
             return "left"
         return "right"
-
-    def priority_arm():
-        """Return the arm that should be disturbed least in a conflict."""
-        if args.priority_arm in ("left", "right"):
-            return args.priority_arm
-        if args.priority_arm == "none":
-            return None
-        left_place = seq.tasks["left"].current_primitive == "place"
-        right_place = seq.tasks["right"].current_primitive == "place"
-        if left_place and not right_place:
-            return "left"
-        if right_place and not left_place:
-            return "right"
-        left_count = seq.placed_per_arm["left"]
-        right_count = seq.placed_per_arm["right"]
-        if left_count < right_count:
-            return "left"
-        if right_count < left_count:
-            return "right"
-        return "left"
 
     def carry_held_blocks():
         for arm in ("left", "right"):
@@ -408,31 +377,6 @@ def main():
             if args.debug_ik:
                 print(f"[WARN] {arm} Lula FK failed, using env EE pose: {exc}")
             return env.get_ee_pose(arm)[0]
-
-    def source_lift_target(arm):
-        task = seq.tasks[arm]
-        if task.source_block_pos is not None:
-            pos = task.source_block_pos
-        elif not task.is_done() and task.current_block is not None:
-            pos = env.get_block_positions()[task.current_block]
-        else:
-            return None
-        return np.array([pos[0], pos[1], cfg["heights"]["lift"]])
-
-    def joint_lula_velocity_to_cart(arm, target_cart):
-        q_seed = franka[arm].get_joint_positions()[:7].copy()
-        q_goal, ok = ik_kin[arm].solve(
-            target_cart,
-            target_quat=seq.ee_orientation(arm),
-            q_seed=q_seed,
-        )
-        if not ok:
-            return None
-        return np.clip(
-            -args.ik_goal_gain * (q_seed - q_goal),
-            -max_joint_vel,
-            max_joint_vel,
-        )
 
     def joint_lula_move_to_cart(arm, target_cart, steps=120, cart_tol=0.03,
                                 label="stack clearance"):
@@ -547,24 +491,19 @@ def main():
 
         # Apply modulation between the two arms
         if not args.no_modulation:
-            prio = priority_arm()
             for arm, other in (("left", "right"), ("right", "left")):
                 if q_dots[arm] is None:
                     continue
                 if seq.tasks[arm].current_primitive in ik_primitives:
                     continue
-                scale = args.priority_mod_scale if arm == prio else args.yield_mod_scale
-                if scale <= 0.0:
-                    continue
                 # Compute Jacobian by finite-diff (slow but version-stable)
                 J = jacobian_finite_difference(franka[arm])
-                q_dot_mod = mod.modulate_joint_velocity(
+                q_dots[arm] = mod.modulate_joint_velocity(
                     q_dot_nominal=q_dots[arm],
                     ee_pos_self=ee_pos[arm],
                     ee_pos_other=ee_pos[other],
                     jacobian=J,
                 )
-                q_dots[arm] = (1.0 - scale) * q_dots[arm] + scale * q_dot_mod
 
         if not args.no_link_safety_hold:
             link_dist = min_link_distance()
@@ -582,24 +521,7 @@ def main():
                       f"letting {other} clear")
             if link_hold_arm is not None:
                 if q_dots.get(link_hold_arm) is not None:
-                    other = "right" if link_hold_arm == "left" else "left"
-                    should_yield_clear = (
-                        not args.no_yield_clearance
-                        and seq.tasks[other].current_primitive == "place"
-                        and seq.tasks[link_hold_arm].current_primitive != "place"
-                    )
-                    if should_yield_clear:
-                        target = source_lift_target(link_hold_arm)
-                        q_dot_clear = (
-                            joint_lula_velocity_to_cart(link_hold_arm, target)
-                            if target is not None else None
-                        )
-                        q_dots[link_hold_arm] = (
-                            q_dot_clear if q_dot_clear is not None
-                            else np.zeros(7)
-                        )
-                    else:
-                        q_dots[link_hold_arm] = np.zeros(7)
+                    q_dots[link_hold_arm] = np.zeros(7)
                     safety_hold_steps[link_hold_arm] += 1
                 if (args.link_safety_print_every
                         and step % args.link_safety_print_every == 0):
@@ -631,7 +553,11 @@ def main():
                 ee_pos_now = ik_frame_position(arm)
                 target_now = seq.cartesian_target(arm)
                 done_err = np.linalg.norm(ee_pos_now - target_now)
-                converged = done_err < cart_done_tol_for(task.current_primitive)
+                joint_err = np.linalg.norm(q - task.q_goal)
+                converged = (
+                    done_err < cart_done_tol_for(task.current_primitive)
+                    or joint_err < args.ik_joint_done_tol
+                )
                 done_label = "||ee-target||"
             else:
                 joint_err = np.linalg.norm(q - task.q_goal)
