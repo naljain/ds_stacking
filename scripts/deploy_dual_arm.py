@@ -56,6 +56,7 @@ def load_ds(ckpt_path, device):
         hidden_dim  = cfg["hidden_dim"],
         lyap_hidden = cfg["lyapunov_hidden"],
         alpha       = cfg["alpha"],
+        stable_skip_gain = cfg.get("stable_skip_gain", 0.0),
     ).to(device)
     model.load_state_dict(ckpt["state_dict"])
     model.eval()
@@ -1154,13 +1155,17 @@ def main():
                 q_dots[arm] = None
                 continue
 
-            x   = np.concatenate([q, q_goal[arm]])
+            x   = q - q_goal[arm]
             x_n = (x - ds[arm]["state_mean"]) / ds[arm]["state_std"]
             x_t = torch.tensor(x_n, dtype=torch.float32,
                                device=device).unsqueeze(0)
 
             if args.use_safe:
-                qd_n = ds[arm]["model"].safe_velocity(x_t)
+                scale_factor = torch.tensor(
+                    ds[arm]["vel_scale"] / ds[arm]["state_std"],
+                    dtype=torch.float32, device=device).unsqueeze(0)
+                qd_n = ds[arm]["model"].safe_velocity(
+                    x_t, scale_factor=scale_factor)
             else:
                 with torch.no_grad():
                     qd_n = ds[arm]["model"](x_t)

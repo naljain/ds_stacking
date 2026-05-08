@@ -62,10 +62,11 @@ def load_trajectories(demo_paths, primitive):
             for step in demo["trajectory"]:
                 if step["primitive"] != primitive:
                     continue
-                x = step["q"] - step["q_goal"]  # error-based: 7-dim
+                q = np.asarray(step["q"], dtype=float)
+                q_goal = np.asarray(step["q_goal"], dtype=float)
+                x = q - q_goal
                 states.append(x)
-                velocities.append(step["q_dot"])
-
+                velocities.append(np.asarray(step["q_dot"], dtype=float))
                 arm = step.get("arm", demo.get("arm", "unknown"))
                 block = step.get("block", "unknown")
                 stack_slot = step.get("stack_slot", "unknown")
@@ -127,7 +128,7 @@ def main():
     print(f"[TRAIN] Loading {args.primitive} samples from {demo_paths}")
     states, velocities, data_manifest = load_trajectories(demo_paths, args.primitive)
     print(f"[TRAIN] Got {len(states)} samples, state dim {states.shape[1]}")
-    print("[TRAIN] ── data partition used for this DS ──")
+    print("[TRAIN] -- data partition used for this DS --")
     print(f"[TRAIN]   checkpoint           : {args.arm}_{args.primitive}.pt")
     print(f"[TRAIN]   primitive label      : {args.primitive}")
     print(f"[TRAIN]   source demo files    : {data_manifest['demo_files']}")
@@ -141,32 +142,22 @@ def main():
         print("[TRAIN]   Lula-settled mismatch: "
               f"mean={err['sum'] / err['count']:.3f}, max={err['max']:.3f}")
 
-    # Defensive clip — collection experts respect max_joint_vel, so anything
-    # above this is a finite-difference artifact (e.g. across an un-recorded
-    # primitive boundary). Letting one outlier through poisons vel_scale and
-    # crushes the model's effective output resolution.
-    max_v = train_cfg["max_joint_vel"]
-    n_clipped = int((np.abs(velocities) > max_v).sum())
-    if n_clipped > 0:
-        print(f"[TRAIN] clipping {n_clipped} velocity components above {max_v} rad/s")
-    velocities = np.clip(velocities, -max_v, max_v)
+    max_v = train_cfg.get("max_joint_vel")
+    if max_v is not None:
+        n_clipped = int((np.abs(velocities) > max_v).sum())
+        if n_clipped > 0:
+            print(f"[TRAIN] clipping {n_clipped} velocity components above {max_v} rad/s")
+        velocities = np.clip(velocities, -max_v, max_v)
 
     # ── Normalisation per joint ───────────────────────────────────────────────
-    # Zero-mean: goal (e=0) maps to x_n=0 so the -x skip connection points at it.
-    # Floor on std: prevents OOD amplification for joints whose error barely
-    # varies in training (e.g. wrist joints the expert holds in a fixed
-    # null-space).
-    # Without this, a deployment q_goal differing by 0.05 rad in such a joint
-    # produces x_n=10+ and saturates Tanh, destroying the velocity output.
     state_mean = np.zeros(N_JOINTS)
     state_std  = np.maximum(states.std(0), 0.1) + 1e-6
-    vel_scale  = np.maximum(np.abs(velocities).max(axis=0), 1e-3)  # shape (7,)
+    vel_scale  = np.maximum(np.abs(velocities).max(axis=0), 1e-3)
 
     states_n     = (states - state_mean) / state_std
     velocities_n = velocities / vel_scale
 
-    # Diagnostics — everything you'd want to know about the dataset before training
-    print(f"[TRAIN] ── data stats for primitive '{args.primitive}' ──")
+    print(f"[TRAIN] -- data stats for primitive '{args.primitive}' --")
     print(f"[TRAIN]   |e| (rad)            : "
           f"min={np.abs(states).min(axis=0).round(3)}  "
           f"max={np.abs(states).max(axis=0).round(3)}")
@@ -194,13 +185,8 @@ def main():
         stable_skip_gain = train_cfg.get("stable_skip_gain", 0.0),
     ).to(device)
 
-    optim     = torch.optim.Adam(model.parameters(), lr=train_cfg["lr"])
+    optim = torch.optim.Adam(model.parameters(), lr=train_cfg["lr"])
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=epochs)
-
-    # Rescaling between model output (normalised by vel_scale) and actual
-    # rate of change of x_n (normalised by state_std). Used so the stability
-    # loss enforces dV/dt ≤ -αV on the real dynamics, not just on a dot
-    # product in mismatched coordinates.
     scale_factor = torch.tensor(vel_scale / state_std,
                                 dtype=torch.float32, device=device)
 
@@ -208,7 +194,6 @@ def main():
     ckpt_dir = Path(cfg["paths"]["checkpoints"])
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     ckpt_path = ckpt_dir / f"{args.arm}_{args.primitive}.pt"
-
     history = {"total": [], "imit": [], "stab": []}
 
     for epoch in range(epochs):

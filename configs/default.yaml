@@ -81,12 +81,14 @@ sim:
 
 # ── Neural DS training ────────────────────────────────────────────────────────
 training:
-  state_dim:        14       # [q (7), q_goal (7)] — joint-space DS input
+  state_dim:        7        # q - q_goal joint-error DS input
   velocity_dim:     7        # joint velocity output
   hidden_dim:       128
   lyapunov_hidden:  64
   alpha:            1.0      # Lyapunov decay rate
   lambda_stab:      0.5      # weight on stability loss
+  stable_skip_gain: 0.0      # optional globally attracting linear skip term
+  max_joint_vel:    0.8      # optional defensive clipping for demo artifacts
   lr:               1.0e-3
   batch_size:       256
   epochs:           500

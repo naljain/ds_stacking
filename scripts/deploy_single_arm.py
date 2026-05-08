@@ -46,6 +46,7 @@ def load_ds(ckpt_path, device):
         hidden_dim  = cfg["hidden_dim"],
         lyap_hidden = cfg["lyapunov_hidden"],
         alpha       = cfg["alpha"],
+        stable_skip_gain = cfg.get("stable_skip_gain", 0.0),
     ).to(device)
     model.load_state_dict(ckpt["state_dict"])
     model.eval()
@@ -260,12 +261,16 @@ def main():
                     print("    [WARN] LPVDS IK has failed for 25 consecutive steps; "
                           "holding the last valid joint target.")
             else:
-                x   = np.concatenate([q, q_goal])
+                x   = q - q_goal
                 x_n = (x - ds["state_mean"]) / ds["state_std"]
                 x_t = torch.tensor(x_n, dtype=torch.float32,
                                    device=device).unsqueeze(0)
                 if args.use_safe:
-                    qd_n = ds["model"].safe_velocity(x_t)
+                    scale_factor = torch.tensor(
+                        ds["vel_scale"] / ds["state_std"],
+                        dtype=torch.float32, device=device).unsqueeze(0)
+                    qd_n = ds["model"].safe_velocity(
+                        x_t, scale_factor=scale_factor)
                 else:
                     with torch.no_grad():
                         qd_n = ds["model"](x_t)
