@@ -223,6 +223,10 @@ class DualArmEnv:
     def get_block_positions(self):
         return {name: obj.get_world_pose()[0] for name, obj in self.blocks.items()}
 
+    def get_block_poses(self):
+        """Return {name: (position, orientation_wxyz)} for all blocks."""
+        return {name: obj.get_world_pose() for name, obj in self.blocks.items()}
+
     def get_block_grasp_quat(self, block_name):
         """Return a gripper-down quaternion (w,x,y,z) with yaw snapped to the
         nearest 90° face of the block."""

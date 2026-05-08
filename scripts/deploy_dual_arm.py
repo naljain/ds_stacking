@@ -161,13 +161,14 @@ def _protected_points_from_links(ik, q, fallback_ee_pos, fallback_ee_quat,
     Uses Lula FK frame positions when available. If the configured frame names
     are not available in this Isaac install, falls back to EE-axis proxies.
     """
-    frame_points = []
+    frame_poses = []
     for frame in frames or []:
         try:
-            pos, _ = ik.get_frame_world_pose(frame, q=q)
-            frame_points.append(np.asarray(pos, dtype=float))
+            pos, quat = ik.get_frame_world_pose(frame, q=q)
+            frame_poses.append((np.asarray(pos, dtype=float), quat))
         except Exception:
             continue
+    frame_points = [p for p, _ in frame_poses]
 
     if len(frame_points) < 2:
         points = _protected_points(
@@ -185,8 +186,11 @@ def _protected_points_from_links(ik, q, fallback_ee_pos, fallback_ee_quat,
         for i in range(1, samples_per_segment + 2):
             s = i / (samples_per_segment + 1)
             points.append((1.0 - s) * a + s * b)
+    gripper_pos, gripper_quat = frame_poses[-1]
+    if gripper_quat is None:
+        gripper_quat = fallback_ee_quat
     return _add_gripper_width_points(
-        points, fallback_ee_pos, fallback_ee_quat,
+        points, gripper_pos, gripper_quat,
         gripper_lateral_offsets, gripper_lateral_body_offsets
     )
 
@@ -316,6 +320,12 @@ def main():
                         help="Max DS steps per transport")
     parser.add_argument("--use_safe",      action="store_true")
     parser.add_argument("--no_modulation", action="store_true")
+    parser.add_argument("--modulation_space", type=str, default="cartesian",
+                        choices=["cartesian", "jsdf"],
+                        help="Avoidance space for neural joint-velocity transport. "
+                             "cartesian uses the old EE velocity modulation; "
+                             "jsdf uses a joint-space distance-field gradient "
+                             "from protected sphere distances.")
     parser.add_argument("--priority_arm",  type=str, default="left",
                         choices=["left", "right"],
                         help="Arm that starts as the unmodulated priority arm")
@@ -334,6 +344,22 @@ def main():
                         help="Gamma exponent; lower values make modulation start earlier")
     parser.add_argument("--mod_isoline", type=float, default=None,
                         help="Gamma contour to track; >1 expands the effective modulation boundary")
+    parser.add_argument("--mod_max_pairs", type=int, default=4,
+                        help="Number of closest protected sphere pairs to apply. "
+                             "Use 0 to apply all pairs.")
+    parser.add_argument("--jsdf_influence_radius", type=float, default=None,
+                        help="Protected sphere centre distance where JSDF-style "
+                             "joint-space avoidance starts. Defaults to mod_radius.")
+    parser.add_argument("--jsdf_gain", type=float, default=2.0,
+                        help="Gain for joint-space distance-field avoidance.")
+    parser.add_argument("--jsdf_max_joint_speed", type=float, default=0.45,
+                        help="Norm cap for the JSDF-style avoidance joint velocity.")
+    parser.add_argument("--jsdf_fd_eps", type=float, default=1e-3,
+                        help="Finite-difference step in radians for the "
+                             "joint-space distance gradient.")
+    parser.add_argument("--jsdf_debug_every", type=int, default=0,
+                        help="Print JSDF activation diagnostics every N sim "
+                             "steps. 0 disables.")
     parser.add_argument("--no_preserve_mod_speed", action="store_true",
                         help="Do not rescale modulated Cartesian velocity back to nominal speed")
     parser.add_argument("--link_spheres", type=int, default=None,
@@ -370,6 +396,15 @@ def main():
                         help="Scale LPVDS Cartesian velocity before speed clipping")
     parser.add_argument("--speedup", type=float, default=1.0,
                         help="Global motion speed multiplier for IK timing and DS velocities")
+    parser.add_argument("--ik_nullspace_seed_weight", type=float, default=0.0,
+                        help="Blend IK warm-starts toward the configured default "
+                             "joint pose. 0 uses previous IK solution; 1 uses "
+                             "the default pose as the seed every solve.")
+    parser.add_argument("--nullspace_home_gain", type=float, default=0.0,
+                        help="Joint-space gain toward the configured default "
+                             "pose, projected through the translational "
+                             "Jacobian null-space during modulated joint "
+                             "commands.")
     parser.add_argument("--sync_speeds", action="store_true",
                         help="Scale down the faster arm to match transport speed norms")
     parser.add_argument("--raw_lpvds",     action="store_true",
@@ -466,8 +501,10 @@ def main():
 
     # Per-arm objects
     franka      = {a: env.frankas[a] for a in ARMS}
-    ik_motion   = {a: IKController(franka[a], arm=a,
-                                   rest_q=np.array(cfg["arms"][f"default_joints_{a}"]))
+    ik_motion   = {a: IKController(
+                       franka[a], arm=a,
+                       rest_q=np.array(cfg["arms"][f"default_joints_{a}"]),
+                       nullspace_seed_weight=args.ik_nullspace_seed_weight)
                    for a in ARMS}
     ik_kin      = {a: FrankaIK(franka[a]) for a in ARMS}
     default_q   = {a: np.array(cfg["arms"][f"default_joints_{a}"]) for a in ARMS}
@@ -510,11 +547,16 @@ def main():
     mod_isoline = args.mod_isoline
     if mod_isoline is None:
         mod_isoline = cfg["coordination"].get("modulation_isoline", 1.0)
+    jsdf_influence_radius = (
+        mod_radius if args.jsdf_influence_radius is None
+        else args.jsdf_influence_radius
+    )
     mod = InterArmModulation(
         safe_radius=mod_radius,
         reactivity=mod_reactivity,
         preserve_speed=not args.no_preserve_mod_speed,
         isoline=mod_isoline,
+        max_pairs=(None if args.mod_max_pairs == 0 else args.mod_max_pairs),
     )
     link_spheres = args.link_spheres
     if link_spheres is None:
@@ -661,6 +703,88 @@ def main():
             if speed > cap > 1e-9:
                 vectors[arm] *= cap / speed
 
+    def add_nullspace_home_velocity(arm, q_dot, jacobian, dt=None):
+        """Bias joints toward default_q without changing translational EE velocity."""
+        if args.nullspace_home_gain <= 0.0 or q_dot is None:
+            return q_dot
+        q_now = franka[arm].get_joint_positions()[:7].copy()
+        J = jacobian[:3, :]
+        JJt = J @ J.T
+        damp = 0.05 ** 2 * np.eye(JJt.shape[0])
+        J_pinv = J.T @ np.linalg.inv(JJt + damp)
+        null_projector = np.eye(7) - J_pinv @ J
+        q_home_dot = args.nullspace_home_gain * (default_q[arm] - q_now)
+        scale = 1.0 if dt is None else float(dt)
+        return q_dot + scale * (null_projector @ q_home_dot)
+
+    def protected_points_for_q(arm, q):
+        ee_pose_now = ik_motion[arm].ik.get_world_pose(q=q)
+        return _protected_points_from_links(
+            ik_motion[arm].ik, q, ee_pose_now[0], ee_pose_now[1],
+            link_frames, link_samples_per_segment, max(0, link_spheres),
+            link_sphere_spacing, gripper_lateral_offsets,
+            gripper_lateral_body_offsets
+        )
+
+    def min_point_distance(self_points, obstacle_points):
+        self_points = np.asarray(self_points, dtype=float).reshape(-1, 3)
+        obstacle_points = np.asarray(obstacle_points, dtype=float).reshape(-1, 3)
+        if len(self_points) == 0 or len(obstacle_points) == 0:
+            return float("inf")
+        deltas = self_points[:, None, :] - obstacle_points[None, :, :]
+        return float(np.linalg.norm(deltas, axis=-1).min())
+
+    def jsdf_avoidance_velocity(arm, q_dot_nominal, obstacle_points, self_points):
+        """Joint-space distance-field repulsion from protected sphere distances."""
+        if args.no_modulation or args.modulation_space != "jsdf":
+            return np.zeros(7)
+        d0 = min_point_distance(self_points, obstacle_points)
+        if d0 >= jsdf_influence_radius:
+            if args.jsdf_debug_every and global_step % args.jsdf_debug_every == 0:
+                print(f"[JSDF] {arm} inactive d={d0:.3f} >= "
+                      f"{jsdf_influence_radius:.3f}")
+            return np.zeros(7)
+
+        q0 = franka[arm].get_joint_positions()[:7].copy()
+        grad = np.zeros(7)
+        eps = max(float(args.jsdf_fd_eps), 1e-6)
+        for j in range(7):
+            q_eps = q0.copy()
+            q_eps[j] += eps
+            d_eps = min_point_distance(
+                protected_points_for_q(arm, q_eps),
+                obstacle_points,
+            )
+            grad[j] = (d_eps - d0) / eps
+
+        grad_norm = float(np.linalg.norm(grad))
+        if grad_norm < 1e-9:
+            if args.jsdf_debug_every and global_step % args.jsdf_debug_every == 0:
+                print(f"[JSDF] {arm} inactive d={d0:.3f} grad_norm~0")
+            return np.zeros(7)
+
+        # Tail effect in joint space: if nominal motion is already increasing
+        # the closest protected-sphere distance and we are not inside the core
+        # safety radius, leave it alone.
+        if d0 > mod_radius and float(np.dot(grad, q_dot_nominal)) >= 0.0:
+            if args.jsdf_debug_every and global_step % args.jsdf_debug_every == 0:
+                print(f"[JSDF] {arm} tail d={d0:.3f} "
+                      f"grad_dot_qdot={float(np.dot(grad, q_dot_nominal)):.4f}")
+            return np.zeros(7)
+
+        activation = max(0.0, (jsdf_influence_radius - d0) / jsdf_influence_radius)
+        q_avoid = args.jsdf_gain * activation * grad / grad_norm
+        speed = float(np.linalg.norm(q_avoid))
+        cap = max(float(args.jsdf_max_joint_speed), 1e-9)
+        if speed > cap:
+            q_avoid *= cap / speed
+        if args.jsdf_debug_every and global_step % args.jsdf_debug_every == 0:
+            print(f"[JSDF] {arm} active d={d0:.3f} "
+                  f"activation={activation:.2f} "
+                  f"grad_norm={grad_norm:.3f} "
+                  f"|q_avoid|={np.linalg.norm(q_avoid):.3f}")
+        return q_avoid
+
     def sped_steps(n_steps):
         return max(1, int(round(n_steps / max(args.speedup, 1e-6))))
 
@@ -701,7 +825,14 @@ def main():
     print(f"[DEPLOY] Gripper-width proxy offsets={gripper_lateral_offsets}")
     print(f"[DEPLOY] Gripper-width body offsets={gripper_lateral_body_offsets}")
     if not args.no_modulation:
-        print("[DEPLOY] IK primitives use smooth Cartesian EE modulation")
+        if args.modulation_space == "jsdf":
+            print("[DEPLOY] IK primitives and neural transport use "
+                  "JSDF-style joint-space avoidance: "
+                  f"influence={jsdf_influence_radius:.3f}m "
+                  f"gain={args.jsdf_gain:.2f} "
+                  f"max_speed={args.jsdf_max_joint_speed:.2f}rad/s")
+        else:
+            print("[DEPLOY] IK primitives use smooth Cartesian EE modulation")
     print(f"[DEPLOY] IK frame={ik_motion['left'].ik.ee_frame}")
     if args.model == "lpvds":
         for arm in ARMS:
@@ -822,7 +953,7 @@ def main():
                 continue
             waypoint = next_waypoint[arm]
             w = avoidance_weight(arm)
-            if w > 0.0:
+            if w > 0.0 and args.modulation_space != "jsdf":
                 other = other_arm(arm)
                 v_nom = waypoint - ee_now[arm]
                 v_mod = mod.huber.modulate_cartesian_points(
@@ -833,7 +964,31 @@ def main():
                 if np.dot(v_cmd, v_nom) <= 0.0:
                     v_cmd = v_nom
                 waypoint = ee_now[arm] + v_cmd
-            ik_ok = ik_motion[arm].step_to(waypoint, target_quat=plan["quat"])
+            if w > 0.0 and args.modulation_space == "jsdf":
+                full_cmd, ik_ok = ik_motion[arm].command_for(
+                    waypoint, target_quat=plan["quat"]
+                )
+                q_now_arm = q_now[arm]
+                q_ik = full_cmd[:7].copy()
+                q_step = q_ik - q_now_arm
+                J = jacobian_finite_difference(franka[arm])
+                q_avoid = jsdf_avoidance_velocity(
+                    arm,
+                    q_step / max(physics_dt, 1e-9),
+                    obstacle_points=protected_now[other_arm(arm)],
+                    self_points=protected_now[arm],
+                )
+                q_step_cmd = q_step + w * q_avoid * physics_dt
+                if np.dot(q_step_cmd, q_step) <= 0.0:
+                    q_step_cmd = q_step
+                q_step_cmd = add_nullspace_home_velocity(
+                    arm, q_step_cmd, J, dt=physics_dt
+                )
+                full_cmd[:7] = q_now_arm + q_step_cmd
+                ik_motion[arm]._q_last = full_cmd[:7].copy()
+                franka[arm].apply_action(_articulation_action(full_cmd))
+            else:
+                ik_ok = ik_motion[arm].step_to(waypoint, target_quat=plan["quat"])
             moved_arms.add(arm)
             if ik_ok:
                 ik_plan_fail_streak[arm] = 0
@@ -893,18 +1048,36 @@ def main():
             if w > 0.0 and np.linalg.norm(q_step) > 1e-9:
                 other = other_arm(arm)
                 J = jacobian_finite_difference(franka[arm])
-                q_step_mod = mod.modulate_joint_velocity_points(
-                    q_dot_nominal=q_step,
-                    self_points=protected_now[arm],
-                    obstacle_points=protected_now[other],
-                    jacobian=J,
-                )
+                if args.modulation_space == "jsdf":
+                    q_step_mod = q_step + physics_dt * jsdf_avoidance_velocity(
+                        arm,
+                        q_step / max(physics_dt, 1e-9),
+                        obstacle_points=protected_now[other],
+                        self_points=protected_now[arm],
+                    )
+                else:
+                    q_step_mod = mod.modulate_joint_velocity_points(
+                        q_dot_nominal=q_step,
+                        self_points=protected_now[arm],
+                        obstacle_points=protected_now[other],
+                        jacobian=J,
+                    )
                 q_step_cmd = (1.0 - w) * q_step + w * q_step_mod
                 if np.dot(q_step_cmd, q_step) <= 0.0:
                     q_step_cmd = q_step
+                q_step_cmd = add_nullspace_home_velocity(
+                    arm, q_step_cmd, J, dt=physics_dt
+                )
                 q = q_now_arm + q_step_cmd
             else:
-                q = q_nom
+                if args.nullspace_home_gain > 0.0:
+                    J = jacobian_finite_difference(franka[arm])
+                    q_step = add_nullspace_home_velocity(
+                        arm, q_step, J, dt=physics_dt
+                    )
+                    q = q_now_arm + q_step
+                else:
+                    q = q_nom
             finger = ik_motion[arm]._finger_width
             full_cmd = np.concatenate([q, [finger, finger]])
             franka[arm].apply_action(_articulation_action(full_cmd))
@@ -1181,13 +1354,24 @@ def main():
             other = other_arm(arm)
             J = jacobian_finite_difference(franka[arm])
             q_dot_nom = q_dots[arm]
-            q_dot_mod = mod.modulate_joint_velocity_points(
-                q_dot_nominal=q_dot_nom,
-                self_points=protected_points[arm],
-                obstacle_points=protected_points[other],
-                jacobian=J,
-            )
+            if args.modulation_space == "jsdf":
+                q_dot_mod = (
+                    q_dot_nom
+                    + jsdf_avoidance_velocity(
+                        arm, q_dot_nom,
+                        obstacle_points=protected_points[other],
+                        self_points=protected_points[arm],
+                    )
+                )
+            else:
+                q_dot_mod = mod.modulate_joint_velocity_points(
+                    q_dot_nominal=q_dot_nom,
+                    self_points=protected_points[arm],
+                    obstacle_points=protected_points[other],
+                    jacobian=J,
+                )
             q_dots[arm] = (1.0 - w) * q_dot_nom + w * q_dot_mod
+            q_dots[arm] = add_nullspace_home_velocity(arm, q_dots[arm], J)
 
         sync_vector_norms(q_dots)
 

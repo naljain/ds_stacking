@@ -101,13 +101,14 @@ class HuberModulation:
 
     def __init__(self, safe_radius=0.15, reactivity=2.0,
                  tail_effect=True, eta_min=0.05, preserve_speed=True,
-                 isoline=1.0):
+                 isoline=1.0, max_pairs=4):
         self.safe_radius = safe_radius
         self.reactivity  = reactivity
         self.tail_effect = tail_effect
         self.eta_min     = eta_min
         self.preserve_speed = preserve_speed
         self.isoline = max(float(isoline), 1e-6)
+        self.max_pairs = None if max_pairs is None else max(1, int(max_pairs))
 
     # ── Level-set Γ and reference direction ────────────────────────────────
     def gamma(self, x, x_obs):
@@ -203,7 +204,7 @@ class HuberModulation:
         return v_mod
 
     def modulate_cartesian_points(self, v_cart, self_points, obstacle_points,
-                                  max_pairs=4):
+                                  max_pairs=None):
         """Modulate using a small set of protected points on both arms.
 
         The commanded Cartesian velocity is still the EE velocity. We evaluate
@@ -224,7 +225,9 @@ class HuberModulation:
         pairs.sort(key=lambda item: item[0])
 
         v_mod = np.asarray(v_cart, dtype=float).copy()
-        for _, i, j in pairs[:max_pairs]:
+        pair_limit = self.max_pairs if max_pairs is None else max_pairs
+        active_pairs = pairs if pair_limit is None else pairs[:max(1, int(pair_limit))]
+        for _, i, j in active_pairs:
             v_mod = self.modulate_cartesian(v_mod, self_points[i], obstacle_points[j])
         return v_mod
 
@@ -260,7 +263,7 @@ class InterArmModulation:
 
     def __init__(self, safe_radius=0.15, reactivity=2.0,
                  tail_effect=True, eta_min=0.05, jac_damping=0.05,
-                 preserve_speed=True, isoline=1.0):
+                 preserve_speed=True, isoline=1.0, max_pairs=4):
         self.huber = HuberModulation(
             safe_radius=safe_radius,
             reactivity=reactivity,
@@ -268,6 +271,7 @@ class InterArmModulation:
             eta_min=eta_min,
             preserve_speed=preserve_speed,
             isoline=isoline,
+            max_pairs=max_pairs,
         )
         self.jac_damping = jac_damping
 

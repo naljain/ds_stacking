@@ -45,6 +45,7 @@ def load_trajectories(demo_paths, primitive):
         "per_block": {},
         "per_stack_slot": {},
         "per_q_goal_source": {},
+        "per_q_goal_seed_policy": {},
         "per_motion_source": {},
         "q_goal_lula_error": {},
     }
@@ -71,6 +72,7 @@ def load_trajectories(demo_paths, primitive):
                 block = step.get("block", "unknown")
                 stack_slot = step.get("stack_slot", "unknown")
                 q_goal_source = step.get("q_goal_source", "legacy_unknown")
+                q_goal_seed_policy = step.get("q_goal_seed_policy", "legacy_unknown")
                 motion_source = step.get("motion_source", "legacy_unknown")
                 manifest["total_samples"] += 1
                 manifest["per_file"][path_key]["samples"] += 1
@@ -81,6 +83,9 @@ def load_trajectories(demo_paths, primitive):
                 )
                 manifest["per_q_goal_source"][q_goal_source] = (
                     manifest["per_q_goal_source"].get(q_goal_source, 0) + 1
+                )
+                manifest["per_q_goal_seed_policy"][q_goal_seed_policy] = (
+                    manifest["per_q_goal_seed_policy"].get(q_goal_seed_policy, 0) + 1
                 )
                 manifest["per_motion_source"][motion_source] = (
                     manifest["per_motion_source"].get(motion_source, 0) + 1
@@ -136,6 +141,7 @@ def main():
     print(f"[TRAIN]   samples by block     : {data_manifest['per_block']}")
     print(f"[TRAIN]   samples by stack slot: {data_manifest['per_stack_slot']}")
     print(f"[TRAIN]   q_goal source counts : {data_manifest['per_q_goal_source']}")
+    print(f"[TRAIN]   q_goal seed policies : {data_manifest['per_q_goal_seed_policy']}")
     print(f"[TRAIN]   motion source counts : {data_manifest['per_motion_source']}")
     if data_manifest["q_goal_lula_error"].get("count", 0):
         err = data_manifest["q_goal_lula_error"]

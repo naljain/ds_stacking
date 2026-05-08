@@ -1,0 +1,47 @@
+deploy:
+  model: neural
+  speedup: 1.0
+  sync_speeds: false
+  parked_obstacle_weight: 0.35
+  done_tol: 0.07
+  ik_done_tol: 0.01
+  max_transport: 4000
+  no_modulation: true
+
+  mod_radius: 0.16
+  mod_reactivity: 4.0
+  mod_isoline: 1.0
+  mod_max_pairs: 4
+  modulation_space: jsdf
+  jsdf_influence_radius: 0.18
+  jsdf_gain: 1.6
+  jsdf_max_joint_speed: 0.35
+  jsdf_fd_eps: 0.001
+  jsdf_debug_every: 120
+  priority_policy: closest_to_stack
+  priority_hysteresis: 0.04
+  priority_mod_weight:
+    left: 0.20
+    right: 0.20
+  yield_mod_weight:
+    left: 0.70
+    right: 0.50
+  no_preserve_mod_speed: false
+  ik_nullspace_seed_weight: 0.0
+  nullspace_home_gain: 0.0
+
+  link_spheres: 2
+  link_sphere_spacing: 0.05
+  link_frames: [panda_link7, right_gripper]
+  link_samples_per_segment: 1
+  gripper_lateral_offsets: [-0.055, 0.055]
+  gripper_lateral_body_offsets: [0.075, 0.13]
+  show_proxy_spheres: false
+  proxy_sphere_radius: 0.02
+
+  status_every: 120
+  diag_out: data/results/neural_low_mod_interaction.pkl
+  isaac_record_out: ""
+  isaac_record_fps: 30
+  isaac_record_size: 1280x720
+  video_out: ""

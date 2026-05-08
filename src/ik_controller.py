@@ -51,7 +51,8 @@ class IKController:
     """
 
     def __init__(self, franka, arm="left", name="cartesian_ik",
-                 max_cart_step=0.005, vel_ramp_frac=0.2, rest_q=None):
+                 max_cart_step=0.005, vel_ramp_frac=0.2, rest_q=None,
+                 nullspace_seed_weight=0.0):
         self.franka        = franka
         self.arm           = arm
         self.max_cart_step = max_cart_step
@@ -63,6 +64,7 @@ class IKController:
         self._q_rest       = np.array(rest_q) if rest_q is not None else _rest_pose(arm)
         self._q_last       = self._q_rest.copy()
         self._finger_width = GRIPPER_OPEN              # tracked gripper state
+        self.nullspace_seed_weight = float(np.clip(nullspace_seed_weight, 0.0, 1.0))
 
     def reset(self):
         """Re-seed IK warm-start from current joint state (which should be
@@ -81,28 +83,34 @@ class IKController:
 
     # ── Core: one IK step to a specific Cartesian waypoint ───────────────────
     def step_to(self, target_pos, target_quat=None):
-        """Solve IK for target_pos and apply a single ArticulationAction that
-        covers all 9 joints (7 arm + 2 fingers) at once.  Mixing
-        franka.apply_action and franka.gripper.apply_action in the same step
-        causes the gripper command to be silently dropped, so we own all joints
-        here.
+        """Solve IK for target_pos and apply a single 9-DOF command."""
+        full_cmd, ok = self.command_for(target_pos, target_quat)
+        ArticulationAction = _articulation_action()
+        self.franka.apply_action(ArticulationAction(joint_positions=full_cmd))
+        return ok
+
+    def command_for(self, target_pos, target_quat=None):
+        """Solve IK and return (full_cmd, ok) without applying it.
+
+        This gives deployment code a hook to add joint-space obstacle
+        corrections before sending the final arm + finger command.
         """
         if target_quat is None:
             target_quat = DEFAULT_DOWN_QUAT
 
-        q_goal, ok = self.ik.solve(target_pos, target_quat,
-                                   q_seed=self._q_last)
+        q_seed = (
+            (1.0 - self.nullspace_seed_weight) * self._q_last
+            + self.nullspace_seed_weight * self._q_rest
+        )
+        q_goal, ok = self.ik.solve(target_pos, target_quat, q_seed=q_seed)
         if ok:
             self._q_last = q_goal.copy()
 
-        # Build full 9-DOF command: arm joints + both finger joints
         full_cmd = np.concatenate([
             self._q_last,                                        # joints 0-6
             np.array([self._finger_width, self._finger_width]),  # joints 7-8
         ])
-        ArticulationAction = _articulation_action()
-        self.franka.apply_action(ArticulationAction(joint_positions=full_cmd))
-        return ok
+        return full_cmd, ok
 
     # ── Straight-line move with trapezoidal velocity profile ─────────────────
     def move_to(self, world, target_pos, target_quat=None, steps=120,
