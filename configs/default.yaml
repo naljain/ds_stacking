@@ -109,10 +109,22 @@ training:
 
 # ── Coordination ──────────────────────────────────────────────────────────────
 coordination:
-  ee_safety_radius:    0.15    # arms back off if EE distance < this
-  hold_threshold:      0.20    # wait if other arm is closer than this to my goal
+  ee_safety_radius:    0.30    # spherical modulation radius around protected points
+  modulation_reactivity: 2.0   # lower values make avoidance start earlier
+  modulation_isoline:  1.0     # >1 expands the effective modulation boundary
+  preserve_mod_speed:  true
+  priority_policy:     fixed   # fixed or closest_to_stack
+  priority_hysteresis: 0.04
+  link_proxy_spheres:  3
+  link_proxy_spacing:  0.055
+  link_proxy_frames:   [panda_link5, panda_link6, panda_link7, right_gripper]
+  link_proxy_samples_per_segment: 2
+  gripper_proxy_lateral_offsets: [-0.065, 0.065]
+  gripper_proxy_body_offsets: [0.075, 0.13, 0.185]
+  hold_threshold:      0.30    # wait if other arm is closer than this to my goal
   collision_check_hz:  60
   start_stagger_steps: 0       # both arms start together by default
+  yield_radius:        0.12    # place-yield radius around shared stack
 
 # ── Perturbations ─────────────────────────────────────────────────────────────
 perturbations:

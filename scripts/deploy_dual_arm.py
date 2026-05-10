@@ -84,6 +84,101 @@ def _load_one_ds(ckpt_path, device):
     }
 
 
+def _quat_wxyz_to_matrix(q):
+    q = np.asarray(q, dtype=float)
+    if q.shape != (4,):
+        return np.eye(3)
+    w, x, y, z = q / (np.linalg.norm(q) + 1e-12)
+    return np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+        [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+        [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+    ])
+
+
+def _protected_points(ee_pos, ee_quat, n_link_spheres, spacing):
+    points = [np.asarray(ee_pos, dtype=float)]
+    if n_link_spheres <= 0:
+        return np.asarray(points)
+    R = _quat_wxyz_to_matrix(ee_quat)
+    link_axis = R @ np.array([0.0, 0.0, -1.0])
+    if np.linalg.norm(link_axis) < 1e-9:
+        link_axis = np.array([0.0, 0.0, 1.0])
+    link_axis = link_axis / (np.linalg.norm(link_axis) + 1e-12)
+    for i in range(1, n_link_spheres + 1):
+        points.append(points[0] + i * spacing * link_axis)
+    return np.asarray(points)
+
+
+def _add_gripper_width_points(points, ee_pos, ee_quat, lateral_offsets,
+                              body_offsets):
+    points = [np.asarray(p, dtype=float) for p in points]
+    if not lateral_offsets:
+        return np.asarray(points)
+    R = _quat_wxyz_to_matrix(ee_quat)
+    lateral_axis = R @ np.array([0.0, 1.0, 0.0])
+    if np.linalg.norm(lateral_axis) < 1e-9:
+        lateral_axis = np.array([1.0, 0.0, 0.0])
+    lateral_axis = lateral_axis / (np.linalg.norm(lateral_axis) + 1e-12)
+    body_axis = R @ np.array([0.0, 0.0, -1.0])
+    if np.linalg.norm(body_axis) < 1e-9:
+        body_axis = np.array([0.0, 0.0, 1.0])
+    body_axis = body_axis / (np.linalg.norm(body_axis) + 1e-12)
+    body_offsets = body_offsets if body_offsets else [0.0]
+    ee_pos = np.asarray(ee_pos, dtype=float)
+    for body_offset in body_offsets:
+        body_center = ee_pos + float(body_offset) * body_axis
+        points.append(body_center)
+        for offset in lateral_offsets:
+            points.append(body_center + float(offset) * lateral_axis)
+    return np.asarray(points)
+
+
+def _protected_points_from_links(ik, q, fallback_ee_pos, fallback_ee_quat,
+                                 frames, samples_per_segment,
+                                 n_fallback_spheres, fallback_spacing,
+                                 gripper_lateral_offsets,
+                                 gripper_lateral_body_offsets):
+    frame_poses = []
+    for frame in frames or []:
+        try:
+            pos, quat = ik.get_frame_world_pose(frame, q=q)
+            frame_poses.append((np.asarray(pos, dtype=float), quat))
+        except Exception:
+            continue
+    frame_points = [p for p, _ in frame_poses]
+    if len(frame_points) < 2:
+        points = _protected_points(
+            fallback_ee_pos, fallback_ee_quat, n_fallback_spheres,
+            fallback_spacing
+        )
+        return _add_gripper_width_points(
+            points, fallback_ee_pos, fallback_ee_quat,
+            gripper_lateral_offsets, gripper_lateral_body_offsets
+        )
+    points = [frame_points[0]]
+    samples_per_segment = max(0, int(samples_per_segment))
+    for a, b in zip(frame_points[:-1], frame_points[1:]):
+        for i in range(1, samples_per_segment + 2):
+            s = i / (samples_per_segment + 1)
+            points.append((1.0 - s) * a + s * b)
+    gripper_pos, gripper_quat = frame_poses[-1]
+    if gripper_quat is None:
+        gripper_quat = fallback_ee_quat
+    return _add_gripper_width_points(
+        points, gripper_pos, gripper_quat,
+        gripper_lateral_offsets, gripper_lateral_body_offsets
+    )
+
+
+def _arm_param(value, arm, default=None):
+    if isinstance(value, dict):
+        if arm in value:
+            return value[arm]
+        return value.get("default", default)
+    return value
+
+
 def load_ds_sets(ckpt_dir, ckpt_arm_mode, device, primitives=None):
     """Load DS checkpoints for both arms.
 
@@ -149,9 +244,49 @@ def main():
                         help="Override inter-arm EE modulation safety radius "
                              "in meters. Larger values create earlier, more "
                              "conservative avoidance.")
-    parser.add_argument("--mod_reactivity", type=float, default=4.0,
+    parser.add_argument("--mod_reactivity", type=float, default=None,
                         help="Exponent for inter-arm modulation. Lower values "
                              "make modulation act earlier over a wider range.")
+    parser.add_argument("--mod_isoline", type=float, default=None,
+                        help="Gamma contour to track. Values >1 expand the "
+                             "effective modulation boundary.")
+    parser.add_argument("--mod_max_pairs", type=int, default=4,
+                        help="Number of closest protected sphere pairs to "
+                             "modulate. Use 0 for all pairs.")
+    parser.add_argument("--no_preserve_mod_speed", action="store_true",
+                        help="Do not rescale modulated Cartesian velocity back "
+                             "to nominal speed.")
+    parser.add_argument("--priority_arm", type=str, default="left",
+                        choices=["left", "right"],
+                        help="Arm that starts as the lower-modulation priority arm.")
+    parser.add_argument("--priority_policy", type=str, default="fixed",
+                        choices=["fixed", "closest_to_stack"],
+                        help="How to choose the priority arm.")
+    parser.add_argument("--priority_hysteresis", type=float, default=0.04,
+                        help="Closest-to-stack policy switch margin in metres.")
+    parser.add_argument("--priority_mod_weight", type=float, default=0.25,
+                        help="Blend weight for modulation on the priority arm.")
+    parser.add_argument("--yield_mod_weight", type=float, default=1.0,
+                        help="Blend weight for modulation on the yielding arm.")
+    parser.add_argument("--link_spheres", type=int, default=None,
+                        help="Fallback proxy spheres behind the EE.")
+    parser.add_argument("--link_sphere_spacing", type=float, default=None,
+                        help="Fallback proxy sphere spacing in metres.")
+    parser.add_argument("--link_frames", nargs="+", default=None,
+                        help="Lula FK frames used for distal-link proxy points.")
+    parser.add_argument("--link_samples_per_segment", type=int, default=None,
+                        help="Extra proxy samples between FK frames.")
+    parser.add_argument("--gripper_lateral_offsets", nargs="*", type=float,
+                        default=None,
+                        help="Gripper body lateral proxy offsets in local Y.")
+    parser.add_argument("--gripper_lateral_body_offsets", nargs="*", type=float,
+                        default=None,
+                        help="Offsets back from EE along local -Z for gripper proxies.")
+    parser.add_argument("--show_proxy_spheres", action="store_true",
+                        help="Print/use protected proxy points for modulation diagnostics.")
+    parser.add_argument("--yield_radius", type=float, default=None,
+                        help="Distance from shared stack where the non-priority "
+                             "arm waits before place.")
     parser.add_argument("--link_safety_radius", type=float, default=0.18,
                         help="Minimum sampled link-to-link distance in meters. "
                              "If any sampled links are closer, pause one arm "
@@ -341,10 +476,52 @@ def main():
         print(f"[DEPLOY] Overriding alpha -> {args.alpha}")
 
     seq = TaskSequencer(env, cfg)
+    mod_radius = (cfg["coordination"]["ee_safety_radius"]
+                  if args.mod_safe_radius is None else args.mod_safe_radius)
+    mod_reactivity = args.mod_reactivity
+    if mod_reactivity is None:
+        mod_reactivity = cfg["coordination"].get("modulation_reactivity", 2.0)
+    mod_isoline = args.mod_isoline
+    if mod_isoline is None:
+        mod_isoline = cfg["coordination"].get("modulation_isoline", 1.0)
     mod = InterArmModulation(
-        safe_radius=(cfg["coordination"]["ee_safety_radius"]
-                     if args.mod_safe_radius is None else args.mod_safe_radius),
-        reactivity=args.mod_reactivity,
+        safe_radius=mod_radius,
+        reactivity=mod_reactivity,
+        preserve_speed=not args.no_preserve_mod_speed,
+        isoline=mod_isoline,
+        max_pairs=(None if args.mod_max_pairs == 0 else args.mod_max_pairs),
+    )
+    link_spheres = args.link_spheres
+    if link_spheres is None:
+        link_spheres = cfg["coordination"].get("link_proxy_spheres", 3)
+    link_sphere_spacing = args.link_sphere_spacing
+    if link_sphere_spacing is None:
+        link_sphere_spacing = cfg["coordination"].get("link_proxy_spacing", 0.055)
+    link_frames = args.link_frames
+    if link_frames is None:
+        link_frames = cfg["coordination"].get(
+            "link_proxy_frames",
+            ["panda_link5", "panda_link6", "panda_link7", "right_gripper"],
+        )
+    link_samples_per_segment = args.link_samples_per_segment
+    if link_samples_per_segment is None:
+        link_samples_per_segment = cfg["coordination"].get(
+            "link_proxy_samples_per_segment", 2
+        )
+    gripper_lateral_offsets = args.gripper_lateral_offsets
+    if gripper_lateral_offsets is None:
+        gripper_lateral_offsets = cfg["coordination"].get(
+            "gripper_proxy_lateral_offsets", [-0.065, 0.065]
+        )
+    gripper_lateral_body_offsets = args.gripper_lateral_body_offsets
+    if gripper_lateral_body_offsets is None:
+        gripper_lateral_body_offsets = cfg["coordination"].get(
+            "gripper_proxy_body_offsets", [0.075, 0.13, 0.185]
+        )
+    priority_arm = args.priority_arm
+    yield_radius = (
+        cfg["coordination"].get("yield_radius", 0.12)
+        if args.yield_radius is None else args.yield_radius
     )
 
     physics_dt = cfg["sim"]["physics_dt"]
@@ -429,6 +606,15 @@ def main():
           f"modulation={'OFF' if args.no_modulation else 'ON'}, "
           f"ds_scale={args.ds_scale}, ds_goal_gain={DS_GOAL_GAIN}, "
           f"max_joint_vel={max_joint_vel}")
+    if not args.no_modulation:
+        print(f"[DEPLOY] Modulation radius={mod_radius:.3f}m "
+              f"reactivity={mod_reactivity:.2f} isoline={mod_isoline:.2f} "
+              f"priority={priority_arm} policy={args.priority_policy} "
+              f"priority_w={args.priority_mod_weight} "
+              f"yield_w={args.yield_mod_weight}")
+        print(f"[DEPLOY] Protected frames={link_frames} "
+              f"samples/segment={link_samples_per_segment} "
+              f"gripper_offsets={gripper_lateral_offsets}")
     if ik_primitives:
         print(f"[DEPLOY] IK primitives: {', '.join(sorted(ik_primitives))}")
     if stagger_steps > 0:
@@ -439,6 +625,77 @@ def main():
     held_offset = {"left": np.zeros(3), "right": np.zeros(3)}
     link_hold_arm = None
     safety_hold_steps = {"left": 0, "right": 0}
+
+    def other_arm(arm):
+        return "right" if arm == "left" else "left"
+
+    def goal_xy_for_arm(arm):
+        return np.asarray(seq.tasks[arm].goal_xy, dtype=float)
+
+    def avoidance_weight(arm):
+        if args.no_modulation:
+            return 0.0
+        task = seq.tasks[arm]
+        if task.is_done():
+            return 0.0
+        if arm == priority_arm:
+            return float(_arm_param(args.priority_mod_weight, arm, 0.25))
+        return float(_arm_param(args.yield_mod_weight, arm, 1.0))
+
+    def update_priority():
+        nonlocal priority_arm
+        if args.priority_policy != "closest_to_stack" or args.no_modulation:
+            return
+        candidates = []
+        for arm in ("left", "right"):
+            task = seq.tasks[arm]
+            if not task.is_done() and task.current_primitive in ("transport", "place"):
+                candidates.append(arm)
+        if len(candidates) == 1:
+            if priority_arm != candidates[0]:
+                priority_arm = candidates[0]
+                print(f"[COORD] Priority -> {priority_arm} (sole active arm)")
+            return
+        if len(candidates) < 2:
+            return
+        dist = {}
+        for arm in candidates:
+            ee = ik_frame_position(arm)
+            dist[arm] = float(np.linalg.norm(ee[:2] - goal_xy_for_arm(arm)))
+        closest = min(candidates, key=lambda arm: dist[arm])
+        current = priority_arm if priority_arm in candidates else None
+        if current is None or dist[closest] + args.priority_hysteresis < dist[current]:
+            priority_arm = closest
+            print(f"[COORD] Priority -> {priority_arm} "
+                  f"(closer to stack: {dist[closest]:.3f}m)")
+
+    def can_place(arm):
+        other = other_arm(arm)
+        other_task = seq.tasks[other]
+        if other_task.is_done():
+            return True
+        if other_task.current_primitive == "place":
+            return arm == priority_arm
+        if other_task.current_primitive not in ("transport", "place"):
+            return True
+        ee_other = ik_frame_position(other)
+        return np.linalg.norm(ee_other[:2] - goal_xy_for_arm(arm)) > yield_radius
+
+    def protected_points_for_arm(arm):
+        q = franka[arm].get_joint_positions()[:7].copy()
+        try:
+            ee_pos = ik_kin[arm].forward_position(q)
+            _, ee_quat = ik_kin[arm].get_frame_world_pose("right_gripper", q=q)
+        except Exception:
+            ee_pos, ee_quat = env.get_ee_pose(arm)
+        if ee_quat is None:
+            ee_quat = seq.ee_orientation(arm)
+        return _protected_points_from_links(
+            ik_kin[arm], q, ee_pos, ee_quat,
+            link_frames, link_samples_per_segment, max(0, link_spheres),
+            link_sphere_spacing, gripper_lateral_offsets,
+            gripper_lateral_body_offsets,
+        )
 
     def min_link_distance():
         left_pts = env.get_arm_link_positions("left")
@@ -563,9 +820,12 @@ def main():
     for step in range(args.max_steps):
         if not simulation_app.is_running():
             break
+        update_priority()
 
         # Cache EE positions BEFORE we move so modulation uses consistent state
         ee_pos = {arm: env.get_ee_pose(arm)[0].copy() for arm in ("left", "right")}
+        protected_points = {arm: protected_points_for_arm(arm)
+                            for arm in ("left", "right")}
 
         # Compute nominal q̇ for each arm (in parallel, before any commits)
         q_dots = {}
@@ -609,6 +869,10 @@ def main():
             prim_steps[arm] += 1
 
             q = franka[arm].get_joint_positions()[:7].copy()
+            if task.current_primitive == "place" and not can_place(arm):
+                q_dots[arm] = None
+                q_cmd_state[arm] = franka[arm].get_joint_positions().copy()
+                continue
             if task.current_primitive in ik_primitives:
                 x = q - task.q_goal
                 q_dots[arm] = np.clip(
@@ -645,12 +909,15 @@ def main():
                     continue
                 # Compute Jacobian by finite-diff (slow but version-stable)
                 J = jacobian_finite_difference(franka[arm])
-                q_dots[arm] = mod.modulate_joint_velocity(
-                    q_dot_nominal=q_dots[arm],
-                    ee_pos_self=ee_pos[arm],
-                    ee_pos_other=ee_pos[other],
+                q_dot_nom = q_dots[arm]
+                q_dot_mod = mod.modulate_joint_velocity_points(
+                    q_dot_nominal=q_dot_nom,
+                    self_points=protected_points[arm],
+                    obstacle_points=protected_points[other],
                     jacobian=J,
                 )
+                w = avoidance_weight(arm)
+                q_dots[arm] = (1.0 - w) * q_dot_nom + w * q_dot_mod
 
         if not args.no_link_safety_hold:
             link_dist = min_link_distance()
@@ -752,6 +1019,10 @@ def main():
                         snap_held_block_to_stack(arm)
                     held_block[arm] = None
                     hold_gripper(arm, 0.04, cfg["sim"]["gripper_steps"])
+                    if args.priority_policy == "fixed":
+                        priority_arm = other_arm(arm)
+                        if not args.no_modulation:
+                            print(f"[COORD] Priority passed to {priority_arm}")
                     joint_lula_move_to_cart(
                         arm,
                         seq.stack_clearance_target(arm),

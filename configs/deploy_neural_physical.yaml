@@ -28,8 +28,15 @@ deploy:
   grasp_z_offset: 0.0
   gripper_steps: 120
 
-  # Start with no modulation while debugging physical grasp behavior.
-  no_modulation: true
+  # Use the stephen/testing-style weighted protected-point modulation.
+  no_modulation: false
+  priority_arm: left
+  priority_policy: fixed
+  priority_mod_weight: 0.25
+  yield_mod_weight: 1.0
+  mod_reactivity: 2.0
+  mod_isoline: 1.0
+  mod_max_pairs: 4
   no_link_safety_hold: true
 
   # Keep finished arms where they end; this avoids a post-task parking motion
