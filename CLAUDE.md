@@ -92,8 +92,8 @@ avoid `add_default_ground_plane()` pulling from the remote asset root.
 - **`render=not args.headless`** — every `world.step()` and `env.step()` call needs this so headless mode actually skips rendering.
 - **Configs over magic numbers** — table dimensions, primitive heights, training hyperparams etc. all live in `configs/default.yaml`, not as constants in code. If something needs tuning, check the config first.
 - **One IK call per primitive transition.** Lula IK is only called when the primitive switches and a new `q_goal` is needed. `reach` and `transport` use the DS inside the primitive; `grasp`, `lift`, and `place` use the scripted Lula joint-space controller.
-- **Coordinator stays slim.** It owns block order, primitive order, stack-slot reservation, dynamic stack clearance, return-home state, and the initial arm phase offset. Continuous EE avoidance belongs to modulation; sampled-link hold is an explicit deployment safety guard.
-- **Dual-arm start is intentionally staggered.** `coordination.start_stagger_steps` delays the right arm so both arms do not reach the shared stack at the same time. This is phase scheduling, not priority arbitration.
+- **Coordinator stays slim.** It owns block order, primitive order, stack-slot reservation, dynamic stack clearance, return-home state, and optional arm phase offset. Continuous EE avoidance belongs to modulation; sampled-link hold is an explicit deployment safety guard.
+- **Dual-arm start is simultaneous by default.** `coordination.start_stagger_steps` is 0. Use `--stagger_steps N` only for ablations.
 
 ## Known footguns
 

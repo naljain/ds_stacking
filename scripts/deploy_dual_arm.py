@@ -150,12 +150,12 @@ def main():
     parser.add_argument("--link_safety_hold", action="store_false",
                         dest="no_link_safety_hold",
                         help="Enable conservative sampled-link safety hold. "
-                             "By default dual-arm coordination relies on the "
-                             "start stagger instead.")
+                             "Disabled by default.")
     parser.set_defaults(no_link_safety_hold=True)
     parser.add_argument("--stagger_steps", type=int, default=None,
                         help="Initial right-arm launch delay in physics steps. "
-                             "Defaults to coordination.start_stagger_steps.")
+                             "Defaults to coordination.start_stagger_steps "
+                             "(0 in the default config).")
     parser.add_argument("--return_home_tol", type=float, default=0.05,
                         help="Joint-space tolerance for parking an arm at its "
                              "initial home pose after its final block is placed.")
@@ -254,6 +254,8 @@ def main():
     arm_start_step = {"left": 0, "right": max(0, stagger_steps)}
     home_q = {arm: franka[arm].get_joint_positions()[:7].copy()
               for arm in ("left", "right")}
+    q_cmd_state = {arm: franka[arm].get_joint_positions().copy()
+                   for arm in ("left", "right")}
     arm_parked = {arm: False for arm in ("left", "right")}
 
     # Open both grippers
@@ -265,6 +267,8 @@ def main():
     # Let blocks settle before querying their positions
     for _ in range(60):
         env.step(render=not args.headless)
+    q_cmd_state = {arm: franka[arm].get_joint_positions().copy()
+                   for arm in ("left", "right")}
 
     # Initialise q_goals per arm
     ik_failed = {"failed": False}
@@ -413,11 +417,13 @@ def main():
                 -max_joint_vel,
                 max_joint_vel,
             )
+            q_cmd_state[arm][:7] = q_cmd_state[arm][:7] + q_dot * physics_dt
             full = franka[arm].get_joint_positions().copy()
-            full[:7] = q_now + q_dot * physics_dt
+            full[:7] = q_cmd_state[arm][:7]
             franka[arm].apply_action(ArticulationAction(joint_positions=full))
             env.step(render=not args.headless)
             carry_held_blocks()
+        q_cmd_state[arm] = franka[arm].get_joint_positions().copy()
         return np.linalg.norm(ik_frame_position(arm) - target_cart) < cart_tol
 
     for step in range(args.max_steps):
@@ -433,16 +439,19 @@ def main():
             task = seq.tasks[arm]
             if step < arm_start_step[arm]:
                 q_dots[arm] = None
+                q_cmd_state[arm] = franka[arm].get_joint_positions().copy()
                 continue
             if task.is_done():
                 if args.no_return_home_after_done or arm_parked[arm]:
                     q_dots[arm] = None
+                    q_cmd_state[arm] = franka[arm].get_joint_positions().copy()
                     continue
                 q = franka[arm].get_joint_positions()[:7].copy()
                 x_home = q - home_q[arm]
                 if np.linalg.norm(x_home) < args.return_home_tol:
                     q_dots[arm] = None
                     arm_parked[arm] = True
+                    q_cmd_state[arm] = franka[arm].get_joint_positions().copy()
                     print(f"[DEPLOY] {arm} arm parked at home.")
                     continue
                 q_dots[arm] = np.clip(
@@ -460,6 +469,7 @@ def main():
                 last_prim[arm] = task.current_primitive
                 prim_steps[arm] = 0
                 safety_hold_steps[arm] = 0
+                q_cmd_state[arm] = franka[arm].get_joint_positions().copy()
 
             prim_steps[arm] += 1
 
@@ -535,9 +545,9 @@ def main():
         for arm in ("left", "right"):
             if q_dots[arm] is None:
                 continue
-            q = franka[arm].get_joint_positions()[:7].copy()
+            q_cmd_state[arm][:7] = q_cmd_state[arm][:7] + q_dots[arm] * physics_dt
             q_cmd_full = franka[arm].get_joint_positions().copy()
-            q_cmd_full[:7] = q + q_dots[arm] * physics_dt
+            q_cmd_full[:7] = q_cmd_state[arm][:7]
             franka[arm].apply_action(ArticulationAction(joint_positions=q_cmd_full))
 
         env.step(render=not args.headless)
@@ -600,6 +610,7 @@ def main():
                     )
                     for _ in range(cfg["sim"]["gripper_steps"]):
                         env.step(render=not args.headless)
+                    q_cmd_state[arm] = franka[arm].get_joint_positions().copy()
                     if args.kinematic_carry:
                         ee = env.get_ee_pose(arm)[0].copy()
                         block_pos = env.get_block_positions()[task.current_block].copy()
@@ -615,6 +626,7 @@ def main():
                     )
                     for _ in range(cfg["sim"]["gripper_steps"]):
                         env.step(render=not args.headless)
+                    q_cmd_state[arm] = franka[arm].get_joint_positions().copy()
                     joint_lula_move_to_cart(
                         arm,
                         seq.stack_clearance_target(arm),

@@ -89,7 +89,7 @@ coordination:
   ee_safety_radius:    0.15    # arms back off if EE distance < this
   hold_threshold:      0.20    # wait if other arm is closer than this to my goal
   collision_check_hz:  60
-  start_stagger_steps: 2400    # 20.0 s at 120 Hz; right arm starts after left
+  start_stagger_steps: 0       # both arms start together by default
 
 # ── Perturbations ─────────────────────────────────────────────────────────────
 perturbations:

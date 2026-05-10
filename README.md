@@ -305,11 +305,9 @@ collision avoidance is handled by DS modulation. A separate sampled-link hold
 guards elbow/forearm collisions by pausing one arm until the sampled link
 distance clears the hysteresis band.
 
-Dual-arm deployment uses an initial phase offset by default:
-`coordination.start_stagger_steps: 2400`, roughly 20.0 s at 120 Hz. The left
-arm starts immediately and the right arm starts after the stagger. This avoids
-both arms arriving at the shared stack together. Override it with
-`--stagger_steps`.
+Dual-arm deployment starts both arms together by default:
+`coordination.start_stagger_steps: 0`. For ablations, add a right-arm launch
+delay with `--stagger_steps`.
 
 Shared stack layers are reserved before `transport/place`, so both arms cannot
 target the same stack height when they arrive at the goal area concurrently.

@@ -234,6 +234,7 @@ def main():
 
     last_primitive = seq.tasks[args.arm].current_primitive
     prim_steps = 0
+    q_cmd_state = franka.get_joint_positions().copy()
     # 30× the collection budget — very generous so a slow-converging DS
     # has plenty of room before we give up and advance.
     prim_timeout = {p: s * 30
@@ -246,6 +247,7 @@ def main():
     # Let blocks settle before querying their positions
     for _ in range(60):
         env.step(render=not args.headless)
+    q_cmd_state = franka.get_joint_positions().copy()
 
     csv_log = None
     if args.log_csv is not None:
@@ -307,11 +309,13 @@ def main():
                 break
             err = q_now - q_goal
             q_dot = np.clip(-args.ik_goal_gain * err, -max_joint_vel, max_joint_vel)
+            q_cmd_state[:7] = q_cmd_state[:7] + q_dot * physics_dt
             full_cmd = franka.get_joint_positions().copy()
-            full_cmd[:7] = q_now + q_dot * physics_dt
+            full_cmd[:7] = q_cmd_state[:7]
             franka.apply_action(ArticulationAction(joint_positions=full_cmd))
             env.step(render=not args.headless)
         final_ee = ik_frame_position().copy()
+        q_cmd_state[:] = franka.get_joint_positions().copy()
         final_err = np.linalg.norm(final_ee - target_cart)
         if args.debug_post_place_lift:
             print(f"[POST_PLACE] final_ee={final_ee.round(3)} "
@@ -329,6 +333,7 @@ def main():
         # If primitive changed since last step, refresh q_goal
         if task.current_primitive != last_primitive:
             update_q_goal(args.arm)
+            q_cmd_state = franka.get_joint_positions().copy()
             q_goal_dbg = task.q_goal
             q_now_dbg  = franka.get_joint_positions()[:7]
             init_e     = np.linalg.norm(q_now_dbg - q_goal_dbg)
@@ -404,7 +409,7 @@ def main():
             proj_correction = float(np.linalg.norm(q_dot - q_dot_raw))
 
         if args.print_every and step % args.print_every == 0:
-            q_cmd_preview = q + q_dot_clipped * physics_dt
+            q_cmd_preview = q_cmd_state[:7] + q_dot_clipped * physics_dt
             print(f"  step {step:5d} | {task.current_primitive:9s} | "
                   f"{'IK' if using_ik else 'DS'} | "
                   f"||e||={e_norm:.3f}  V={V_val:7.3f}  "
@@ -413,7 +418,7 @@ def main():
                   f"||qd||={qd_norm:.2f}  "
                   f"proj_Δ={proj_correction:.2f}  "
                   f"cos→goal={cos_to_goal:+.2f}  "
-                  f"max|Δqcmd|={np.max(np.abs(q_cmd_preview - q)):.4f}")
+                  f"max|qcmd-q|={np.max(np.abs(q_cmd_preview - q)):.4f}")
 
         if args.log_csv is not None:
             csv_log.write(
@@ -424,19 +429,14 @@ def main():
                 f"{cos_to_goal:.5f}\n"
             )
 
-        if using_ik:
-            q_cmd = q + q_dot_clipped * physics_dt
-            full_cmd = franka.get_joint_positions().copy()
-            full_cmd[:7] = q_cmd
-            franka.apply_action(ArticulationAction(joint_positions=full_cmd))
-        elif not using_ik:
-            q_dot = q_dot_clipped
-
-            # Integrate to get joint position command
-            q_cmd = q + q_dot * physics_dt
-            full_cmd = franka.get_joint_positions().copy()
-            full_cmd[:7] = q_cmd
-            franka.apply_action(ArticulationAction(joint_positions=full_cmd))
+        # Integrate velocity into a persistent command trajectory. Using
+        # q_measured + q_dot*dt every tick can stall when the articulation
+        # lags the tiny one-step target; q_cmd_state gives the low-level
+        # position controller an actual trajectory to track.
+        q_cmd_state[:7] = q_cmd_state[:7] + q_dot_clipped * physics_dt
+        full_cmd = franka.get_joint_positions().copy()
+        full_cmd[:7] = q_cmd_state[:7]
+        franka.apply_action(ArticulationAction(joint_positions=full_cmd))
 
         env.step(render=not args.headless)
         carry_held_block()
@@ -479,6 +479,7 @@ def main():
                 )
                 for _ in range(cfg["sim"]["gripper_steps"]):
                     env.step(render=not args.headless)
+                q_cmd_state = franka.get_joint_positions().copy()
                 if args.kinematic_carry:
                     ee_pos = env.get_ee_pose(args.arm)[0].copy()
                     block_pos = env.get_block_positions()[task.current_block].copy()
@@ -494,6 +495,7 @@ def main():
                 )
                 for _ in range(cfg["sim"]["gripper_steps"]):
                     env.step(render=not args.headless)
+                q_cmd_state = franka.get_joint_positions().copy()
                 if args.post_place_lift_steps > 0:
                     retract_cart = seq.stack_clearance_target(args.arm)
                     joint_lula_move_to_cart(
@@ -502,6 +504,7 @@ def main():
                         cart_tol=args.post_place_lift_tol,
                         label="post-place lift",
                     )
+                    q_cmd_state = franka.get_joint_positions().copy()
             seq.primitive_complete(args.arm)
             prim_steps = 0
 
