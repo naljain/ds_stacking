@@ -80,7 +80,7 @@ training:
                              # residual, which trains poorly when demos are noisy.
   lr:               1.0e-3
   batch_size:       256
-  epochs:           1000
+  epochs:           300
   device:           cuda
   max_joint_vel:    1.5      # rad/s clamp applied at deployment (per joint)
 

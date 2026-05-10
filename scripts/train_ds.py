@@ -3,12 +3,15 @@ Train a joint-space Neural DS + Lyapunov network for one primitive.
 
 Loads demos from data/demonstrations/{arm}_demos.pkl, filters to the requested
 primitive, forms (state, q_dot) pairs where state = q - q_goal and q_dot is
-the demonstrated joint velocity.
+the demonstrated joint velocity. Holds out the last ~10% of demos in each
+pickle as a validation set; the saved checkpoint is the model with the lowest
+validation imitation MSE.
 
 Saves a checkpoint per (arm, primitive) at data/checkpoints/{arm}_{primitive}.pt.
 
 Usage:
-  python scripts/train_ds.py --primitive reach --arm both
+  python scripts/train_ds.py --primitive reach --arm left
+  python scripts/train_ds.py --primitive reach --arm both     # pools — see CLAUDE.md
 """
 
 import os
@@ -27,19 +30,26 @@ from src.neural_ds import StableNeuralDS, total_loss, N_JOINTS
 from src.primitives import DS_PRIMITIVES
 
 
-def load_trajectories(demo_paths, primitive):
+def load_trajectories(demo_paths, primitive, val_fraction=0.1):
     """Concatenate (state=q-q_goal, q_dot) pairs for one primitive.
 
-    Also returns a manifest describing exactly which saved demonstrations
-    contributed samples. This keeps the data split explicit: each DS checkpoint
-    is trained from one primitive label, optionally pooled across arms.
+    Splits each pickle into train/val by demo index (last `val_fraction` of
+    demos go to val). Returns
+        (train_states, train_velocities,
+         val_states,   val_velocities,
+         manifest).
+    val_* are zero-length arrays if every pickle has fewer than 5 demos.
+
+    The manifest reflects training samples only — that's what produced the
+    checkpoint. Validation samples are counted under `val_samples`.
     """
-    states = []
-    velocities = []
+    train_states, train_velocities = [], []
+    val_states, val_velocities = [], []
     manifest = {
         "primitive": primitive,
         "demo_files": [str(p) for p in demo_paths],
         "total_samples": 0,
+        "val_samples": 0,
         "per_file": {},
         "per_arm": {},
         "per_block": {},
@@ -52,19 +62,26 @@ def load_trajectories(demo_paths, primitive):
         path_key = str(path)
         manifest["per_file"][path_key] = {
             "demos": 0,
+            "val_demos": 0,
             "samples": 0,
             "blocks": {},
         }
         with open(path, "rb") as f:
             demos = pickle.load(f)
-        manifest["per_file"][path_key]["demos"] = len(demos)
-        for demo in demos:
+        n_total = len(demos)
+        n_val = max(1, int(round(n_total * val_fraction))) if n_total >= 5 else 0
+        train_demos = demos[: n_total - n_val]
+        val_demos = demos[n_total - n_val :]
+        manifest["per_file"][path_key]["demos"] = len(train_demos)
+        manifest["per_file"][path_key]["val_demos"] = len(val_demos)
+
+        for demo in train_demos:
             for step in demo["trajectory"]:
                 if step["primitive"] != primitive:
                     continue
                 x = step["q"] - step["q_goal"]  # error-based: 7-dim
-                states.append(x)
-                velocities.append(step["q_dot"])
+                train_states.append(x)
+                train_velocities.append(step["q_dot"])
 
                 arm = step.get("arm", demo.get("arm", "unknown"))
                 block = step.get("block", "unknown")
@@ -92,9 +109,29 @@ def load_trajectories(demo_paths, primitive):
                                            float(step["q_goal_lula_error"]))
                 blocks = manifest["per_file"][path_key]["blocks"]
                 blocks[block] = blocks.get(block, 0) + 1
-    if not states:
+
+        for demo in val_demos:
+            for step in demo["trajectory"]:
+                if step["primitive"] != primitive:
+                    continue
+                val_states.append(step["q"] - step["q_goal"])
+                val_velocities.append(step["q_dot"])
+                manifest["val_samples"] += 1
+
+    if not train_states:
         raise RuntimeError(f"No samples found for primitive '{primitive}' in {demo_paths}")
-    return np.stack(states), np.stack(velocities), manifest
+
+    train_states_arr     = np.stack(train_states)
+    train_velocities_arr = np.stack(train_velocities)
+    if val_states:
+        val_states_arr     = np.stack(val_states)
+        val_velocities_arr = np.stack(val_velocities)
+    else:
+        val_states_arr     = np.empty((0, train_states_arr.shape[1]))
+        val_velocities_arr = np.empty((0, train_velocities_arr.shape[1]))
+    return (train_states_arr, train_velocities_arr,
+            val_states_arr,   val_velocities_arr,
+            manifest)
 
 
 def main():
@@ -120,8 +157,11 @@ def main():
         demo_paths = [demos_dir / f"{args.arm}_demos.pkl"]
 
     print(f"[TRAIN] Loading {args.primitive} samples from {demo_paths}")
-    states, velocities, data_manifest = load_trajectories(demo_paths, args.primitive)
-    print(f"[TRAIN] Got {len(states)} samples, state dim {states.shape[1]}")
+    (states, velocities,
+     val_states, val_velocities,
+     data_manifest) = load_trajectories(demo_paths, args.primitive)
+    print(f"[TRAIN] Got {len(states)} train samples, {len(val_states)} val samples, "
+          f"state dim {states.shape[1]}")
     print("[TRAIN] ── data partition used for this DS ──")
     print(f"[TRAIN]   checkpoint           : {args.arm}_{args.primitive}.pt")
     print(f"[TRAIN]   primitive label      : {args.primitive}")
@@ -131,6 +171,7 @@ def main():
     print(f"[TRAIN]   samples by stack slot: {data_manifest['per_stack_slot']}")
     print(f"[TRAIN]   q_goal source counts : {data_manifest['per_q_goal_source']}")
     print(f"[TRAIN]   motion source counts : {data_manifest['per_motion_source']}")
+    print(f"[TRAIN]   val samples held out : {data_manifest['val_samples']}")
     if data_manifest["q_goal_lula_error"].get("count", 0):
         err = data_manifest["q_goal_lula_error"]
         print("[TRAIN]   Lula-settled mismatch: "
@@ -143,22 +184,38 @@ def main():
     max_v = train_cfg["max_joint_vel"]
     n_clipped = int((np.abs(velocities) > max_v).sum())
     if n_clipped > 0:
-        print(f"[TRAIN] clipping {n_clipped} velocity components above {max_v} rad/s")
+        print(f"[TRAIN] clipping {n_clipped} train velocity components above {max_v} rad/s")
     velocities = np.clip(velocities, -max_v, max_v)
+    if len(val_velocities):
+        val_velocities = np.clip(val_velocities, -max_v, max_v)
 
-    # ── Normalisation per joint ───────────────────────────────────────────────
+    # ── Normalisation ─────────────────────────────────────────────────────────
     # Zero-mean: goal (e=0) maps to x_n=0 so the -x skip connection points at it.
-    # Floor on std: prevents OOD amplification for joints whose error barely
-    # varies in training (e.g. wrist joints the expert holds in a fixed
-    # null-space).
-    # Without this, a deployment q_goal differing by 0.05 rad in such a joint
-    # produces x_n=10+ and saturates Tanh, destroying the velocity output.
+    #
+    # state_std is UNIFORM across all 7 joints (a single scalar broadcast). With
+    # per-joint state_std, the Lyapunov V is defined on e_n = e/state_std, so
+    # V-decreasing trajectories can drift in joint space (||e|| grows while
+    # ||e_n|| shrinks) when joints with smaller std contribute more to V than
+    # joints with larger std. A uniform scalar makes ||e_n||² ∝ ||e||², so
+    # V-decrease implies joint-space convergence — that's what makes the
+    # learned DS attract to q_goal in the unnormalized joint space we actually
+    # deploy in. Without this, the DS needs an external linear stabilizer at
+    # deployment (DS_GOAL_GAIN); with it, the DS converges on its own.
+    #
+    # vel_scale stays per-joint with floor 0.05 rad/s — vel_scale only affects
+    # output resolution, not the geometric correspondence between V and ||e||.
     state_mean = np.zeros(N_JOINTS)
-    state_std  = np.maximum(states.std(0), 0.1) + 1e-6
-    vel_scale  = np.maximum(np.abs(velocities).max(axis=0), 1e-3)  # shape (7,)
+    state_std  = np.full(N_JOINTS, max(states.std(0).max(), 0.5))
+    vel_scale  = np.maximum(np.abs(velocities).max(axis=0), 0.05)
 
     states_n     = (states - state_mean) / state_std
     velocities_n = velocities / vel_scale
+    if len(val_states):
+        val_states_n     = (val_states - state_mean) / state_std
+        val_velocities_n = val_velocities / vel_scale
+    else:
+        val_states_n     = np.empty_like(states_n[:0])
+        val_velocities_n = np.empty_like(velocities_n[:0])
 
     # Diagnostics — everything you'd want to know about the dataset before training
     print(f"[TRAIN] ── data stats for primitive '{args.primitive}' ──")
@@ -180,6 +237,14 @@ def main():
     V = torch.tensor(velocities_n, dtype=torch.float32)
     loader = DataLoader(TensorDataset(X, V),
                         batch_size=train_cfg["batch_size"], shuffle=True)
+
+    has_val = len(val_states_n) > 0
+    if has_val:
+        X_val = torch.tensor(val_states_n, dtype=torch.float32, device=device)
+        V_val = torch.tensor(val_velocities_n, dtype=torch.float32, device=device)
+    else:
+        print("[TRAIN] no validation set (fewer than 5 demos per file); "
+              "selecting checkpoint by training loss")
 
     model = StableNeuralDS(
         n_joints    = N_JOINTS,
@@ -204,9 +269,10 @@ def main():
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     ckpt_path = ckpt_dir / f"{args.arm}_{args.primitive}.pt"
 
-    history = {"total": [], "imit": [], "stab": []}
+    history = {"total": [], "imit": [], "stab": [], "val_imit": []}
 
     for epoch in range(epochs):
+        model.train()
         running = {"total": 0.0, "imit": 0.0, "stab": 0.0, "n": 0}
         for x_batch, v_batch in loader:
             x_batch = x_batch.to(device)
@@ -230,11 +296,23 @@ def main():
             running["n"]     += n
 
         avg = {k: running[k] / running["n"] for k in ("total", "imit", "stab")}
+
+        if has_val:
+            model.eval()
+            with torch.no_grad():
+                val_pred = model(X_val)
+                val_imit = (val_pred - V_val).pow(2).mean().item()
+            selection_metric = val_imit
+        else:
+            val_imit = float("nan")
+            selection_metric = avg["total"]
+
         for k in ("total", "imit", "stab"):
             history[k].append(avg[k])
+        history["val_imit"].append(val_imit)
 
-        if avg["total"] < best:
-            best = avg["total"]
+        if selection_metric < best:
+            best = selection_metric
             torch.save({
                 "state_dict":  model.state_dict(),
                 "state_mean":  state_mean,
@@ -246,16 +324,21 @@ def main():
                 "n_joints":    N_JOINTS,
                 "history":     history,
                 "data_manifest": data_manifest,
+                "best_epoch":  epoch,
+                "best_metric": "val_imit" if has_val else "train_total",
+                "best_value":  best,
             }, ckpt_path)
 
         scheduler.step()
 
         if epoch % 10 == 0 or epoch == epochs - 1:
+            val_str = f"  val_imit {val_imit:.5f}" if has_val else ""
             print(f"  epoch {epoch:4d} | total {avg['total']:.5f}  "
-                  f"imit {avg['imit']:.5f}  stab {avg['stab']:.5f}  "
+                  f"imit {avg['imit']:.5f}  stab {avg['stab']:.5f}{val_str}  "
                   f"lr {scheduler.get_last_lr()[0]:.2e}")
 
-    print(f"[TRAIN] Best loss {best:.5f}, checkpoint -> {ckpt_path}")
+    metric_label = "val_imit" if has_val else "train_total"
+    print(f"[TRAIN] Best {metric_label} {best:.5f}, checkpoint -> {ckpt_path}")
 
     # ── Post-training diagnostics ────────────────────────────────────────────
     # Reload the BEST checkpoint and evaluate on the full training set.
@@ -272,13 +355,13 @@ def main():
 
     # Stability check: how often does dV/dt + αV exceed 0 on training data?
     x_grad = X_all.clone().requires_grad_(True)
-    V_val  = model.V(x_grad)
-    grad   = torch.autograd.grad(V_val.sum(), x_grad)[0]
+    V_val_eval  = model.V(x_grad)
+    grad   = torch.autograd.grad(V_val_eval.sum(), x_grad)[0]
     gV_eff = grad * scale_factor
     with torch.no_grad():
         v_out = model.f(X_all)
         dV_dt = (gV_eff * v_out).sum(-1)
-        violates = (dV_dt + train_cfg["alpha"] * V_val) > 0
+        violates = (dV_dt + train_cfg["alpha"] * V_val_eval) > 0
         stab_violation_rate = violates.float().mean().item()
 
     print(f"[TRAIN] ── post-training quality on training set ──")
@@ -294,6 +377,12 @@ def main():
           f"(should be ~0)")
     print(f"[TRAIN]   stability violation %  : "
           f"{100 * stab_violation_rate:.2f}%  (lower = better)")
+
+    if has_val:
+        with torch.no_grad():
+            val_pred = model(X_val)
+            val_imit_final = (val_pred - V_val).pow(2).mean().item()
+        print(f"[TRAIN]   final val imitation MSE: {val_imit_final:.5f}")
 
 
 if __name__ == "__main__":

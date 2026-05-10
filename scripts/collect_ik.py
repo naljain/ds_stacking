@@ -109,7 +109,7 @@ def main():
     from src.env import DualArmEnv
     from src.franka_ik import FrankaIK
     from src.primitives import (primitive_target, PRIMITIVE_ORDER,
-                                grasp_quat_from_block)
+                                DS_PRIMITIVES, grasp_quat_from_block)
     try:
         from isaacsim.core.utils.types import ArticulationAction
     except ImportError:
@@ -297,19 +297,27 @@ def main():
                 # the retract or gripper-action motion that came before it.
                 prev_q = franka.get_joint_positions()[:7].copy()
 
+                # Single-attractor proportional-decay expert:
+                # q_dot = -k * (q - q_goal), clipped to max_joint_vel. The
+                # state recorded for training is e = q - q_goal, and the
+                # velocity recorded points DIRECTLY at this same q_goal — so
+                # the (e, q_dot) data is single-valued in error space and the
+                # DS sees a clean radial flow to fit. (We removed an earlier
+                # via-point design because it labelled samples with q_goal_final
+                # while the velocity pointed at q_goal_via, which made the
+                # same e map to different q_dots across blocks and gave the DS
+                # multi-valued training labels.)
+                max_joint_vel = args.collection_max_joint_vel
+                k = float(args.joint_goal_gain)
                 q_seed = franka.get_joint_positions()[:7].copy()
                 q_goal_lula, ok = ik_kin.solve(
                     target_cart, target_quat=target_quat, q_seed=q_seed)
                 if not ok:
                     print(f"    [WARN] Lula IK failed for {primitive}; "
-                          "using current q as q_goal.")
-                    q_goal_lula = q_seed
+                          "discarding this demo attempt")
+                    demo_failed = True
+                    break
 
-                # Proportional-decay Lula expert: q_dot = -k * (q - q_goal),
-                # clipped to max_joint_vel. Velocity scales with the error and
-                # goes to zero at the attractor, which matches f(0)=0.
-                max_joint_vel = args.collection_max_joint_vel
-                k = float(args.joint_goal_gain)
                 q_start = franka.get_joint_positions().copy()
                 e0 = np.linalg.norm(q_start[:7] - q_goal_lula)
                 if e0 > args.joint_done_tol and k > 1e-3:
@@ -341,27 +349,26 @@ def main():
                         )
                     env.world.step(render=not args.headless)
                     carry_held_block()
-                    if args.direct_joint_set:
-                        record(q_override=q_demo, q_dot_override=q_dot_des)
-                        prev_q = q_demo.copy()
-                    else:
-                        record()
+                    if primitive in DS_PRIMITIVES:
+                        if args.direct_joint_set:
+                            # Record (q_t, q_dot_t) — both relative to the
+                            # SAME q_goal so labels are single-valued.
+                            record(q_override=q_now, q_dot_override=q_dot_des)
+                            prev_q = q_now.copy()
+                        else:
+                            record()
+
                 q_settled = (q_demo.copy() if args.direct_joint_set
                              else franka.get_joint_positions()[:7].copy())
 
-                q_goal = q_goal_lula
                 q_goal_lula_error = float(np.linalg.norm(q_settled - q_goal_lula))
                 if q_goal_lula_error > args.max_q_goal_error:
                     print(f"    [WARN] {primitive} settled {q_goal_lula_error:.3f} "
                           f"rad from Lula q_goal; discarding this demo attempt")
                     demo_failed = True
                     break
-                if q_goal_lula_error > 0.25:
-                    print(f"    [WARN] {primitive} Lula q_goal differs from "
-                          f"expert settled q by {q_goal_lula_error:.3f} rad; "
-                          "label_source=lula")
                 for step in prim_buf:
-                    step["q_goal"] = q_goal
+                    step["q_goal"] = q_goal_lula
                     step["q_goal_source"] = "lula"
                     step["motion_source"] = "lula"
                     step["q_goal_settled"] = q_settled

@@ -28,6 +28,31 @@ os.environ["OMNI_KIT_ACCEPT_EULA"] = "YES"
 os.environ["CARB_LOG_LEVEL"] = "error"
 
 
+# Cartesian EE tolerance for IK-primitive completion (grasp, lift, transport,
+# place). Set to the block size: place physically can't descend below this
+# because the carried block rests on top of the existing stack, and the other
+# IK primitives don't need tighter precision than this either.
+IK_CART_DONE_TOL = 0.05
+
+# Joint-space fallback tolerance for IK primitives. The proportional law plus
+# Isaac's position controller has a small steady-state Cartesian gap (Lula
+# q_goal vs realized FK), so completion accepts EITHER cart_err < 0.05 OR
+# joint_err < this — whichever happens first.
+IK_JOINT_DONE_TOL = 0.12
+
+# Cartesian EE tolerance that can complete a DS reach primitive even when the
+# redundant joint configuration does not match q_goal exactly.
+DS_REACH_CART_DONE_TOL = 0.03
+
+# Linear joint-space attraction added to the DS output for every DS primitive:
+#     q_dot = ds_scale * f_DS(e) - DS_GOAL_GAIN * (q - q_goal)
+# 0.0 = pure neural DS. With uniform state_std normalization at training time,
+# the trained DS converges in joint space on its own, so the external linear
+# stabilizer is no longer needed. Set to >0 only as a fallback if the trained
+# field is divergent in some region (was 1.0 before the uniform-std retrain).
+DS_GOAL_GAIN = 0.0
+
+
 def load_ds(ckpt_path, device):
     from src.neural_ds import StableNeuralDS, N_JOINTS
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
@@ -53,35 +78,21 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--arm", type=str, default="left", choices=["left", "right"])
     parser.add_argument("--config", type=str, default="configs/default.yaml")
-    parser.add_argument("--ckpt_arm", type=str, default="both")
+    parser.add_argument("--ckpt_arm", type=str, default=None,
+                        choices=["left", "right"],
+                        help="Checkpoint prefix for the loaded DS. Defaults to "
+                             "--arm; override only for ablations like running "
+                             "the right-trained DS on the left arm.")
     parser.add_argument("--max_steps", type=int, default=20000)
     parser.add_argument("--use_safe", action="store_true",
                         help="Apply Lyapunov projection at inference")
     parser.add_argument("--alpha", type=float, default=None,
                         help="Override Lyapunov decay rate at deployment "
                              "(higher = more aggressive projection / faster convergence).")
-    parser.add_argument("--goal_gain", type=float, default=0.0,
-                        help="Add q_goal attraction term -gain*(q-q_goal) to "
-                             "the learned DS at deployment. Use this as a "
-                             "stabilizing ablation if the learned field points "
-                             "away from the attractor.")
     parser.add_argument("--ds_scale", type=float, default=1.0,
-                        help="Scale learned DS velocity. Use 0 with "
-                             "--goal_gain for a pure joint-space attractor "
-                             "sanity check.")
-    parser.add_argument("--transport_ds_scale", type=float, default=None,
-                        help="Optional DS velocity scale used only for the "
-                             "transport primitive. Defaults to --ds_scale.")
-    parser.add_argument("--transport_goal_gain", type=float, default=0.0,
-                        help="Additional joint-space attraction gain used only "
-                             "for the transport primitive. This keeps transport "
-                             "DS in the loop while stabilizing a divergent "
-                             "transport field.")
-    parser.add_argument("--transport_min_radial_speed", type=float, default=0.0,
-                        help="For transport only, enforce a minimum inward "
-                             "joint-space radial speed toward q_goal in rad/s. "
-                             "This is a diagnostic flow guard for divergent "
-                             "transport checkpoints; 0 leaves the DS unchanged.")
+                        help="Scale learned DS velocity. Set to 0 for a pure "
+                             "joint-space attractor sanity check (then only "
+                             "DS_GOAL_GAIN drives motion).")
     parser.add_argument("--max_joint_vel", type=float, default=None,
                         help="Deployment joint velocity clamp in rad/s. "
                              "Defaults to training.max_joint_vel from config.")
@@ -92,26 +103,6 @@ def main():
     parser.add_argument("--joint_done_tol", type=float, default=None,
                         help="L2 joint-space tolerance for DS primitive completion. "
                              "Defaults to --done_tol.")
-    parser.add_argument("--cart_done_tol", type=float, default=0.02,
-                        help="Cartesian EE tolerance in meters for IK primitive "
-                             "completion.")
-    parser.add_argument("--ds_reach_cart_done_tol", type=float, default=0.03,
-                        help="Cartesian EE tolerance in meters that can complete "
-                             "a DS reach primitive even when the redundant joint "
-                             "configuration does not match q_goal exactly.")
-    parser.add_argument("--grasp_cart_done_tol", type=float, default=None,
-                        help="Optional Cartesian tolerance in meters for IK grasp "
-                             "completion. Defaults to --cart_done_tol.")
-    parser.add_argument("--lift_cart_done_tol", type=float, default=0.03,
-                        help="Optional Cartesian tolerance in meters for IK lift "
-                             "completion. Defaults to 0.03 because lift only "
-                             "needs clearance, not placement precision.")
-    parser.add_argument("--transport_cart_done_tol", type=float, default=None,
-                        help="Optional Cartesian tolerance in meters for IK transport "
-                             "completion. Defaults to --cart_done_tol.")
-    parser.add_argument("--place_cart_done_tol", type=float, default=None,
-                        help="Optional Cartesian tolerance in meters for IK place "
-                             "completion. Defaults to --cart_done_tol.")
     parser.add_argument("--log_csv", type=str, default=None,
                         help="If set, write per-step diagnostics to this CSV "
                              "for post-mortem plotting.")
@@ -148,17 +139,6 @@ def main():
     args = parser.parse_args()
     joint_done_tol = args.done_tol if args.joint_done_tol is None else args.joint_done_tol
 
-    def cart_done_tol_for(primitive):
-        if primitive == "grasp" and args.grasp_cart_done_tol is not None:
-            return args.grasp_cart_done_tol
-        if primitive == "lift" and args.lift_cart_done_tol is not None:
-            return args.lift_cart_done_tol
-        if primitive == "transport" and args.transport_cart_done_tol is not None:
-            return args.transport_cart_done_tol
-        if primitive == "place" and args.place_cart_done_tol is not None:
-            return args.place_cart_done_tol
-        return args.cart_done_tol
-
     from isaacsim import SimulationApp
     _app_cfg = {"headless": args.headless}
     if not args.headless:
@@ -194,8 +174,11 @@ def main():
 
     ckpt_dir = Path(cfg["paths"]["checkpoints"])
     ds_primitives = [p for p in DS_PRIMITIVES if p not in ik_primitives]
-    ds_set = {p: load_ds(ckpt_dir / f"{args.ckpt_arm}_{p}.pt", device)
+    ckpt_arm = args.ckpt_arm if args.ckpt_arm is not None else args.arm
+    ds_set = {p: load_ds(ckpt_dir / f"{ckpt_arm}_{p}.pt", device)
               for p in ds_primitives}
+    print(f"[DEPLOY] Loaded DS checkpoints: {ckpt_arm}_*.pt for "
+          f"primitives {ds_primitives}")
 
     # Override training alpha to drive faster Lyapunov decay at deployment
     if args.alpha is not None:
@@ -210,10 +193,23 @@ def main():
 
     # Compute initial q_goal for the first primitive
     def update_q_goal(arm):
+        task = seq.tasks[arm]
         cart = seq.cartesian_target(arm)
         if cart is None:
             return None
-        q_seed = franka.get_joint_positions()[:7].copy()
+        # Seed Lula IK from the previous primitive's q_goal when available.
+        # The collection-time expert (direct_joint_set) settled to within
+        # joint_done_tol of every q_goal, so seeding the *next* primitive's
+        # IK from the previous q_goal matches what Lula saw during data
+        # collection. Seeding from the lagging live articulation pose
+        # instead lets a 0.1–0.2 rad tracking lag flip Lula to a different
+        # IK branch — the resulting q_goal can be 2+ rad away in joint
+        # space, which then drives the DS into OOD territory.
+        prev_q_goal = getattr(task, "q_goal", None)
+        if prev_q_goal is not None:
+            q_seed = np.asarray(prev_q_goal, dtype=float).copy()
+        else:
+            q_seed = franka.get_joint_positions()[:7].copy()
         ee_quat = seq.ee_orientation(arm)
         q_goal, ok = ik_kin.solve(cart, target_quat=ee_quat, q_seed=q_seed)
         if args.debug_ik:
@@ -233,7 +229,7 @@ def main():
     update_q_goal(args.arm)
 
     print(f"[DEPLOY] Joint-space DS on {args.arm} arm — safe={args.use_safe}, "
-          f"goal_gain={args.goal_gain}, ds_scale={args.ds_scale}, "
+          f"ds_scale={args.ds_scale}, ds_goal_gain={DS_GOAL_GAIN}, "
           f"max_joint_vel={max_joint_vel}")
 
     last_primitive = seq.tasks[args.arm].current_primitive
@@ -352,7 +348,7 @@ def main():
             V_val = 0.0
             x = q - q_goal
             e_norm = np.linalg.norm(x)
-            ee_err = np.linalg.norm(env.get_ee_pose(args.arm)[0] - cart_target)
+            ee_err = np.linalg.norm(ik_frame_position() - cart_target)
             q_dot_raw = -args.ik_goal_gain * x
             q_dot_clipped = np.clip(q_dot_raw, -max_joint_vel, max_joint_vel)
             qd_norm = np.linalg.norm(q_dot_clipped)
@@ -380,24 +376,9 @@ def main():
                 qd_n = qd_n_raw
 
             q_dot_raw = qd_n_raw.cpu().numpy().squeeze(0) * ds["vel_scale"]
-            ds_scale = args.ds_scale
-            goal_gain = args.goal_gain
-            if task.current_primitive == "transport":
-                ds_scale = (args.transport_ds_scale
-                            if args.transport_ds_scale is not None else ds_scale)
-                goal_gain += args.transport_goal_gain
-            q_dot = ds_scale * qd_n.cpu().numpy().squeeze(0) * ds["vel_scale"]
-            if goal_gain > 0:
-                q_dot = q_dot - goal_gain * x
-            if (task.current_primitive == "transport"
-                    and args.transport_min_radial_speed > 0
-                    and np.linalg.norm(x) > 1e-9):
-                inward = -x / np.linalg.norm(x)
-                radial_speed = float(np.dot(q_dot, inward))
-                if radial_speed < args.transport_min_radial_speed:
-                    q_dot = q_dot + (
-                        args.transport_min_radial_speed - radial_speed
-                    ) * inward
+            q_dot = args.ds_scale * qd_n.cpu().numpy().squeeze(0) * ds["vel_scale"]
+            if DS_GOAL_GAIN > 0:
+                q_dot = q_dot - DS_GOAL_GAIN * x
             q_dot_clipped = np.clip(q_dot, -max_joint_vel, max_joint_vel)
 
             # V value, useful for tracking convergence
@@ -412,7 +393,13 @@ def main():
                 -np.dot(x, q_dot_clipped) / (e_norm * qd_norm + 1e-9)
                 if e_norm * qd_norm > 1e-9 else 0.0
             )
-            ee_err = np.linalg.norm(env.get_ee_pose(args.arm)[0] - cart_target)
+            # Use Lula's IK frame (right_gripper) for the diagnostic, NOT
+            # Isaac's high-level end_effector (panda_hand). They differ by ~10
+            # cm of gripper-hand offset, and cart_target is defined for the
+            # Lula frame because that's what IK targets. Mixing them produces
+            # a small ee_err in the print while the convergence check (which
+            # correctly uses ik_frame_position) sees a much larger cart_err.
+            ee_err = np.linalg.norm(ik_frame_position() - cart_target)
 
             proj_correction = float(np.linalg.norm(q_dot - q_dot_raw))
 
@@ -463,12 +450,13 @@ def main():
             cart_err = np.linalg.norm(ee_pos - cart_target)
             joint_err = np.linalg.norm(franka.get_joint_positions()[:7] - q_goal)
             done_err = cart_err
-            converged = done_err < cart_done_tol_for(task.current_primitive)
+            converged = (cart_err < IK_CART_DONE_TOL
+                         or joint_err < IK_JOINT_DONE_TOL)
             done_label = "||ee-target||"
         else:
             joint_err = np.linalg.norm(q - q_goal)
             cart_err = np.linalg.norm(ik_frame_position() - cart_target)
-            if task.current_primitive == "reach" and cart_err < args.ds_reach_cart_done_tol:
+            if task.current_primitive == "reach" and cart_err < DS_REACH_CART_DONE_TOL:
                 converged = True
                 done_err = cart_err
                 done_label = "||ee-target||"

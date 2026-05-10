@@ -14,10 +14,11 @@ The 2D slice fixes 5 of the 7 error joints to zero and varies two of them
 (default: joints 0 and 1 — the shoulder pair, usually the biggest movers).
 
 Usage:
-  python scripts/plot_ds.py data/checkpoints/both_reach.pt
-  python scripts/plot_ds.py --all --ckpt_arm both
-  python scripts/plot_ds.py data/checkpoints/both_reach.pt --joints 0 3
-  python scripts/plot_ds.py data/checkpoints/both_transport.pt --no-rollouts
+  python scripts/plot_ds.py data/checkpoints/left_reach.pt
+  python scripts/plot_ds.py --all                       # every *.pt in ckpt_dir
+  python scripts/plot_ds.py --all --ckpt_arm left       # left_reach, left_transport
+  python scripts/plot_ds.py data/checkpoints/left_reach.pt --joints 0 3
+  python scripts/plot_ds.py data/checkpoints/right_transport.pt --no-rollouts
 """
 
 import argparse
@@ -339,8 +340,11 @@ def main():
     parser.add_argument("--all", action="store_true",
                         help="Plot every checkpoint for --ckpt_arm in --ckpt_dir.")
     parser.add_argument("--ckpt_dir", type=str, default="data/checkpoints")
-    parser.add_argument("--ckpt_arm", type=str, default="both",
-                        help="Checkpoint prefix to plot with --all: both, left, right, or all.")
+    parser.add_argument("--ckpt_arm", type=str, default="all",
+                        choices=["left", "right", "both", "all"],
+                        help="Checkpoint prefix to plot with --all. 'all' "
+                             "globs every *.pt in --ckpt_dir; left/right "
+                             "selects per-arm checkpoints.")
     parser.add_argument("--joints", type=int, nargs=2, default=[0, 1],
                         help="Two joint indices to slice for 2D plots")
     parser.add_argument("--out_dir", type=str, default="data/results/ds_plots",

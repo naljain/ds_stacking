@@ -26,63 +26,102 @@ os.environ["OMNI_KIT_ACCEPT_EULA"] = "YES"
 os.environ["CARB_LOG_LEVEL"] = "error"
 
 
-def load_ds_set(ckpt_dir, ckpt_arm, device, primitives=None):
+# Cartesian EE tolerance for IK-primitive completion (grasp, lift, transport,
+# place). Set to the block size: place physically can't descend below this
+# because the carried block rests on top of the existing stack, and the other
+# IK primitives don't need tighter precision than this either.
+IK_CART_DONE_TOL = 0.05
+
+# Joint-space fallback tolerance for IK primitives. The proportional law plus
+# Isaac's position controller has a small steady-state Cartesian gap (Lula
+# q_goal vs realized FK), so completion accepts EITHER cart_err < 0.05 OR
+# joint_err < this — whichever happens first.
+IK_JOINT_DONE_TOL = 0.12
+
+# Cartesian EE tolerance that can complete a DS reach primitive even when the
+# redundant joint configuration does not match q_goal exactly.
+DS_REACH_CART_DONE_TOL = 0.03
+
+# Linear joint-space attraction added to the DS output for every DS primitive:
+#     q_dot = ds_scale * f_DS(e) - DS_GOAL_GAIN * (q - q_goal)
+# 0.0 = pure neural DS. With uniform state_std normalization at training time,
+# the trained DS converges in joint space on its own, so the external linear
+# stabilizer is no longer needed. Set to >0 only as a fallback if the trained
+# field is divergent in some region (was 1.0 before the uniform-std retrain).
+DS_GOAL_GAIN = 0.0
+
+
+def _load_one_ds(ckpt_path, device):
     from src.neural_ds import StableNeuralDS, N_JOINTS
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    cfg = ckpt["config"]
+    model = StableNeuralDS(
+        n_joints    = N_JOINTS,
+        hidden_dim  = cfg["hidden_dim"],
+        lyap_hidden = cfg["lyapunov_hidden"],
+        alpha       = cfg["alpha"],
+        stable_skip_gain = cfg.get("stable_skip_gain", 0.0),
+    ).to(device)
+    model.load_state_dict(ckpt["state_dict"])
+    model.eval()
+    return {
+        "model":      model,
+        "state_mean": ckpt["state_mean"],
+        "state_std":  ckpt["state_std"],
+        "vel_scale":  ckpt["vel_scale"],
+    }
+
+
+def load_ds_sets(ckpt_dir, ckpt_arm_mode, device, primitives=None):
+    """Load DS checkpoints for both arms.
+
+    ckpt_arm_mode:
+      'per_arm' -> load left_{primitive}.pt for the left arm and
+                   right_{primitive}.pt for the right arm. This is the
+                   default after we moved to per-arm training, since pooling
+                   left+right with a via-point expert washes out the
+                   curvature.
+      'left'    -> use left_{primitive}.pt for BOTH arms (ablation).
+      'right'   -> use right_{primitive}.pt for BOTH arms (ablation).
+
+    Returns dict keyed by arm: {"left": {primitive: ds_dict}, "right": ...}.
+    """
     if primitives is None:
         from src.primitives import DS_PRIMITIVES
         primitives = DS_PRIMITIVES
-    out = {}
-    for p in primitives:
-        ckpt = torch.load(ckpt_dir / f"{ckpt_arm}_{p}.pt", map_location=device, weights_only=False)
-        cfg = ckpt["config"]
-        model = StableNeuralDS(
-            n_joints    = N_JOINTS,
-            hidden_dim  = cfg["hidden_dim"],
-            lyap_hidden = cfg["lyapunov_hidden"],
-            alpha       = cfg["alpha"],
-            stable_skip_gain = cfg.get("stable_skip_gain", 0.0),
-        ).to(device)
-        model.load_state_dict(ckpt["state_dict"])
-        model.eval()
-        out[p] = {
-            "model":      model,
-            "state_mean": ckpt["state_mean"],
-            "state_std":  ckpt["state_std"],
-            "vel_scale":  ckpt["vel_scale"],
-        }
-    return out
+
+    if ckpt_arm_mode == "per_arm":
+        prefixes = {"left": "left", "right": "right"}
+    elif ckpt_arm_mode in ("left", "right"):
+        prefixes = {"left": ckpt_arm_mode, "right": ckpt_arm_mode}
+    else:
+        raise ValueError(f"unknown ckpt_arm_mode: {ckpt_arm_mode!r}")
+
+    return {
+        arm: {p: _load_one_ds(ckpt_dir / f"{prefixes[arm]}_{p}.pt", device)
+              for p in primitives}
+        for arm in ("left", "right")
+    }
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default="configs/default.yaml")
-    parser.add_argument("--ckpt_arm", type=str, default="both")
+    parser.add_argument("--ckpt_arm", type=str, default="per_arm",
+                        choices=["per_arm", "left", "right"],
+                        help="Checkpoint loading mode. 'per_arm' (default) "
+                             "loads left_*.pt for the left arm and right_*.pt "
+                             "for the right arm. 'left' or 'right' loads one "
+                             "arm's checkpoints for both arms (ablation).")
     parser.add_argument("--max_steps", type=int, default=30000)
     parser.add_argument("--use_safe", action="store_true")
     parser.add_argument("--alpha", type=float, default=None,
                         help="Override Lyapunov decay rate at deployment "
                              "(higher = more aggressive projection).")
-    parser.add_argument("--goal_gain", type=float, default=0.0,
-                        help="Add q_goal attraction term -gain*(q-q_goal) to "
-                             "the learned DS before modulation. Use as a "
-                             "stabilizing ablation when raw DS convergence is poor.")
     parser.add_argument("--ds_scale", type=float, default=1.0,
-                        help="Scale learned DS velocity. Use 0 with "
-                             "--goal_gain for a pure joint-space attractor "
-                             "sanity check.")
-    parser.add_argument("--transport_ds_scale", type=float, default=None,
-                        help="Optional DS velocity scale used only for the "
-                             "transport primitive. Defaults to --ds_scale.")
-    parser.add_argument("--transport_goal_gain", type=float, default=0.0,
-                        help="Additional joint-space attraction gain used only "
-                             "for the transport primitive. This keeps transport "
-                             "DS in the loop while stabilizing a divergent "
-                             "transport field.")
-    parser.add_argument("--transport_min_radial_speed", type=float, default=0.0,
-                        help="For transport only, enforce a minimum inward "
-                             "joint-space radial speed toward q_goal in rad/s. "
-                             "This is a diagnostic flow guard for divergent "
-                             "transport checkpoints; 0 leaves the DS unchanged.")
+                        help="Scale learned DS velocity. Set to 0 for a pure "
+                             "joint-space attractor sanity check (then only "
+                             "DS_GOAL_GAIN drives motion).")
     parser.add_argument("--max_joint_vel", type=float, default=None,
                         help="Deployment joint velocity clamp in rad/s. "
                              "Defaults to training.max_joint_vel from config.")
@@ -149,44 +188,8 @@ def main():
     parser.add_argument("--joint_done_tol", type=float, default=None,
                         help="L2 joint-space tolerance for DS primitive completion. "
                              "Defaults to --done_tol.")
-    parser.add_argument("--cart_done_tol", type=float, default=0.05,
-                        help="Cartesian EE tolerance in meters for IK primitive "
-                             "completion.")
-    parser.add_argument("--ds_reach_cart_done_tol", type=float, default=0.03,
-                        help="Cartesian EE tolerance in meters that can complete "
-                             "a DS reach primitive even when the redundant joint "
-                             "configuration does not match q_goal exactly.")
-    parser.add_argument("--grasp_cart_done_tol", type=float, default=None,
-                        help="Optional Cartesian tolerance in meters for IK grasp "
-                             "completion. Defaults to --cart_done_tol.")
-    parser.add_argument("--lift_cart_done_tol", type=float, default=0.05,
-                        help="Optional Cartesian tolerance in meters for IK lift "
-                             "completion. Defaults to 0.05 because lift only "
-                             "needs clearance, not placement precision.")
-    parser.add_argument("--transport_cart_done_tol", type=float, default=None,
-                        help="Optional Cartesian tolerance in meters for IK transport "
-                             "completion. Defaults to --cart_done_tol.")
-    parser.add_argument("--place_cart_done_tol", type=float, default=None,
-                        help="Optional Cartesian tolerance in meters for IK place "
-                             "completion. Defaults to --cart_done_tol.")
-    parser.add_argument("--ik_joint_done_tol", type=float, default=0.12,
-                        help="Fallback joint-space completion tolerance for "
-                             "scripted IK primitives. This prevents a good "
-                             "Lula q_goal from timing out due to small FK/frame "
-                             "or contact offsets.")
     args = parser.parse_args()
     joint_done_tol = args.done_tol if args.joint_done_tol is None else args.joint_done_tol
-
-    def cart_done_tol_for(primitive):
-        if primitive == "grasp" and args.grasp_cart_done_tol is not None:
-            return args.grasp_cart_done_tol
-        if primitive == "lift" and args.lift_cart_done_tol is not None:
-            return args.lift_cart_done_tol
-        if primitive == "transport" and args.transport_cart_done_tol is not None:
-            return args.transport_cart_done_tol
-        if primitive == "place" and args.place_cart_done_tol is not None:
-            return args.place_cart_done_tol
-        return args.cart_done_tol
 
     from isaacsim import SimulationApp
     _app_cfg = {"headless": args.headless}
@@ -224,12 +227,16 @@ def main():
 
     ckpt_dir = Path(cfg["paths"]["checkpoints"])
     ds_primitives = [p for p in DS_PRIMITIVES if p not in ik_primitives]
-    ds_set = load_ds_set(ckpt_dir, args.ckpt_arm, device, primitives=ds_primitives)
+    ds_sets = load_ds_sets(ckpt_dir, args.ckpt_arm, device, primitives=ds_primitives)
+    print(f"[DEPLOY] DS checkpoint mode: {args.ckpt_arm} "
+          f"(left arm <- {'left' if args.ckpt_arm in ('per_arm', 'left') else 'right'}_*.pt, "
+          f"right arm <- {'right' if args.ckpt_arm in ('per_arm', 'right') else 'left'}_*.pt)")
 
     # Override training alpha to drive faster Lyapunov decay at deployment
     if args.alpha is not None:
-        for p in ds_set.values():
-            p["model"].alpha = args.alpha
+        for arm_set in ds_sets.values():
+            for p in arm_set.values():
+                p["model"].alpha = args.alpha
         print(f"[DEPLOY] Overriding alpha -> {args.alpha}")
 
     seq = TaskSequencer(env, cfg)
@@ -263,13 +270,23 @@ def main():
     ik_failed = {"failed": False}
 
     def update_q_goal(arm):
+        task = seq.tasks[arm]
         cart = seq.cartesian_target(arm)
         if cart is None:
             return None
-        q_seed = franka[arm].get_joint_positions()[:7].copy()
+        # Seed Lula IK from the previous primitive's q_goal when available
+        # (matches the collection-time IK seed, which was effectively the
+        # previous q_goal because the direct-joint-set expert settled to
+        # within joint_done_tol). Seeding from the lagging live pose lets a
+        # 0.1–0.2 rad tracking lag flip Lula's IK branch and produce a
+        # q_goal 2+ rad away in joint space, which drives the DS OOD.
+        prev_q_goal = getattr(task, "q_goal", None)
+        if prev_q_goal is not None:
+            q_seed = np.asarray(prev_q_goal, dtype=float).copy()
+        else:
+            q_seed = franka[arm].get_joint_positions()[:7].copy()
         ee_quat = seq.ee_orientation(arm)
         q_goal, ok = ik_kin[arm].solve(cart, target_quat=ee_quat, q_seed=q_seed)
-        task = seq.tasks[arm]
         if args.debug_ik or not ok:
             print(f"[IK] {arm}/{task.current_primitive:9s} ok={ok} "
                   f"cart={cart.round(3)} seed={q_seed.round(3)} "
@@ -303,7 +320,7 @@ def main():
 
     print(f"[DEPLOY] Dual-arm joint-space DS — safe={args.use_safe}, "
           f"modulation={'OFF' if args.no_modulation else 'ON'}, "
-          f"goal_gain={args.goal_gain}, ds_scale={args.ds_scale}, "
+          f"ds_scale={args.ds_scale}, ds_goal_gain={DS_GOAL_GAIN}, "
           f"max_joint_vel={max_joint_vel}")
     if ik_primitives:
         print(f"[DEPLOY] IK primitives: {', '.join(sorted(ik_primitives))}")
@@ -456,7 +473,7 @@ def main():
                 )
                 continue
 
-            ds = ds_set[task.current_primitive]
+            ds = ds_sets[arm][task.current_primitive]
             x = q - task.q_goal
             x_n = (x - ds["state_mean"]) / ds["state_std"]
             x_t = torch.tensor(x_n, dtype=torch.float32, device=device).unsqueeze(0)
@@ -469,24 +486,9 @@ def main():
             else:
                 with torch.no_grad():
                     qd_n = ds["model"](x_t)
-            ds_scale = args.ds_scale
-            goal_gain = args.goal_gain
-            if task.current_primitive == "transport":
-                ds_scale = (args.transport_ds_scale
-                            if args.transport_ds_scale is not None else ds_scale)
-                goal_gain += args.transport_goal_gain
-            q_dots[arm] = ds_scale * qd_n.cpu().numpy().squeeze(0) * ds["vel_scale"]
-            if goal_gain > 0:
-                q_dots[arm] = q_dots[arm] - goal_gain * x
-            if (task.current_primitive == "transport"
-                    and args.transport_min_radial_speed > 0
-                    and np.linalg.norm(x) > 1e-9):
-                inward = -x / np.linalg.norm(x)
-                radial_speed = float(np.dot(q_dots[arm], inward))
-                if radial_speed < args.transport_min_radial_speed:
-                    q_dots[arm] = q_dots[arm] + (
-                        args.transport_min_radial_speed - radial_speed
-                    ) * inward
+            q_dots[arm] = args.ds_scale * qd_n.cpu().numpy().squeeze(0) * ds["vel_scale"]
+            if DS_GOAL_GAIN > 0:
+                q_dots[arm] = q_dots[arm] - DS_GOAL_GAIN * x
             q_dots[arm] = np.clip(q_dots[arm], -max_joint_vel, max_joint_vel)
 
         # Apply modulation between the two arms
@@ -555,15 +557,15 @@ def main():
                 done_err = np.linalg.norm(ee_pos_now - target_now)
                 joint_err = np.linalg.norm(q - task.q_goal)
                 converged = (
-                    done_err < cart_done_tol_for(task.current_primitive)
-                    or joint_err < args.ik_joint_done_tol
+                    done_err < IK_CART_DONE_TOL
+                    or joint_err < IK_JOINT_DONE_TOL
                 )
                 done_label = "||ee-target||"
             else:
                 joint_err = np.linalg.norm(q - task.q_goal)
                 cart_err = np.linalg.norm(ik_frame_position(arm) - seq.cartesian_target(arm))
                 if (task.current_primitive == "reach"
-                        and cart_err < args.ds_reach_cart_done_tol):
+                        and cart_err < DS_REACH_CART_DONE_TOL):
                     done_err = cart_err
                     converged = True
                     done_label = "||ee-target||"

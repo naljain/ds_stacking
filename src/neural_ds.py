@@ -50,32 +50,31 @@ class NeuralDS(nn.Module):
 
 
 class LyapunovNet(nn.Module):
-    """V_phi(e) — positive definite around e = 0.
+    """V(e_n) = ||e_n||² — quadratic Lyapunov candidate.
 
-    V(e) = ||g(e) - g(0)||² + epsilon * ||e||²
+    With uniform state_std at training time, e_n = e / c is a uniform scaling
+    of the joint-space error, so V = ||e_n||² is strictly monotone in ||e||.
+    That makes 'V decreases' equivalent to 'joint-space error decreases',
+    which is the property the deployment field needs.
 
-    Both terms are zero at e=0 and positive elsewhere.
-    Input e = q - q_goal so the "at goal" state is the zero vector.
+    The previous formulation V = ||g(e) - g(0)||² + ε||e||² used a learned
+    3-layer network g, which had enough expressive power to decrease V while
+    ||e|| grew (g could ride a ridge in error space). That's how the deployed
+    DS converged in normalized space but diverged in joint space.
+
+    Module is parameterless — kept as nn.Module so the rest of the code can
+    still call model.V(x) without changes. hidden_dim and epsilon kwargs are
+    accepted but ignored, for backward compatibility with old checkpoints'
+    config dicts.
     """
 
-    def __init__(self, n_joints=N_JOINTS, hidden_dim=64, epsilon=0.5):
+    def __init__(self, n_joints=N_JOINTS, hidden_dim=None, epsilon=None):
         super().__init__()
         self.n_joints = n_joints
-        self.epsilon  = epsilon
-        self.g = nn.Sequential(
-            nn.Linear(n_joints, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, hidden_dim),
-        )
 
     def forward(self, x):
-        # x = e = q - q_goal, shape (..., 7)
-        x_at_goal = torch.zeros_like(x)
-        psd = ((self.g(x) - self.g(x_at_goal)) ** 2).sum(dim=-1)
-        reg = self.epsilon * (x ** 2).sum(dim=-1)
-        return psd + reg
+        # x = e_n = (q - q_goal) / state_std, shape (..., 7)
+        return (x ** 2).sum(dim=-1)
 
 
 class StableNeuralDS(nn.Module):
