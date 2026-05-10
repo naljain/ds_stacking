@@ -1,0 +1,39 @@
+deploy:
+  config: configs/default.yaml
+
+  # Set this from the CLI for quick side switching:
+  #   --arm left
+  #   --arm right
+
+  use_safe: true
+  ds_scale: 1.0
+  max_steps: 20000
+  done_tol: 0.05
+  joint_done_tol: 0.05
+
+  # Physical manipulation only: no software attach, no snap-to-stack.
+  kinematic_carry: false
+  advance_on_timeout: false
+
+  # Physical pickup path:
+  # - reach is a deterministic pre-pick hover directly over the cube
+  # - grasp then descends vertically from that pre-pick pose
+  # - transport remains the learned neural DS
+  ik_primitives: reach,grasp,lift,place
+  cartesian_ik_primitives: true
+  ik_goal_gain: 3.0
+  grasp_z_offset: 0.0
+  gripper_steps: 120
+
+  print_every: 50
+  headless: false
+  debug_ik: false
+
+  # Optional offscreen recording. Set video=true for the default path, or set
+  # gif_out explicitly.
+  video: false
+  video_dir: data/results
+  gif_out: ""
+  gif_fps: 20
+  gif_stride: 4
+  gif_size: 640x480

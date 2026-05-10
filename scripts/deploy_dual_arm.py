@@ -16,8 +16,10 @@ Usage:
 import os
 import sys
 import argparse
+import signal
 import numpy as np
 import torch
+import yaml
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -49,6 +51,16 @@ DS_REACH_CART_DONE_TOL = 0.03
 # stabilizer is no longer needed. Set to >0 only as a fallback if the trained
 # field is divergent in some region (was 1.0 before the uniform-std retrain).
 DS_GOAL_GAIN = 0.0
+
+
+def _load_deploy_config(path):
+    if path is None:
+        return {}
+    with open(path, "r") as f:
+        payload = yaml.safe_load(f) or {}
+    if not isinstance(payload, dict):
+        raise ValueError(f"Deploy config must be a mapping: {path}")
+    return payload.get("deploy", payload)
 
 
 def _load_one_ds(ckpt_path, device):
@@ -105,7 +117,13 @@ def load_ds_sets(ckpt_dir, ckpt_arm_mode, device, primitives=None):
 
 
 def main():
-    parser = argparse.ArgumentParser()
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--deploy_config", type=str, default=None,
+                     help="YAML file with deploy argument defaults.")
+    pre_args, _ = pre.parse_known_args()
+    deploy_defaults = _load_deploy_config(pre_args.deploy_config)
+
+    parser = argparse.ArgumentParser(parents=[pre])
     parser.add_argument("--config", type=str, default="configs/default.yaml")
     parser.add_argument("--ckpt_arm", type=str, default="per_arm",
                         choices=["per_arm", "left", "right"],
@@ -178,6 +196,20 @@ def main():
     parser.add_argument("--ik_goal_gain", type=float, default=3.0,
                         help="Joint-space attraction gain for "
                              "Lula-controlled primitives.")
+    parser.add_argument("--grasp_height", type=float, default=None,
+                        help="Override config heights.grasp in meters.")
+    parser.add_argument("--grasp_z_offset", type=float, default=0.0,
+                        help="Additive offset to config heights.grasp in meters. "
+                             "Negative values make the gripper descend lower.")
+    parser.add_argument("--gripper_steps", type=int, default=None,
+                        help="Override sim.gripper_steps for close/open dwell.")
+    parser.add_argument("--grasp_offset", type=float, nargs=2, default=None,
+                        metavar=("DX", "DY"),
+                        help="Extra world-frame XY pick offset in meters for "
+                             "both arms.")
+    parser.add_argument("--debug_grasp", action="store_true",
+                        help="Print finger joint positions and block height "
+                             "after close/lift for physical grasp debugging.")
     parser.add_argument("--debug_ik", action="store_true",
                         help="Print Cartesian targets, IK success, seeds, and "
                              "q_goal at primitive transitions.")
@@ -188,12 +220,40 @@ def main():
     parser.add_argument("--joint_done_tol", type=float, default=None,
                         help="L2 joint-space tolerance for DS primitive completion. "
                              "Defaults to --done_tol.")
+    parser.add_argument("--gif_out", type=str, default=None,
+                        help="Optional offscreen GIF path. Works with --headless "
+                             "when Isaac offscreen rendering is available.")
+    parser.add_argument("--video", action="store_true",
+                        help="IsaacLab-style convenience flag: record a "
+                             "headless-compatible video to --video_dir unless "
+                             "--gif_out is set explicitly.")
+    parser.add_argument("--video_dir", type=str, default="data/results",
+                        help="Output directory used by --video.")
+    parser.add_argument("--gif_fps", type=int, default=20)
+    parser.add_argument("--gif_stride", type=int, default=4,
+                        help="Capture every N sim steps.")
+    parser.add_argument("--gif_size", type=str, default="640x480",
+                        help="Offscreen GIF size, e.g. 640x480.")
+    if deploy_defaults:
+        parser.set_defaults(**deploy_defaults)
     args = parser.parse_args()
+    if args.video and not args.gif_out:
+        args.gif_out = str(Path(args.video_dir) / "dual_neural.gif")
     joint_done_tol = args.done_tol if args.joint_done_tol is None else args.joint_done_tol
 
     from isaacsim import SimulationApp
     _app_cfg = {"headless": args.headless}
-    if not args.headless:
+    if args.gif_out:
+        try:
+            _gif_w, _gif_h = (int(v) for v in args.gif_size.lower().split("x", 1))
+        except Exception:
+            _gif_w, _gif_h = 640, 480
+        _app_cfg.update({
+            "width": _gif_w,
+            "height": _gif_h,
+            "hide_ui": False,
+        })
+    elif not args.headless:
         _app_cfg.update({"width": 1280, "height": 720})
     simulation_app = SimulationApp(_app_cfg)
 
@@ -205,6 +265,7 @@ def main():
     from src.coordinator import TaskSequencer
     from src.franka_ik import FrankaIK
     from src.modulation import InterArmModulation, jacobian_finite_difference
+    from src.offscreen_recorder import OffscreenGifRecorder
     from src.primitives import (
         DS_PRIMITIVES,
         SCRIPTED_PRIMITIVES,
@@ -215,6 +276,46 @@ def main():
 
     env = DualArmEnv(config_path=args.config, arms=("left", "right"))
     cfg = env.cfg
+    if args.grasp_height is not None:
+        cfg["heights"]["grasp"] = float(args.grasp_height)
+    elif args.grasp_z_offset:
+        cfg["heights"]["grasp"] = float(cfg["heights"]["grasp"]) + float(args.grasp_z_offset)
+    if args.grasp_height is not None or args.grasp_z_offset:
+        print(f"[DEPLOY] Grasp target height -> {cfg['heights']['grasp']:.3f} m")
+    if args.gripper_steps is not None:
+        cfg["sim"]["gripper_steps"] = int(args.gripper_steps)
+        print(f"[DEPLOY] Gripper dwell -> {cfg['sim']['gripper_steps']} steps")
+    if args.grasp_offset is not None:
+        offsets = cfg.setdefault("block", {}).setdefault("grasp_xy_offset", {})
+        for arm in ("left", "right"):
+            base = np.asarray(offsets.get(arm, [0.0, 0.0]), dtype=float)
+            offsets[arm] = (base + np.asarray(args.grasp_offset, dtype=float)).tolist()
+        print(f"[DEPLOY] Grasp XY offsets -> {offsets}")
+    try:
+        gif_size = tuple(int(v) for v in args.gif_size.lower().split("x", 1))
+    except Exception:
+        raise ValueError("--gif_size must look like WIDTHxHEIGHT, e.g. 640x480")
+    recorder = OffscreenGifRecorder(
+        camera_prim_path="/World/Camera",
+        out_path=args.gif_out,
+        size=gif_size,
+        fps=args.gif_fps,
+        stride=args.gif_stride,
+    )
+    render_steps = (not args.headless) or recorder.enabled
+
+    def step_env():
+        env.step(render=render_steps)
+        recorder.capture()
+
+    def _handle_signal(signum, _frame):
+        print(f"[DEPLOY] Received signal {signum}; closing recorder.")
+        recorder.close()
+        simulation_app.close()
+        raise SystemExit(128 + signum)
+
+    signal.signal(signal.SIGINT, _handle_signal)
+    signal.signal(signal.SIGTERM, _handle_signal)
     franka = {"left": env.frankas["left"], "right": env.frankas["right"]}
     ik_kin = {arm: FrankaIK(franka[arm]) for arm in franka}
     ik_primitives = {p.strip() for p in args.ik_primitives.split(",") if p.strip()}
@@ -256,6 +357,7 @@ def main():
               for arm in ("left", "right")}
     q_cmd_state = {arm: franka[arm].get_joint_positions().copy()
                    for arm in ("left", "right")}
+    desired_finger_width = {"left": 0.04, "right": 0.04}
     arm_parked = {arm: False for arm in ("left", "right")}
 
     # Open both grippers
@@ -266,7 +368,7 @@ def main():
 
     # Let blocks settle before querying their positions
     for _ in range(60):
-        env.step(render=not args.headless)
+        step_env()
     q_cmd_state = {arm: franka[arm].get_joint_positions().copy()
                    for arm in ("left", "right")}
 
@@ -313,6 +415,7 @@ def main():
     for arm in ("left", "right"):
         update_q_goal(arm)
     if ik_failed["failed"]:
+        recorder.close()
         simulation_app.close()
         return
 
@@ -380,6 +483,39 @@ def main():
             obj.set_linear_velocity(np.zeros(3))
             obj.set_angular_velocity(np.zeros(3))
 
+    def print_grasp_debug(arm, label, block_name):
+        if not args.debug_grasp or block_name is None:
+            return
+        q_full = franka[arm].get_joint_positions()
+        block_pos = env.get_block_positions()[block_name]
+        ee_pos = ik_frame_position(arm)
+        table_top = cfg["table"]["height"]
+        print(f"[GRASP] {arm} {label}: block={block_name} "
+              f"block_xy=({block_pos[0]:+.3f},{block_pos[1]:+.3f}) "
+              f"ee_xy=({ee_pos[0]:+.3f},{ee_pos[1]:+.3f}) "
+              f"xy_err={np.linalg.norm(ee_pos[:2] - block_pos[:2]):.4f} "
+              f"z={block_pos[2]:.4f} dz_table={block_pos[2] - table_top:.4f} "
+              f"fingers={q_full[7:9].round(4)} "
+              f"target_width={desired_finger_width[arm]:.4f}")
+
+    def apply_full_command(arm, q7=None):
+        full_cmd = franka[arm].get_joint_positions().copy()
+        if q7 is not None:
+            full_cmd[:7] = q7[:7]
+        full_cmd[7:9] = desired_finger_width[arm]
+        franka[arm].apply_action(ArticulationAction(joint_positions=full_cmd))
+
+    def hold_gripper(arm, width, steps):
+        desired_finger_width[arm] = float(width)
+        for _ in range(steps):
+            full_cmd = franka[arm].get_joint_positions().copy()
+            full_cmd[7:9] = desired_finger_width[arm]
+            franka[arm].apply_action(ArticulationAction(joint_positions=full_cmd))
+            step_env()
+            carry_held_blocks()
+        q_cmd_state[arm] = franka[arm].get_joint_positions().copy()
+        q_cmd_state[arm][7:9] = desired_finger_width[arm]
+
     def snap_held_block_to_stack(arm):
         if held_block[arm] is None:
             return
@@ -418,10 +554,8 @@ def main():
                 max_joint_vel,
             )
             q_cmd_state[arm][:7] = q_cmd_state[arm][:7] + q_dot * physics_dt
-            full = franka[arm].get_joint_positions().copy()
-            full[:7] = q_cmd_state[arm][:7]
-            franka[arm].apply_action(ArticulationAction(joint_positions=full))
-            env.step(render=not args.headless)
+            apply_full_command(arm, q_cmd_state[arm][:7])
+            step_env()
             carry_held_blocks()
         q_cmd_state[arm] = franka[arm].get_joint_positions().copy()
         return np.linalg.norm(ik_frame_position(arm) - target_cart) < cart_tol
@@ -464,6 +598,7 @@ def main():
             if task.current_primitive != last_prim[arm]:
                 update_q_goal(arm)
                 if ik_failed["failed"]:
+                    recorder.close()
                     simulation_app.close()
                     return
                 last_prim[arm] = task.current_primitive
@@ -546,11 +681,9 @@ def main():
             if q_dots[arm] is None:
                 continue
             q_cmd_state[arm][:7] = q_cmd_state[arm][:7] + q_dots[arm] * physics_dt
-            q_cmd_full = franka[arm].get_joint_positions().copy()
-            q_cmd_full[:7] = q_cmd_state[arm][:7]
-            franka[arm].apply_action(ArticulationAction(joint_positions=q_cmd_full))
+            apply_full_command(arm, q_cmd_state[arm][:7])
 
-        env.step(render=not args.headless)
+        step_env()
         carry_held_blocks()
 
         # Per-arm primitive completion checks
@@ -601,16 +734,13 @@ def main():
                     if not args.advance_on_timeout:
                         print("[DEPLOY] Aborting instead of advancing. Use "
                               "--advance_on_timeout only for phase-flow debugging.")
+                        recorder.close()
                         simulation_app.close()
                         return
                 grip = gripper_action_for_primitive(task.current_primitive)
                 if grip == "close":
-                    franka[arm].gripper.apply_action(
-                        ArticulationAction(joint_positions=np.array([0.0, 0.0]))
-                    )
-                    for _ in range(cfg["sim"]["gripper_steps"]):
-                        env.step(render=not args.headless)
-                    q_cmd_state[arm] = franka[arm].get_joint_positions().copy()
+                    hold_gripper(arm, 0.0, cfg["sim"]["gripper_steps"])
+                    print_grasp_debug(arm, "after close", task.current_block)
                     if args.kinematic_carry:
                         ee = env.get_ee_pose(arm)[0].copy()
                         block_pos = env.get_block_positions()[task.current_block].copy()
@@ -621,12 +751,7 @@ def main():
                     if args.kinematic_carry:
                         snap_held_block_to_stack(arm)
                     held_block[arm] = None
-                    franka[arm].gripper.apply_action(
-                        ArticulationAction(joint_positions=np.array([0.04, 0.04]))
-                    )
-                    for _ in range(cfg["sim"]["gripper_steps"]):
-                        env.step(render=not args.headless)
-                    q_cmd_state[arm] = franka[arm].get_joint_positions().copy()
+                    hold_gripper(arm, 0.04, cfg["sim"]["gripper_steps"])
                     joint_lula_move_to_cart(
                         arm,
                         seq.stack_clearance_target(arm),
@@ -634,6 +759,8 @@ def main():
                         cart_tol=0.03,
                         label="post-place stack clearance",
                     )
+                elif args.debug_grasp and task.current_primitive == "lift":
+                    print_grasp_debug(arm, "after lift", task.current_block)
                 seq.primitive_complete(arm)
                 prim_steps[arm] = 0
                 safety_hold_steps[arm] = 0
@@ -651,6 +778,7 @@ def main():
             break
 
     print(f"[DEPLOY] Finished after {step + 1} steps.")
+    recorder.close()
     simulation_app.close()
 
 

@@ -9,8 +9,26 @@ table:
   centre: [0.0, 0.45, 0.0]
 
 block:
-  size: 0.05
+  size: 0.045
   mass: 0.05
+  static_friction: 2.0
+  dynamic_friction: 1.5
+  restitution: 0.0
+  # World-frame XY correction applied to reach/grasp targets. This mirrors
+  # the working stephen/testing calibration hook for the controlled Lula
+  # gripper frame vs. the visual cube center.
+  grasp_xy_offset:
+    left:  [0.0, 0.0]
+    right: [0.0, 0.0]
+
+gripper:
+  # Physical pickup needs friction on the finger collision meshes too, not just
+  # on the cube. Off by default because the stock Franka contact is able to
+  # pick cubes and late material binding can perturb Isaac's referenced USD.
+  high_friction_fingers: false
+  static_friction: 2.5
+  dynamic_friction: 2.0
+  restitution: 0.0
 
 stack:
   clearance_above_top: 0.12
@@ -35,14 +53,14 @@ arms:
 
 # ── Initial block layout ───────────────────────────────────────────────────────
 left_blocks:
-  - {name: block_red,    pos: [-0.40,  0.30, 0.765], color: [1.0, 0.1, 0.1]}
-  - {name: block_orange, pos: [-0.40,  0.50, 0.765], color: [1.0, 0.5, 0.0]}
-  - {name: block_pink,   pos: [-0.25,  0.40, 0.765], color: [1.0, 0.4, 0.7]}
+  - {name: block_red,    pos: [-0.40,  0.30, 0.7625], color: [1.0, 0.1, 0.1]}
+  - {name: block_orange, pos: [-0.40,  0.50, 0.7625], color: [1.0, 0.5, 0.0]}
+  - {name: block_pink,   pos: [-0.25,  0.40, 0.7625], color: [1.0, 0.4, 0.7]}
 
 right_blocks:
-  - {name: block_blue,   pos: [0.40,  0.30, 0.765], color: [0.1, 0.3, 1.0]}
-  - {name: block_green,  pos: [0.40,  0.50, 0.765], color: [0.1, 0.8, 0.1]}
-  - {name: block_yellow, pos: [0.25,  0.40, 0.765], color: [1.0, 0.85, 0.0]}
+  - {name: block_blue,   pos: [0.40,  0.30, 0.7625], color: [0.1, 0.3, 1.0]}
+  - {name: block_green,  pos: [0.40,  0.50, 0.7625], color: [0.1, 0.8, 0.1]}
+  - {name: block_yellow, pos: [0.25,  0.40, 0.7625], color: [1.0, 0.85, 0.0]}
 
 goals:
   left:  [0.0, 0.65]   # single shared stack — both arms transport to centre
@@ -50,17 +68,22 @@ goals:
 
 # ── Motion primitive heights ──────────────────────────────────────────────────
 heights:
-  hover:  0.95    # table_height + 0.21 — pre-grasp hover
-  grasp:  0.77    # table_height + 0.03 — fingertips at mid-block
+  hover:  0.89    # table_height + 0.15 — pre-pick hover from stephen/testing
+  grasp:  0.75    # table_height + 0.01 — matches working stephen/testing grasp
   lift:   0.99    # table_height + 0.25 — transport altitude
 
 # ── Simulation ────────────────────────────────────────────────────────────────
 sim:
   physics_dt:    0.00833    # 1/120
   rendering_dt:  0.01667    # 1/60
+  camera:
+    # Front-of-table view from stephen/testing: camera sits at +Y and looks
+    # back toward the Franka bases, keeping the grippers and stack visible.
+    eye:    [0.0, 2.25, 1.45]
+    target: [0.0, 0.25, 0.80]
   steps_per_primitive:
     reach:     120
-    grasp:     60
+    grasp:     80
     lift:      80
     transport: 150
     place:     80
