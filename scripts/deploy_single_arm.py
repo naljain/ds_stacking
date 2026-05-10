@@ -29,6 +29,35 @@ os.environ["OMNI_KIT_ACCEPT_EULA"] = "YES"
 os.environ["CARB_LOG_LEVEL"] = "error"
 
 
+def _quat_conj(q):
+    q = np.asarray(q, dtype=float)
+    return np.array([q[0], -q[1], -q[2], -q[3]], dtype=float)
+
+
+def _quat_mul(a, b):
+    aw, ax, ay, az = np.asarray(a, dtype=float)
+    bw, bx, by, bz = np.asarray(b, dtype=float)
+    return np.array([
+        aw * bw - ax * bx - ay * by - az * bz,
+        aw * bx + ax * bw + ay * bz - az * by,
+        aw * by - ax * bz + ay * bw + az * bx,
+        aw * bz + ax * by - ay * bx + az * bw,
+    ], dtype=float)
+
+
+def _quat_error_vec(target, current):
+    target = np.asarray(target, dtype=float)
+    current = np.asarray(current, dtype=float)
+    if target.shape != (4,) or current.shape != (4,):
+        return np.zeros(3)
+    target = target / (np.linalg.norm(target) + 1e-12)
+    current = current / (np.linalg.norm(current) + 1e-12)
+    err = _quat_mul(target, _quat_conj(current))
+    if err[0] < 0.0:
+        err = -err
+    return 2.0 * err[1:4]
+
+
 def _grasp_xy(block_xy, arm, cfg, cli_offset=None):
     offset = np.array(cfg["block"].get("grasp_xy_offset", {}).get(arm, [0.0, 0.0]),
                       dtype=float)
@@ -63,7 +92,7 @@ def main():
     parser.add_argument("--arm",       type=str, default="left", choices=["left", "right"])
     parser.add_argument("--config",    type=str, default="configs/default.yaml")
     parser.add_argument("--ckpt_arm",  type=str, default=None,
-                        help="Checkpoint arm label (default: same as --arm)")
+                        help="Checkpoint arm label (default: both)")
     parser.add_argument("--max_steps", type=int, default=2000,
                         help="Max DS steps per transport primitive")
     parser.add_argument("--use_safe",  action="store_true",
@@ -73,7 +102,21 @@ def main():
                         help="DS model type: neural (default) or lpvds")
     parser.add_argument("--headless",  action="store_true")
     parser.add_argument("--done_tol",  type=float, default=0.05,
-                        help="EE dist (m) to declare transport done")
+                        help="Joint-space L2 tolerance for neural transport; "
+                             "EE distance for LPVDS transport")
+    parser.add_argument("--max_joint_vel", type=float, default=None,
+                        help="Clamp neural DS joint velocities in rad/s. "
+                             "Defaults to training.max_joint_vel from config.")
+    parser.add_argument("--transport_ori_gain", type=float, default=0.0,
+                        help="Joint-space correction gain that holds the EE "
+                             "orientation near straight-down during neural "
+                             "transport. 0 disables.")
+    parser.add_argument("--transport_ori_max_joint_speed", type=float, default=0.4,
+                        help="Norm cap for the transport orientation-hold "
+                             "joint velocity.")
+    parser.add_argument("--ds_debug_every", type=int, default=50,
+                        help="Print neural DS convergence diagnostics every N "
+                             "transport steps. 0 disables.")
     parser.add_argument("--seed", type=int, default=None,
                         help="Random seed for deploy-time block randomization")
     parser.add_argument("--no_randomize_blocks", action="store_true",
@@ -81,6 +124,10 @@ def main():
     parser.add_argument("--grasp_offset", type=float, nargs=2, default=None,
                         metavar=("DX", "DY"),
                         help="Extra world-frame XY pick offset in metres")
+    parser.add_argument("--kinematic_carry", action="store_true",
+                        help="After grasp, attach the active block to the EE "
+                             "kinematically until place. This isolates DS "
+                             "tracking from gripper/contact physics.")
     parser.add_argument("--lookahead", type=int,   default=5,
                         help="IK target = ee_pos + x_dot * lookahead * dt")
     parser.add_argument("--max_cart_speed", type=float, default=0.25,
@@ -96,7 +143,7 @@ def main():
     args = parser.parse_args()
 
     if args.ckpt_arm is None:
-        args.ckpt_arm = args.arm
+        args.ckpt_arm = "both"
 
     from isaacsim import SimulationApp
     simulation_app = SimulationApp({"headless": args.headless,
@@ -133,6 +180,10 @@ def main():
         lpv_model = None
 
     physics_dt = cfg["sim"]["physics_dt"]
+    max_joint_vel = (
+        cfg["training"].get("max_joint_vel", 1.5)
+        if args.max_joint_vel is None else args.max_joint_vel
+    )
     steps      = cfg["sim"]["steps_per_primitive"]
     hover_h    = cfg["heights"]["hover"]
     lift_h     = cfg["heights"]["lift"]
@@ -165,7 +216,10 @@ def main():
 
     goal_z = cfg["table"]["height"] + block_h / 2
 
-    print(f"[DEPLOY] Single-arm transport DS — arm={args.arm}  safe={args.use_safe}")
+    print(f"[DEPLOY] Single-arm transport DS — arm={args.arm}  "
+          f"ckpt={args.ckpt_arm}  safe={args.use_safe}")
+    if args.model == "neural":
+        print(f"[DEPLOY] Neural transport max_joint_vel={max_joint_vel:.2f} rad/s")
     print(f"[DEPLOY] IK frame={ik_motion.ik.ee_frame}")
     if args.model == "lpvds":
         print(f"[DEPLOY] LPVDS goal={np.round(lpv_model.x_goal, 4)}  "
@@ -181,6 +235,56 @@ def main():
         except ImportError:
             from omni.isaac.core.utils.types import ArticulationAction
         return ArticulationAction(joint_positions=positions)
+
+    held_block = None
+    held_offset = np.zeros(3)
+
+    def carry_held_block():
+        if held_block is None:
+            return
+        ee_pos, _ = ik_motion.ik.get_world_pose()
+        obj = env.get_block_obj(held_block)
+        obj.set_world_pose(position=np.asarray(ee_pos) + held_offset,
+                           orientation=np.array([1.0, 0.0, 0.0, 0.0]))
+        obj.set_linear_velocity(np.zeros(3))
+        obj.set_angular_velocity(np.zeros(3))
+
+    def snap_held_block_to_stack():
+        if held_block is None:
+            return
+        obj = env.get_block_obj(held_block)
+        obj.set_world_pose(position=np.array([goal_xy[0], goal_xy[1], goal_z]),
+                           orientation=np.array([1.0, 0.0, 0.0, 0.0]))
+        obj.set_linear_velocity(np.zeros(3))
+        obj.set_angular_velocity(np.zeros(3))
+
+    def orientation_jacobian_finite_difference(q0, quat0, eps=1e-4):
+        J = np.zeros((3, 7))
+        for j in range(7):
+            q_eps = q0.copy()
+            q_eps[j] += eps
+            _, quat_eps = ik_motion.ik.get_world_pose(q=q_eps)
+            J[:, j] = _quat_error_vec(quat_eps, quat0) / eps
+        return J
+
+    def add_transport_orientation_hold(q_dot, target_quat):
+        if args.transport_ori_gain <= 0.0 or q_dot is None:
+            return q_dot
+        q_now = franka.get_joint_positions()[:7].copy()
+        _, quat_now = ik_motion.ik.get_world_pose(q=q_now)
+        err = _quat_error_vec(target_quat, quat_now)
+        if np.linalg.norm(err) < 1e-5:
+            return q_dot
+        J_rot = orientation_jacobian_finite_difference(q_now, quat_now)
+        JJt = J_rot @ J_rot.T
+        damp = 0.05 ** 2 * np.eye(3)
+        J_pinv = J_rot.T @ np.linalg.inv(JJt + damp)
+        q_ori = J_pinv @ (args.transport_ori_gain * err)
+        speed = float(np.linalg.norm(q_ori))
+        cap = max(float(args.transport_ori_max_joint_speed), 1e-9)
+        if speed > cap:
+            q_ori *= cap / speed
+        return q_dot + q_ori
 
     for block_name in block_names:
         block_pos = env.get_block_positions()[block_name].copy()
@@ -201,13 +305,30 @@ def main():
         ik_motion.set_gripper(open=False)
         for _ in range(cfg["sim"]["gripper_steps"]):
             env.world.step(render=not args.headless)
+        if args.kinematic_carry:
+            ee_pos, _ = ik_motion.ik.get_world_pose()
+            block_pos = env.get_block_positions()[block_name].copy()
+            held_block = block_name
+            held_offset = block_pos - np.asarray(ee_pos)
+            carry_held_block()
 
         # ── 3. Lift ───────────────────────────────────────────────────────
         ik_motion.move_to(env.world, np.array([pick_xy[0], pick_xy[1], lift_h]),
                           target_quat=ee_down,
-                          steps=steps["lift"], render=not args.headless)
+                          steps=steps["lift"],
+                          record_callback=carry_held_block,
+                          render=not args.headless)
 
         # ── 4. Transport — DS ─────────────────────────────────────────────
+        if args.model == "neural":
+            q_seed = franka.get_joint_positions()[:7].copy()
+            q_goal_new, ok = ik_kin.solve(
+                transport_pos, target_quat=ee_down, q_seed=q_seed)
+            if ok:
+                q_goal = q_goal_new
+            else:
+                print("[WARN] IK failed for transport target after lift; "
+                      "keeping previous q_goal")
         # Compute J once here: arm is in a stable post-lift pose and changes
         # slowly during transport, so one J per block is sufficient.
         # Computing J inside the loop disturbs the sim (7 FK perturbations).
@@ -274,20 +395,43 @@ def main():
                 else:
                     with torch.no_grad():
                         qd_n = ds["model"](x_t)
-                q_dot  = qd_n.cpu().numpy().squeeze(0) * ds["vel_scale"]
+                q_dot_raw = qd_n.cpu().numpy().squeeze(0) * ds["vel_scale"]
+                q_dot = np.clip(q_dot_raw, -max_joint_vel, max_joint_vel)
+                q_dot = add_transport_orientation_hold(q_dot, ee_down)
+                q_dot = np.clip(q_dot, -max_joint_vel, max_joint_vel)
+                if args.ds_debug_every and step % args.ds_debug_every == 0:
+                    e_norm = float(np.linalg.norm(x))
+                    qd_norm = float(np.linalg.norm(q_dot))
+                    _, quat_now = ik_motion.ik.get_world_pose(q=q)
+                    ori_err = float(np.linalg.norm(_quat_error_vec(ee_down, quat_now)))
+                    cos_to_goal = (
+                        -float(np.dot(x, q_dot)) / (e_norm * qd_norm + 1e-9)
+                        if e_norm * qd_norm > 1e-9 else 0.0
+                    )
+                    print(f"    [DS] step={step:>4} ||e||={e_norm:.3f} "
+                          f"ori_err={ori_err:.3f} "
+                          f"||qd_raw||={np.linalg.norm(q_dot_raw):.3f} "
+                          f"||qd||={qd_norm:.3f} "
+                          f"cos_to_goal={cos_to_goal:+.2f}")
                 finger   = ik_motion._finger_width
                 q_cmd    = q + q_dot * physics_dt
                 full_cmd = np.concatenate([q_cmd, [finger, finger]])
                 franka.apply_action(_articulation_action(full_cmd))
             env.step(render=not args.headless)
+            carry_held_block()
         else:
             print(f"  [WARN] Transport hit max_steps ({args.max_steps})")
 
         # ── 5. Place ──────────────────────────────────────────────────────
         place_pos = np.array([goal_xy[0], goal_xy[1], goal_z + 0.02])
         ik_motion.move_to(env.world, place_pos, target_quat=ee_down,
-                          steps=steps["place"], render=not args.headless)
+                          steps=steps["place"],
+                          record_callback=carry_held_block,
+                          render=not args.headless)
         ik_motion.set_gripper(open=True)
+        if args.kinematic_carry:
+            snap_held_block_to_stack()
+            held_block = None
         for _ in range(cfg["sim"]["gripper_steps"]):
             env.world.step(render=not args.headless)
 

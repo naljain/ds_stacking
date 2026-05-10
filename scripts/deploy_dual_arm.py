@@ -103,6 +103,36 @@ def _quat_wxyz_to_matrix(q):
     ])
 
 
+def _quat_conj(q):
+    q = np.asarray(q, dtype=float)
+    return np.array([q[0], -q[1], -q[2], -q[3]], dtype=float)
+
+
+def _quat_mul(a, b):
+    aw, ax, ay, az = np.asarray(a, dtype=float)
+    bw, bx, by, bz = np.asarray(b, dtype=float)
+    return np.array([
+        aw * bw - ax * bx - ay * by - az * bz,
+        aw * bx + ax * bw + ay * bz - az * by,
+        aw * by - ax * bz + ay * bw + az * bx,
+        aw * bz + ax * by - ay * bx + az * bw,
+    ], dtype=float)
+
+
+def _quat_error_vec(target, current):
+    """Small-angle orientation error vector from current to target."""
+    target = np.asarray(target, dtype=float)
+    current = np.asarray(current, dtype=float)
+    if target.shape != (4,) or current.shape != (4,):
+        return np.zeros(3)
+    target = target / (np.linalg.norm(target) + 1e-12)
+    current = current / (np.linalg.norm(current) + 1e-12)
+    err = _quat_mul(target, _quat_conj(current))
+    if err[0] < 0.0:
+        err = -err
+    return 2.0 * err[1:4]
+
+
 def _protected_points(ee_pos, ee_quat, n_link_spheres, spacing):
     """EE plus proxy spheres along the wrist/hand link before the EE."""
     points = [np.asarray(ee_pos, dtype=float)]
@@ -379,6 +409,10 @@ def main():
     parser.add_argument("--grasp_offset", type=float, nargs=2, default=None,
                         metavar=("DX", "DY"),
                         help="Extra world-frame XY pick offset in metres for both arms")
+    parser.add_argument("--kinematic_carry", action="store_true",
+                        help="After grasp, attach each active block to its EE "
+                             "kinematically until place. This isolates DS "
+                             "tracking from gripper/contact physics.")
     parser.add_argument("--model",         type=str, default="neural",
                         choices=["neural", "lpvds"],
                         help="Transport DS model: neural joint-space or Cartesian LPVDS")
@@ -419,6 +453,26 @@ def main():
                         help="Cartesian tolerance for finishing IK primitives before grasp/place")
     parser.add_argument("--ik_settle_steps", type=int, default=120,
                         help="Max extra ticks to hold final IK waypoint while waiting for tolerance")
+    parser.add_argument("--max_joint_vel", type=float, default=None,
+                        help="Clamp neural DS joint velocities in rad/s. "
+                             "Defaults to training.max_joint_vel from config.")
+    parser.add_argument("--transport_goal_gain", type=float, default=0.0,
+                        help="Optional joint-space attraction added during "
+                             "neural transport: q_dot -= gain * (q - q_goal).")
+    parser.add_argument("--transport_min_radial_speed", type=float, default=0.0,
+                        help="For neural transport, enforce a minimum inward "
+                             "joint-space speed toward q_goal in rad/s. "
+                             "0 leaves the DS unchanged.")
+    parser.add_argument("--transport_ori_gain", type=float, default=0.0,
+                        help="Joint-space correction gain that holds the EE "
+                             "orientation near straight-down during neural "
+                             "transport. 0 disables.")
+    parser.add_argument("--transport_ori_max_joint_speed", type=float, default=0.4,
+                        help="Norm cap for the transport orientation-hold "
+                             "joint velocity.")
+    parser.add_argument("--ds_debug_every", type=int, default=0,
+                        help="Print neural DS convergence diagnostics every N "
+                             "transport steps. 0 disables.")
     parser.add_argument("--seed", type=int, default=None,
                         help="Random seed for deploy-time block randomization")
     parser.add_argument("--no_randomize_blocks", action="store_true",
@@ -461,6 +515,10 @@ def main():
 
     env = DualArmEnv(config_path=args.config, arms=("left", "right"))
     cfg = env.cfg
+    max_joint_vel = (
+        cfg["training"].get("max_joint_vel", 1.5)
+        if args.max_joint_vel is None else args.max_joint_vel
+    )
     proxy_viz = IsaacProxySphereViz(radius=args.proxy_sphere_radius) \
         if args.show_proxy_spheres else None
     screen_recorder = None
@@ -717,6 +775,34 @@ def main():
         scale = 1.0 if dt is None else float(dt)
         return q_dot + scale * (null_projector @ q_home_dot)
 
+    def orientation_jacobian_finite_difference(arm, q0, quat0, eps=1e-4):
+        J = np.zeros((3, 7))
+        for j in range(7):
+            q_eps = q0.copy()
+            q_eps[j] += eps
+            _, quat_eps = ik_motion[arm].ik.get_world_pose(q=q_eps)
+            J[:, j] = _quat_error_vec(quat_eps, quat0) / eps
+        return J
+
+    def add_transport_orientation_hold(arm, q_dot, target_quat):
+        if args.transport_ori_gain <= 0.0 or q_dot is None:
+            return q_dot
+        q_now = franka[arm].get_joint_positions()[:7].copy()
+        _, quat_now = ik_motion[arm].ik.get_world_pose(q=q_now)
+        err = _quat_error_vec(target_quat, quat_now)
+        if np.linalg.norm(err) < 1e-5:
+            return q_dot
+        J_rot = orientation_jacobian_finite_difference(arm, q_now, quat_now)
+        JJt = J_rot @ J_rot.T
+        damp = 0.05 ** 2 * np.eye(3)
+        J_pinv = J_rot.T @ np.linalg.inv(JJt + damp)
+        q_ori = J_pinv @ (args.transport_ori_gain * err)
+        speed = float(np.linalg.norm(q_ori))
+        cap = max(float(args.transport_ori_max_joint_speed), 1e-9)
+        if speed > cap:
+            q_ori *= cap / speed
+        return q_dot + q_ori
+
     def protected_points_for_q(arm, q):
         ee_pose_now = ik_motion[arm].ik.get_world_pose(q=q)
         return _protected_points_from_links(
@@ -815,6 +901,10 @@ def main():
     )
     print(f"[DEPLOY] Dual-arm transport DS  model={args.model}  safe={args.use_safe}  "
           f"modulation={mod_mode}")
+    if args.model == "neural":
+        print(f"[DEPLOY] Neural transport max_joint_vel={max_joint_vel:.2f} rad/s "
+              f"goal_gain={args.transport_goal_gain:.2f} "
+              f"min_radial={args.transport_min_radial_speed:.2f}")
     print(f"[DEPLOY] Modulation sphere radius={mod_radius:.3f}m "
           f"reactivity={mod_reactivity:.2f} "
           f"isoline={mod_isoline:.2f} "
@@ -850,6 +940,44 @@ def main():
     ik_plan = {a: None for a in ARMS}
     joint_plan = {a: None for a in ARMS}
     gripper_wait = {a: None for a in ARMS}
+    held_block = {a: None for a in ARMS}
+    held_offset = {a: np.zeros(3) for a in ARMS}
+
+    def carry_held_blocks():
+        if not args.kinematic_carry:
+            return
+        for arm in ARMS:
+            if held_block[arm] is None:
+                continue
+            ee_pos, _ = ik_motion[arm].ik.get_world_pose()
+            obj = env.get_block_obj(held_block[arm])
+            obj.set_world_pose(position=np.asarray(ee_pos) + held_offset[arm],
+                               orientation=np.array([1.0, 0.0, 0.0, 0.0]))
+            obj.set_linear_velocity(np.zeros(3))
+            obj.set_angular_velocity(np.zeros(3))
+
+    def attach_held_block(arm):
+        if not args.kinematic_carry:
+            return
+        blk = current_block(arm)
+        if blk is None:
+            return
+        ee_pos, _ = ik_motion[arm].ik.get_world_pose()
+        block_pos = env.get_block_positions()[blk].copy()
+        held_block[arm] = blk
+        held_offset[arm] = block_pos - np.asarray(ee_pos)
+        carry_held_blocks()
+
+    def snap_held_block_to_stack(arm):
+        if not args.kinematic_carry or held_block[arm] is None:
+            return
+        obj = env.get_block_obj(held_block[arm])
+        obj.set_world_pose(position=np.array([goal_xy[0], goal_xy[1], goal_z]),
+                           orientation=np.array([1.0, 0.0, 0.0, 0.0]))
+        obj.set_linear_velocity(np.zeros(3))
+        obj.set_angular_velocity(np.zeros(3))
+        held_block[arm] = None
+        held_offset[arm] = np.zeros(3)
 
     def start_ik_plan(arm, target, quat, n_steps, kind):
         if ik_plan[arm] is not None:
@@ -891,8 +1019,18 @@ def main():
         elif kind == "grasp":
             start_gripper_wait(arm, open_gripper=False,
                                n_steps=cfg["sim"]["gripper_steps"],
-                               next_stage=Stage.LIFT)
+                               next_stage=Stage.LIFT,
+                               after="grasp_close")
         elif kind == "lift":
+            if args.model == "neural":
+                q_seed = franka[arm].get_joint_positions()[:7].copy()
+                q, ok = ik_kin[arm].solve(
+                    transport_pos, target_quat=ee_down, q_seed=q_seed)
+                if ok:
+                    q_goal[arm] = q
+                else:
+                    print(f"[WARN] IK failed for transport target on {arm} arm; "
+                          "keeping previous q_goal")
             transport_steps[arm] = 0
             ik_fail_streak[arm] = 0
             stage[arm] = Stage.TRANSPORT
@@ -912,7 +1050,10 @@ def main():
 
     def finish_gripper_wait(arm, wait):
         nonlocal goal_z, priority_arm
-        if wait["after"] == "place_open":
+        if wait["after"] == "grasp_close":
+            attach_held_block(arm)
+        elif wait["after"] == "place_open":
+            snap_held_block_to_stack(arm)
             goal_z += block_h + 0.002
             if args.priority_policy == "fixed":
                 priority_arm = other_arm(arm)
@@ -1297,6 +1438,7 @@ def main():
 
             if any_transport or moved_arms:
                 env.step(render=not args.headless)
+                carry_held_blocks()
                 global_step += 1
                 idle_ticks = 0
                 if args.status_every > 0 and global_step % args.status_every == 0:
@@ -1345,6 +1487,36 @@ def main():
 
             q_dots[arm] = (args.speedup * qd_n.cpu().numpy().squeeze(0) *
                            ds[arm]["vel_scale"])
+            q_dot_raw = q_dots[arm].copy()
+            if args.transport_goal_gain > 0.0:
+                q_dots[arm] = q_dots[arm] - args.transport_goal_gain * x
+            if (args.transport_min_radial_speed > 0.0
+                    and np.linalg.norm(x) > 1e-9):
+                inward = -x / np.linalg.norm(x)
+                radial_speed = float(np.dot(q_dots[arm], inward))
+                if radial_speed < args.transport_min_radial_speed:
+                    q_dots[arm] = q_dots[arm] + (
+                        args.transport_min_radial_speed - radial_speed
+                    ) * inward
+            q_dots[arm] = add_transport_orientation_hold(
+                arm, q_dots[arm], ee_down
+            )
+            q_dots[arm] = np.clip(q_dots[arm], -max_joint_vel, max_joint_vel)
+            if args.ds_debug_every and transport_steps[arm] % args.ds_debug_every == 0:
+                e_norm = float(np.linalg.norm(x))
+                qd_norm = float(np.linalg.norm(q_dots[arm]))
+                _, quat_now = ik_motion[arm].ik.get_world_pose(q=q)
+                ori_err = float(np.linalg.norm(_quat_error_vec(ee_down, quat_now)))
+                cos_to_goal = (
+                    -float(np.dot(x, q_dots[arm])) / (e_norm * qd_norm + 1e-9)
+                    if e_norm * qd_norm > 1e-9 else 0.0
+                )
+                print(f"[DS] {arm} step={transport_steps[arm]} "
+                      f"||e||={e_norm:.3f} "
+                      f"ori_err={ori_err:.3f} "
+                      f"||qd_raw||={np.linalg.norm(q_dot_raw):.3f} "
+                      f"||qd||={qd_norm:.3f} "
+                      f"cos_to_goal={cos_to_goal:+.2f}")
 
         # Apply inter-arm modulation
         for arm in ARMS:
@@ -1389,6 +1561,7 @@ def main():
 
         if any_transport or moved_arms:
             env.step(render=not args.headless)
+            carry_held_blocks()
             global_step += 1
             idle_ticks = 0
             if args.status_every > 0 and global_step % args.status_every == 0:

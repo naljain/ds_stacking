@@ -95,11 +95,12 @@ def main():
                              "settles farther than this L2 joint error from "
                              "its Lula q_goal.")
     parser.add_argument("--ik_seed_policy", type=str, default="default",
-                        choices=["default", "current"],
+                        choices=["default", "current", "transport_current"],
                         help="Seed Lula q_goal solves from the biased default "
                              "joint configuration or from the current joint "
-                             "state. Default matches neural deployment's "
-                             "transport q_goal branch.")
+                             "state. transport_current uses the default seed "
+                             "for setup/place primitives and current seed only "
+                             "for transport.")
     parser.add_argument("--direct_joint_set", action="store_true", default=True,
                         help="Set joint "
                              "positions directly along the generated demo "
@@ -284,12 +285,16 @@ def main():
                         existing_stack_top + stack_clearance,
                     )
 
-                # Use block-aligned orientation when approaching; straight down
-                # for lift / transport / place (block orientation no longer matters).
-                target_quat = (
-                    aligned_quat if primitive in ("reach", "grasp")
-                    else DEFAULT_DOWN_QUAT
-                )
+                # Match main's robust collection path for setup primitives:
+                # reach/grasp align to the block, lift/place leave redundant
+                # wrist orientation free, and transport alone constrains the
+                # gripper down because that is the neural DS target we deploy.
+                if primitive in ("reach", "grasp"):
+                    target_quat = aligned_quat
+                elif primitive == "transport":
+                    target_quat = DEFAULT_DOWN_QUAT
+                else:
+                    target_quat = None
 
                 # Buffer this primitive's steps; q_goal is filled in once the
                 # primitive attractor is known.
@@ -326,9 +331,14 @@ def main():
                 # the retract or gripper-action motion that came before it.
                 prev_q = franka.get_joint_positions()[:7].copy()
 
+                use_current_seed = (
+                    args.ik_seed_policy == "current"
+                    or (args.ik_seed_policy == "transport_current"
+                        and primitive == "transport")
+                )
                 q_seed = (
-                    default_q.copy() if args.ik_seed_policy == "default"
-                    else franka.get_joint_positions()[:7].copy()
+                    franka.get_joint_positions()[:7].copy()
+                    if use_current_seed else default_q.copy()
                 )
                 q_goal_lula, ok = ik_kin.solve(
                     target_cart, target_quat=target_quat, q_seed=q_seed)
