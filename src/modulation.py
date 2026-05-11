@@ -288,6 +288,71 @@ class InterArmModulation:
 
         return q_dot_nominal + J_pinv @ delta_v
 
+    def modulate_joint_velocity_lateral_order(self, q_dot_nominal,
+                                              self_points, obstacle_points,
+                                              jacobian, side_axis,
+                                              min_separation=0.08,
+                                              reactivity=None,
+                                              lambda_floor=-0.75):
+        """Modulate qdot to preserve a left/right ordering between arms.
+
+        The normal obstacle modulation above keeps points away from each other
+        radially, but in the shared-stack geometry it can route one arm over or
+        through the other.  This adds a virtual separating plane: for the left
+        arm, protected points should remain to the left of the right arm; for
+        the right arm, they should remain to the right of the left arm.
+
+        `side_axis` points from the other arm toward the safe side of this arm,
+        e.g. [-1, 0, 0] for the left arm and [1, 0, 0] for the right arm.
+        """
+        self_points = np.asarray(self_points, dtype=float).reshape(-1, 3)
+        obstacle_points = np.asarray(obstacle_points, dtype=float).reshape(-1, 3)
+        if len(self_points) == 0 or len(obstacle_points) == 0:
+            return q_dot_nominal
+
+        side_axis = np.asarray(side_axis, dtype=float)
+        side_axis = side_axis / (np.linalg.norm(side_axis) + 1e-12)
+        min_separation = max(float(min_separation), 1e-6)
+        p = self.huber.reactivity if reactivity is None else float(reactivity)
+
+        # Most critical pair: smallest signed distance to the separating plane.
+        separation = float("inf")
+        for p_self in self_points:
+            for p_obs in obstacle_points:
+                sep = float(np.dot(p_self - p_obs, side_axis))
+                if sep < separation:
+                    separation = sep
+
+        # Far from the virtual plane, the modulation is identity.
+        gamma = (max(separation, 1e-6) / min_separation) ** p
+        if gamma > 100.0:
+            return q_dot_nominal
+
+        J_trans = jacobian[:3, :]
+        v_nom = J_trans @ q_dot_nominal
+        v_side = float(np.dot(v_nom, side_axis))
+
+        # Tail effect: outward motion is safe and should not be disturbed.
+        if v_side >= 0.0:
+            return q_dot_nominal
+
+        if gamma > 1.0:
+            lambda_side = 1.0 - 1.0 / gamma
+        else:
+            # Inside the separating margin, allow a bounded negative eigenvalue
+            # so inward velocity is reflected back toward the arm's own side.
+            lambda_side = max(float(lambda_floor), 1.0 - 1.0 / max(gamma, 1e-6))
+
+        v_normal = v_side * side_axis
+        v_tangent = v_nom - v_normal
+        v_mod = v_tangent + lambda_side * v_normal
+        delta_v = v_mod - v_nom
+
+        JJt = J_trans @ J_trans.T
+        damp = (self.jac_damping ** 2) * np.eye(JJt.shape[0])
+        J_pinv = J_trans.T @ np.linalg.inv(JJt + damp)
+        return q_dot_nominal + J_pinv @ delta_v
+
     # ── Diagnostics: useful for the writeup ────────────────────────────────
     def diagnostics(self, q_dot_nominal, ee_pos_self, ee_pos_other, jacobian):
         """Return scalar quantities for plotting/logging:

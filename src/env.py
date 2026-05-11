@@ -40,6 +40,7 @@ class DualArmEnv:
         self.blocks     = {}  # block_name -> DynamicCuboid object
         self.block_init = {}  # block_name -> initial position (np.array)
         self.goals      = {}  # arm_name -> (x, y) goal location
+        self._default_joints = {}
         self._block_physics_material = None
         self._gripper_physics_material = None
 
@@ -53,12 +54,21 @@ class DualArmEnv:
         self._apply_gripper_physics_material()
 
         self.world.reset()
+        self._apply_default_joints(settle_steps=30)
         self._configure_viewport_camera()
 
     # ── Loading ───────────────────────────────────────────────────────────────
     @staticmethod
     def _load_config(path):
-        with open(path, "r") as f:
+        p = Path(path)
+        if not p.is_absolute() and not p.exists():
+            # Allow running from subdirectories (e.g. cwd=scripts/) by resolving
+            # relative paths against the repository root (parent of src/).
+            repo_root = Path(__file__).resolve().parent.parent
+            candidate = repo_root / p
+            if candidate.exists():
+                p = candidate
+        with open(p, "r") as f:
             return yaml.safe_load(f)
 
     # ── Scene construction ────────────────────────────────────────────────────
@@ -209,9 +219,26 @@ class DualArmEnv:
                     ) from exc
                 raise
             self.frankas[name] = franka
+            self._default_joints[name] = np.array(a[f"default_joints_{name}"],
+                                                  dtype=float)
 
             # Goal location for this arm
             self.goals[name] = tuple(self.cfg["goals"][name])
+
+    def _apply_default_joints(self, settle_steps=30, render=False):
+        """Reset active arms to the configured trained-home joint posture."""
+        for name, franka in self.frankas.items():
+            q = self._default_joints[name]
+            full = franka.get_joint_positions().copy()
+            full[:7] = q
+            franka.set_joint_positions(full)
+            franka.set_joint_velocities(np.zeros_like(full))
+        for _ in range(settle_steps):
+            self.world.step(render=render)
+
+    def reset_arms(self, settle_steps=60, render=False):
+        """Reset all active arms to their configured default posture."""
+        self._apply_default_joints(settle_steps=settle_steps, render=render)
 
     def _build_blocks(self):
         block_cfg = self.cfg["block"]

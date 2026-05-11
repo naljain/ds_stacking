@@ -121,6 +121,12 @@ def main():
     parser.add_argument("--joint_done_tol", type=float, default=None,
                         help="L2 joint-space tolerance for DS primitive completion. "
                              "Defaults to --done_tol.")
+    parser.add_argument("--cart_done_tol", type=float, default=IK_CART_DONE_TOL,
+                        help="Cartesian EE completion tolerance (meters) for IK primitives "
+                             "(grasp/lift/place), except place uses --place_cart_done_tol.")
+    parser.add_argument("--place_cart_done_tol", type=float, default=0.01,
+                        help="Cartesian EE completion tolerance (meters) for place. "
+                             "Tight by default so --kinematic_carry doesn't snap early.")
     parser.add_argument("--log_csv", type=str, default=None,
                         help="If set, write per-step diagnostics to this CSV "
                              "for post-mortem plotting.")
@@ -277,6 +283,11 @@ def main():
         raise ValueError(f"Unknown --ik_primitives entries: {sorted(bad_primitives)}")
 
     ckpt_dir = Path(cfg["paths"]["checkpoints"])
+    if not ckpt_dir.is_absolute() and not ckpt_dir.exists():
+        repo_root = Path(__file__).resolve().parent.parent
+        candidate = repo_root / ckpt_dir
+        if candidate.exists():
+            ckpt_dir = candidate
     ds_primitives = [p for p in DS_PRIMITIVES if p not in ik_primitives]
     ckpt_arm = args.ckpt_arm if args.ckpt_arm is not None else args.arm
     ds_set = {p: load_ds(ckpt_dir / f"{ckpt_arm}_{p}.pt", device)
@@ -398,7 +409,7 @@ def main():
     def carry_held_block():
         if held_block is None:
             return
-        ee_pos = env.get_ee_pose(args.arm)[0].copy()
+        ee_pos = ik_frame_position().copy()
         obj = env.get_block_obj(held_block)
         obj.set_world_pose(position=ee_pos + held_offset,
                            orientation=np.array([1.0, 0.0, 0.0, 0.0]))
@@ -549,16 +560,19 @@ def main():
                 hold_gripper(0.0, cfg["sim"]["gripper_steps"])
                 print_grasp_debug("after close", task.current_block)
                 if args.kinematic_carry:
-                    ee_pos = env.get_ee_pose(args.arm)[0].copy()
+                    ee_pos = ik_frame_position().copy()
                     block_pos = env.get_block_positions()[task.current_block].copy()
                     held_block = task.current_block
                     held_offset = block_pos - ee_pos
                     carry_held_block()
             elif grip == "open":
                 if args.kinematic_carry:
+                    hold_gripper(0.04, cfg["sim"]["gripper_steps"])
                     snap_held_block_to_stack()
-                held_block = None
-                hold_gripper(0.04, cfg["sim"]["gripper_steps"])
+                    held_block = None
+                else:
+                    hold_gripper(0.04, cfg["sim"]["gripper_steps"])
+                    held_block = None
                 if args.post_place_lift_steps > 0:
                     joint_lula_move_to_cart(
                         seq.stack_clearance_target(args.arm),
@@ -672,8 +686,14 @@ def main():
             cart_err = np.linalg.norm(ee_pos - cart_target)
             joint_err = np.linalg.norm(franka.get_joint_positions()[:7] - q_goal)
             done_err = cart_err
-            converged = (cart_err < IK_CART_DONE_TOL
-                         or joint_err < IK_JOINT_DONE_TOL)
+            cart_tol = (
+                args.place_cart_done_tol
+                if task.current_primitive == "place" else args.cart_done_tol
+            )
+            if task.current_primitive == "place":
+                converged = cart_err < cart_tol
+            else:
+                converged = (cart_err < cart_tol) or (joint_err < IK_JOINT_DONE_TOL)
             done_label = "||ee-target||"
         else:
             joint_err = np.linalg.norm(q - q_goal)
@@ -699,16 +719,19 @@ def main():
                 hold_gripper(0.0, cfg["sim"]["gripper_steps"])
                 print_grasp_debug("after close", task.current_block)
                 if args.kinematic_carry:
-                    ee_pos = env.get_ee_pose(args.arm)[0].copy()
+                    ee_pos = ik_frame_position().copy()
                     block_pos = env.get_block_positions()[task.current_block].copy()
                     held_block = task.current_block
                     held_offset = block_pos - ee_pos
                     carry_held_block()
             elif grip == "open":
                 if args.kinematic_carry:
+                    hold_gripper(0.04, cfg["sim"]["gripper_steps"])
                     snap_held_block_to_stack()
-                held_block = None
-                hold_gripper(0.04, cfg["sim"]["gripper_steps"])
+                    held_block = None
+                else:
+                    hold_gripper(0.04, cfg["sim"]["gripper_steps"])
+                    held_block = None
                 if args.post_place_lift_steps > 0:
                     retract_cart = seq.stack_clearance_target(args.arm)
                     joint_lula_move_to_cart(

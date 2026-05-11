@@ -53,6 +53,49 @@ DS_REACH_CART_DONE_TOL = 0.03
 DS_GOAL_GAIN = 0.0
 
 
+class IsaacProxySphereViz:
+    """Small USD sphere markers that follow protected modulation points."""
+
+    def __init__(self, radius=0.025, max_points=32):
+        self.radius = float(radius)
+        self.max_points = int(max_points)
+        self.prims = {}
+        self.enabled = False
+        try:
+            import omni.usd
+            from pxr import Gf, UsdGeom
+            self.stage = omni.usd.get_context().get_stage()
+            self.Gf = Gf
+            self.UsdGeom = UsdGeom
+            self.enabled = self.stage is not None
+        except Exception as exc:
+            print(f"[WARN] Proxy sphere visualization unavailable: {exc}")
+
+    def _make(self, arm, idx):
+        path = f"/World/ModulationSpheres/{arm}_{idx:02d}"
+        sphere = self.UsdGeom.Sphere.Define(self.stage, path)
+        sphere.CreateRadiusAttr(self.radius)
+        color = (1.0, 0.05, 0.05) if arm == "left" else (0.05, 0.20, 1.0)
+        sphere.CreateDisplayColorAttr([self.Gf.Vec3f(*color)])
+        sphere.CreateDisplayOpacityAttr([0.45])
+        xform = self.UsdGeom.Xformable(sphere.GetPrim())
+        xform.ClearXformOpOrder()
+        translate = xform.AddTranslateOp()
+        self.prims[(arm, idx)] = translate
+        return translate
+
+    def update(self, points_by_arm):
+        if not self.enabled:
+            return
+        hidden = self.Gf.Vec3d(0.0, 0.0, -10.0)
+        for arm, points in points_by_arm.items():
+            points = np.asarray(points, dtype=float).reshape(-1, 3)
+            for idx in range(self.max_points):
+                op = self.prims.get((arm, idx)) or self._make(arm, idx)
+                pos = points[idx] if idx < len(points) else hidden
+                op.Set(self.Gf.Vec3d(float(pos[0]), float(pos[1]), float(pos[2])))
+
+
 def _load_deploy_config(path):
     if path is None:
         return {}
@@ -268,6 +311,25 @@ def main():
                         help="Blend weight for modulation on the priority arm.")
     parser.add_argument("--yield_mod_weight", type=float, default=1.0,
                         help="Blend weight for modulation on the yielding arm.")
+    parser.add_argument("--yield_mod_speed_scale", type=float, default=1.0,
+                        help="Extra velocity scale applied to the non-priority "
+                             "arm after modulation. Values below 1 make the "
+                             "yielding arm slow down instead of trying to "
+                             "route around aggressively.")
+    parser.add_argument("--no_lateral_order_modulation", action="store_true",
+                        help="Disable virtual separating-plane modulation that "
+                             "keeps the left arm on the left side of the right arm.")
+    parser.add_argument("--lateral_order_min_separation", type=float, default=None,
+                        help="Minimum signed X separation between protected "
+                             "left/right points before lateral-order modulation "
+                             "pushes an arm back to its own side.")
+    parser.add_argument("--lateral_order_reactivity", type=float, default=None,
+                        help="Reactivity exponent for lateral-order modulation.")
+    parser.add_argument("--lateral_order_mod_weight", type=float, default=None,
+                        help="Blend weight for lateral-order modulation.")
+    parser.add_argument("--lateral_order_lambda_floor", type=float, default=None,
+                        help="Most negative normal eigenvalue allowed inside "
+                             "the lateral-order separating margin.")
     parser.add_argument("--link_spheres", type=int, default=None,
                         help="Fallback proxy spheres behind the EE.")
     parser.add_argument("--link_sphere_spacing", type=float, default=None,
@@ -283,10 +345,19 @@ def main():
                         default=None,
                         help="Offsets back from EE along local -Z for gripper proxies.")
     parser.add_argument("--show_proxy_spheres", action="store_true",
-                        help="Print/use protected proxy points for modulation diagnostics.")
+                        help="Show protected modulation proxy spheres in the Isaac viewport.")
+    parser.add_argument("--proxy_sphere_radius", type=float, default=0.025,
+                        help="Radius (meters) for --show_proxy_spheres markers.")
     parser.add_argument("--yield_radius", type=float, default=None,
                         help="Distance from shared stack where the non-priority "
                              "arm waits before place.")
+    parser.add_argument("--stack_keepout_radius", type=float, default=0.0,
+                        help="If >0, keep the non-priority arm out of this "
+                             "XY radius around the shared stack while the "
+                             "priority arm is transporting/placing.")
+    parser.add_argument("--stack_keepout_wait_x", type=float, default=0.25,
+                        help="Absolute X offset for the non-priority arm's "
+                             "side wait pose during stack keepout.")
     parser.add_argument("--link_safety_radius", type=float, default=0.18,
                         help="Minimum sampled link-to-link distance in meters. "
                              "If any sampled links are closer, pause one arm "
@@ -355,6 +426,13 @@ def main():
     parser.add_argument("--joint_done_tol", type=float, default=None,
                         help="L2 joint-space tolerance for DS primitive completion. "
                              "Defaults to --done_tol.")
+    parser.add_argument("--cart_done_tol", type=float, default=IK_CART_DONE_TOL,
+                        help="Cartesian EE completion tolerance (meters) for IK primitives "
+                             "(grasp/lift/place), except place uses --place_cart_done_tol.")
+    parser.add_argument("--place_cart_done_tol", type=float, default=0.03,
+                        help="Cartesian EE completion tolerance (meters) for place. "
+                             "Use a practical value because Lula/Isaac FK can "
+                             "settle a little off the requested Cartesian target.")
     parser.add_argument("--gif_out", type=str, default=None,
                         help="Optional offscreen GIF path. Works with --headless "
                              "when Isaac offscreen rendering is available.")
@@ -462,6 +540,11 @@ def main():
         raise ValueError(f"Unknown --ik_primitives entries: {sorted(bad_primitives)}")
 
     ckpt_dir = Path(cfg["paths"]["checkpoints"])
+    if not ckpt_dir.is_absolute() and not ckpt_dir.exists():
+        repo_root = Path(__file__).resolve().parent.parent
+        candidate = repo_root / ckpt_dir
+        if candidate.exists():
+            ckpt_dir = candidate
     ds_primitives = [p for p in DS_PRIMITIVES if p not in ik_primitives]
     ds_sets = load_ds_sets(ckpt_dir, args.ckpt_arm, device, primitives=ds_primitives)
     print(f"[DEPLOY] DS checkpoint mode: {args.ckpt_arm} "
@@ -491,6 +574,26 @@ def main():
         isoline=mod_isoline,
         max_pairs=(None if args.mod_max_pairs == 0 else args.mod_max_pairs),
     )
+    lateral_order_min_separation = args.lateral_order_min_separation
+    if lateral_order_min_separation is None:
+        lateral_order_min_separation = cfg["coordination"].get(
+            "lateral_order_min_separation", 0.08
+        )
+    lateral_order_reactivity = args.lateral_order_reactivity
+    if lateral_order_reactivity is None:
+        lateral_order_reactivity = cfg["coordination"].get(
+            "lateral_order_reactivity", mod_reactivity
+        )
+    lateral_order_mod_weight = args.lateral_order_mod_weight
+    if lateral_order_mod_weight is None:
+        lateral_order_mod_weight = cfg["coordination"].get(
+            "lateral_order_mod_weight", 1.0
+        )
+    lateral_order_lambda_floor = args.lateral_order_lambda_floor
+    if lateral_order_lambda_floor is None:
+        lateral_order_lambda_floor = cfg["coordination"].get(
+            "lateral_order_lambda_floor", -0.75
+        )
     link_spheres = args.link_spheres
     if link_spheres is None:
         link_spheres = cfg["coordination"].get("link_proxy_spheres", 3)
@@ -530,12 +633,22 @@ def main():
     stagger_steps = (cfg["coordination"].get("start_stagger_steps", 0)
                      if args.stagger_steps is None else args.stagger_steps)
     arm_start_step = {"left": 0, "right": max(0, stagger_steps)}
-    home_q = {arm: franka[arm].get_joint_positions()[:7].copy()
-              for arm in ("left", "right")}
+    # Return-home uses the configured trained home pose, not whatever Isaac
+    # reports after startup/settling. These are the same joint values used as
+    # the collection reset pose.
+    home_q = {
+        arm: np.asarray(cfg["arms"][f"default_joints_{arm}"], dtype=float).copy()
+        for arm in ("left", "right")
+    }
     q_cmd_state = {arm: franka[arm].get_joint_positions().copy()
                    for arm in ("left", "right")}
     desired_finger_width = {"left": 0.04, "right": 0.04}
     arm_parked = {arm: False for arm in ("left", "right")}
+
+    proxy_viz = (
+        IsaacProxySphereViz(radius=args.proxy_sphere_radius)
+        if args.show_proxy_spheres else None
+    )
 
     # Open both grippers
     for arm in franka:
@@ -615,6 +728,15 @@ def main():
         print(f"[DEPLOY] Protected frames={link_frames} "
               f"samples/segment={link_samples_per_segment} "
               f"gripper_offsets={gripper_lateral_offsets}")
+        if args.stack_keepout_radius > 0.0:
+            print(f"[DEPLOY] Stack keepout radius={args.stack_keepout_radius:.3f}m "
+                  f"wait_x={args.stack_keepout_wait_x:.3f}m")
+        if not args.no_lateral_order_modulation:
+            print(f"[DEPLOY] Lateral order modulation: "
+                  f"min_sep={lateral_order_min_separation:.3f}m "
+                  f"reactivity={lateral_order_reactivity:.2f} "
+                  f"weight={lateral_order_mod_weight:.2f} "
+                  f"lambda_floor={lateral_order_lambda_floor:.2f}")
     if ik_primitives:
         print(f"[DEPLOY] IK primitives: {', '.join(sorted(ik_primitives))}")
     if stagger_steps > 0:
@@ -681,6 +803,56 @@ def main():
         ee_other = ik_frame_position(other)
         return np.linalg.norm(ee_other[:2] - goal_xy_for_arm(arm)) > yield_radius
 
+    def stack_keepout_velocity(arm, q_now):
+        """Move the non-priority arm to a side wait pose near the stack.
+
+        Pure modulation can make the yielding arm arc over the priority arm.
+        This small task-level keepout prevents that by reserving the shared
+        stack airspace for the priority arm during transport/place.
+        """
+        if args.stack_keepout_radius <= 0.0 or arm == priority_arm:
+            return None
+        task = seq.tasks[arm]
+        priority_task = seq.tasks[priority_arm]
+        if task.is_done() or priority_task.is_done():
+            return None
+        if task.current_primitive != "transport":
+            return None
+        if priority_task.current_primitive not in ("transport", "place"):
+            return None
+
+        stack_xy = goal_xy_for_arm(priority_arm)
+        ee = ik_frame_position(arm)
+        dist_to_stack = float(np.linalg.norm(ee[:2] - stack_xy))
+        if dist_to_stack > args.stack_keepout_radius:
+            return None
+
+        side = -1.0 if arm == "left" else 1.0
+        wait_z = max(cfg["heights"]["lift"], seq.stack_clearance_z_for_task(task))
+        wait_cart = np.array([
+            stack_xy[0] + side * abs(args.stack_keepout_wait_x),
+            stack_xy[1],
+            wait_z,
+        ])
+        q_wait, ok = ik_kin[arm].solve(
+            wait_cart, target_quat=seq.ee_orientation(arm), q_seed=q_now)
+        if not ok:
+            return np.zeros(7)
+        return np.clip(
+            -args.ik_goal_gain * (q_now - q_wait),
+            -max_joint_vel,
+            max_joint_vel,
+        )
+
+    def use_lateral_order_modulation(arm):
+        task = seq.tasks[arm]
+        if task.is_done():
+            return False
+        # Both arms eventually need to enter the shared stack column.  The
+        # ordering plane prevents transport crossing, but it must not fight the
+        # final place primitive once task-level priority has granted access.
+        return task.current_primitive != "place"
+
     def protected_points_for_arm(arm):
         q = franka[arm].get_joint_positions()[:7].copy()
         try:
@@ -733,7 +905,9 @@ def main():
         for arm in ("left", "right"):
             if held_block[arm] is None:
                 continue
-            ee = env.get_ee_pose(arm)[0].copy()
+            # Use the same frame as IK targets (Lula right_gripper) so the
+            # kinematic-carry offset is consistent with reach/grasp/lift/place.
+            ee = ik_frame_position(arm).copy()
             obj = env.get_block_obj(held_block[arm])
             obj.set_world_pose(position=ee + held_offset[arm],
                                orientation=np.array([1.0, 0.0, 0.0, 0.0]))
@@ -826,6 +1000,8 @@ def main():
         ee_pos = {arm: env.get_ee_pose(arm)[0].copy() for arm in ("left", "right")}
         protected_points = {arm: protected_points_for_arm(arm)
                             for arm in ("left", "right")}
+        if proxy_viz is not None:
+            proxy_viz.update(protected_points)
 
         # Compute nominal q̇ for each arm (in parallel, before any commits)
         q_dots = {}
@@ -873,6 +1049,11 @@ def main():
                 q_dots[arm] = None
                 q_cmd_state[arm] = franka[arm].get_joint_positions().copy()
                 continue
+            keepout_dot = stack_keepout_velocity(arm, q)
+            if keepout_dot is not None:
+                q_dots[arm] = keepout_dot
+                safety_hold_steps[arm] += 1
+                continue
             if task.current_primitive in ik_primitives:
                 x = q - task.q_goal
                 q_dots[arm] = np.clip(
@@ -918,6 +1099,31 @@ def main():
                 )
                 w = avoidance_weight(arm)
                 q_dots[arm] = (1.0 - w) * q_dot_nom + w * q_dot_mod
+                if arm != priority_arm:
+                    q_dots[arm] *= float(args.yield_mod_speed_scale)
+            if not args.no_lateral_order_modulation:
+                for arm, other in (("left", "right"), ("right", "left")):
+                    if q_dots[arm] is None:
+                        continue
+                    if not use_lateral_order_modulation(arm):
+                        continue
+                    side_axis = np.array(
+                        [-1.0, 0.0, 0.0] if arm == "left" else [1.0, 0.0, 0.0]
+                    )
+                    J = jacobian_finite_difference(franka[arm])
+                    q_dot_nom = q_dots[arm]
+                    q_dot_mod = mod.modulate_joint_velocity_lateral_order(
+                        q_dot_nominal=q_dot_nom,
+                        self_points=protected_points[arm],
+                        obstacle_points=protected_points[other],
+                        jacobian=J,
+                        side_axis=side_axis,
+                        min_separation=lateral_order_min_separation,
+                        reactivity=lateral_order_reactivity,
+                        lambda_floor=lateral_order_lambda_floor,
+                    )
+                    w = float(lateral_order_mod_weight)
+                    q_dots[arm] = (1.0 - w) * q_dot_nom + w * q_dot_mod
 
         if not args.no_link_safety_hold:
             link_dist = min_link_distance()
@@ -964,12 +1170,20 @@ def main():
             if task.current_primitive in ik_primitives:
                 ee_pos_now = ik_frame_position(arm)
                 target_now = seq.cartesian_target(arm)
-                done_err = np.linalg.norm(ee_pos_now - target_now)
+                cart_err = np.linalg.norm(ee_pos_now - target_now)
                 joint_err = np.linalg.norm(q - task.q_goal)
-                converged = (
-                    done_err < IK_CART_DONE_TOL
-                    or joint_err < IK_JOINT_DONE_TOL
+                cart_tol = (
+                    args.place_cart_done_tol
+                    if task.current_primitive == "place" else args.cart_done_tol
                 )
+                if task.current_primitive == "place":
+                    converged = (
+                        cart_err < cart_tol
+                        or joint_err < IK_JOINT_DONE_TOL
+                    )
+                else:
+                    converged = (cart_err < cart_tol) or (joint_err < IK_JOINT_DONE_TOL)
+                done_err = cart_err
                 done_label = "||ee-target||"
             else:
                 joint_err = np.linalg.norm(q - task.q_goal)
@@ -1009,16 +1223,23 @@ def main():
                     hold_gripper(arm, 0.0, cfg["sim"]["gripper_steps"])
                     print_grasp_debug(arm, "after close", task.current_block)
                     if args.kinematic_carry:
-                        ee = env.get_ee_pose(arm)[0].copy()
+                        ee = ik_frame_position(arm).copy()
                         block_pos = env.get_block_positions()[task.current_block].copy()
                         held_block[arm] = task.current_block
                         held_offset[arm] = block_pos - ee
                         carry_held_blocks()
                 elif grip == "open":
                     if args.kinematic_carry:
+                        # Match stephen/testing: keep the cube attached while
+                        # the fingers open, then snap onto the reserved stack
+                        # slot. This avoids a "teleport while still grasping"
+                        # artifact.
+                        hold_gripper(arm, 0.04, cfg["sim"]["gripper_steps"])
                         snap_held_block_to_stack(arm)
-                    held_block[arm] = None
-                    hold_gripper(arm, 0.04, cfg["sim"]["gripper_steps"])
+                        held_block[arm] = None
+                    else:
+                        hold_gripper(arm, 0.04, cfg["sim"]["gripper_steps"])
+                        held_block[arm] = None
                     if args.priority_policy == "fixed":
                         priority_arm = other_arm(arm)
                         if not args.no_modulation:

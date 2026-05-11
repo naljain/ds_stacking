@@ -10,11 +10,11 @@ deploy:
   max_steps: 30000
   done_tol: 0.05
   joint_done_tol: 0.05
+  place_cart_done_tol: 0.03
 
-  # Physical manipulation only:
-  # - false means do not attach cubes to the gripper in software
-  # - false means do not snap cubes to the stack target after opening
-  kinematic_carry: false
+  # Use kinematic carry while debugging dual-arm trajectories/modulation. Set
+  # this false only when tuning physical contact and grasp calibration.
+  kinematic_carry: true
 
   # Do not skip failed primitives by moving to the next phase.
   advance_on_timeout: false
@@ -32,19 +32,29 @@ deploy:
   no_modulation: false
   priority_arm: left
   priority_policy: fixed
-  priority_mod_weight: 0.25
-  yield_mod_weight: 1.0
-  mod_reactivity: 2.0
-  mod_isoline: 1.0
-  mod_max_pairs: 4
+  priority_mod_weight: 0.15
+  yield_mod_weight: 0.55
+  yield_mod_speed_scale: 0.65
+  mod_reactivity: 4.0
+  mod_isoline: 0.85
+  mod_max_pairs: 2
+  no_preserve_mod_speed: true
+  no_lateral_order_modulation: false
+  lateral_order_min_separation: 0.10
+  lateral_order_reactivity: 2.0
+  lateral_order_mod_weight: 1.0
+  lateral_order_lambda_floor: -0.75
+  stack_keepout_radius: 0.0
+  stack_keepout_wait_x: 0.28
   no_link_safety_hold: true
 
-  # Keep finished arms where they end; this avoids a post-task parking motion
-  # from bumping the stack while physical grasp/place is being debugged.
-  no_return_home_after_done: true
+  # Return finished arms to their calibrated defaults so they clear the shared
+  # stack for the other arm's remaining placements.
+  no_return_home_after_done: false
 
   # Visibility/runtime
   headless: false
+  show_proxy_spheres: true
   debug_ik: false
 
   # Optional offscreen recording. Set video=true for the default path, or set

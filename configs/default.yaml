@@ -43,13 +43,12 @@ arms:
   y:       0.0      # Y position of arm bases
   face_table_quat: [0.7071, 0.0, 0.0, 0.7071]   # 90° around Z
 
-  # Default joint poses in radians (raw values).
-  # Left arm: exact values from reference pose.
-  # Right arm: j0 and j1 mirrored (sign flipped); j2-j6 kept the same
-  #            until confirmed by testing.
-  #   j0       j1       j2        j3       j4      j5      j6
-  default_joints_left:  [ 1.93,  1.10, -1.8639, -2.6820,  1.0833,  1.9480, -0.1237]
-  default_joints_right: [-1.93, 1.10, 1.8639, -2.6820,  -1.0833,  1.9480, 0.1237]
+  # Default joint poses in radians: explicit copy of the Isaac Franka startup
+  # posture used before d933725, when the demos/checkpoints were collected.
+  # Keep both arms identical in their local joint coordinates.
+  #   j0       j1       j2       j3       j4      j5      j6
+  default_joints_left:  [0.0, -0.785398, 0.0, -2.356194, 0.0, 1.570796, 0.785398]
+  default_joints_right: [0.0, -0.785398, 0.0, -2.356194, 0.0, 1.570796, 0.785398]
 
 # ── Initial block layout ───────────────────────────────────────────────────────
 left_blocks:
@@ -113,6 +112,10 @@ coordination:
   modulation_reactivity: 2.0   # lower values make avoidance start earlier
   modulation_isoline:  1.0     # >1 expands the effective modulation boundary
   preserve_mod_speed:  true
+  lateral_order_min_separation: 0.08  # keep protected left/right points ordered in X
+  lateral_order_reactivity: 2.0
+  lateral_order_mod_weight: 1.0
+  lateral_order_lambda_floor: -0.75
   priority_policy:     fixed   # fixed or closest_to_stack
   priority_hysteresis: 0.04
   link_proxy_spheres:  3
