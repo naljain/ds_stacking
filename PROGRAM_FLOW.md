@@ -25,6 +25,9 @@ a clamped joint-space Lula controller.
 
 - `configs/default.yaml` defines scene geometry, block positions, primitive
   timing, training hyperparameters, and output paths.
+- `configs/deploy_single_neural_physical.yaml` and
+  `configs/deploy_neural_physical.yaml` provide current single/dual deploy
+  argument defaults.
 - `src/env.py` builds the Isaac Sim environment.
 - `src/primitives.py` defines the primitive order and Cartesian targets.
 - `src/franka_ik.py` wraps Lula IK for computing joint goals.
@@ -33,10 +36,11 @@ a clamped joint-space Lula controller.
   attractor labels are consistent before training.
 - `scripts/train_ds.py` trains a Neural DS for one learned primitive.
 - `scripts/train_all.sh` trains the `reach` and `transport` DS models.
-- `src/neural_ds.py` defines the DS and Lyapunov networks.
+- `src/neural_ds.py` defines the DS and quadratic Lyapunov helper.
 - `src/coordinator.py` manages primitive sequencing and stack slots.
 - `scripts/deploy_single_arm.py` deploys one arm.
-- `scripts/deploy_dual_arm.py` deploys both arms.
+- `scripts/deploy_dual_arm.py` deploys both arms with protected-point
+  modulation and optional safety guards.
 - `scripts/evaluate.py` runs perturbation experiments and metrics.
 
 ## 1. Configuration
@@ -286,11 +290,13 @@ bad finite-difference spike from dominating the velocity scale.
 
 Then it normalizes:
 
-- states by per-joint `state_std`
+- states by a uniform scalar `state_std` broadcast to all joints
 - velocities by per-joint `vel_scale`
 
 The checkpoint stores these normalization values because deployment must apply
-the same scaling before calling the network.
+the same scaling before calling the network. The uniform `state_std` is
+important because the current Lyapunov candidate is `V(e_n)=||e_n||^2`; with a
+single scale factor, decreasing `V` matches decreasing joint-space error.
 
 ## 6. How Data Is Partitioned Across DS Primitives
 
@@ -321,15 +327,18 @@ for demo_file in demo_paths:
             velocities.append(step["q_dot"])
 ```
 
-So `both_reach.pt` is trained only from timesteps labeled `reach`, and
-`both_transport.pt` is trained only from timesteps labeled `transport`.
+So `left_reach.pt` is trained only from left-arm timesteps labeled `reach`, and
+`right_transport.pt` is trained only from right-arm timesteps labeled
+`transport`.
 
 The primitive split is therefore:
 
 | Checkpoint | Training samples used |
 |---|---|
-| `both_reach.pt` | all `reach` timesteps |
-| `both_transport.pt` | all `transport` timesteps |
+| `left_reach.pt` | left-arm `reach` timesteps |
+| `left_transport.pt` | left-arm `transport` timesteps |
+| `right_reach.pt` | right-arm `reach` timesteps |
+| `right_transport.pt` | right-arm `transport` timesteps |
 
 This means each learned DS covers one of the longer free-space motions:
 
@@ -398,9 +407,9 @@ and saves:
 data/checkpoints/both_reach.pt
 ```
 
-The current `scripts/train_all.sh` uses `--arm both`, so the standard pipeline
-trains shared primitive models from the union of left-arm and right-arm
-demonstrations.
+`--arm both` is still supported for ablations, but it is not the standard
+pipeline. The current `scripts/train_all.sh` trains per-arm checkpoints because
+pooled left/right data can average mirrored joint-space flows.
 
 ### Checkpoint Data Manifest
 
@@ -425,14 +434,14 @@ python scripts/train_ds.py --primitive reach --arm left
 the checkpoint should explicitly say that `left_reach.pt` was trained only from
 `reach` timesteps in `data/demonstrations/left_demos.pkl`.
 
-When training:
+For an ablation with pooled data:
 
 ```bash
 python scripts/train_ds.py --primitive transport --arm both
 ```
 
-the checkpoint should explicitly say that `both_transport.pt` was trained only from
-`transport` timesteps pooled from:
+the checkpoint should explicitly say that `both_transport.pt` was trained only
+from `transport` timesteps pooled from:
 
 ```text
 data/demonstrations/left_demos.pkl
@@ -444,11 +453,10 @@ collection source produced that DS.
 
 ### What Is Not Partitioned
 
-There is no train/validation split in the current training script. All samples
-for the requested primitive and arm selection are used for training. The script
-does print post-training diagnostics on the same training set, such as
-imitation error and Lyapunov stability violation rate, but those are not held-out
-validation metrics.
+The current training script holds out the last about 10% of demos in each
+pickle as validation when a file has at least five demos. Checkpoints are saved
+by best validation imitation MSE. If there are too few demos for a validation
+split, the script falls back to best training total loss.
 
 There is also no block-specific DS. For example, all `reach` samples for all
 blocks are pooled together into the same `reach` dataset. The state is
@@ -459,10 +467,10 @@ joint-space error to the current primitive goal rather than the block identity.
 
 `src/neural_ds.py` defines the model.
 
-There are two learned components:
+There is one learned velocity component and one fixed Lyapunov component:
 
 - `NeuralDS`: maps normalized joint error to normalized joint velocity.
-- `LyapunovNet`: produces a positive-definite Lyapunov value around the goal.
+- `LyapunovNet`: parameterless quadratic `V(e_n)=||e_n||^2`.
 
 The trained policy is:
 
@@ -477,11 +485,11 @@ f(e_n) = residual_theta(e_n) - stable_skip_gain * e_n
 ```
 
 This is still part of the learned DS: the stabilizing term is inside the
-learned primitive model and is used during training. It is not the same as deployment
-`--goal_gain`, which adds an external controller after the network output and
-is only for diagnostics.
+learned primitive model and is used during training. The deploy scripts keep
+the external `DS_GOAL_GAIN` constant at `0.0`; change it in code only as a
+diagnostic fallback.
 
-One model is trained for each learned DS primitive. The standard training
+One model is trained for each learned DS primitive and arm. The standard training
 command is:
 
 ```bash
@@ -491,15 +499,19 @@ bash scripts/train_all.sh
 That runs:
 
 ```bash
-python scripts/train_ds.py --primitive reach --arm both
-python scripts/train_ds.py --primitive transport --arm both
+python scripts/train_ds.py --primitive reach --arm left
+python scripts/train_ds.py --primitive transport --arm left
+python scripts/train_ds.py --primitive reach --arm right
+python scripts/train_ds.py --primitive transport --arm right
 ```
 
 The output checkpoints are:
 
 ```text
-data/checkpoints/both_reach.pt
-data/checkpoints/both_transport.pt
+data/checkpoints/left_reach.pt
+data/checkpoints/left_transport.pt
+data/checkpoints/right_reach.pt
+data/checkpoints/right_transport.pt
 ```
 
 Each checkpoint contains:
@@ -557,7 +569,7 @@ the stack and blocking the remaining arm.
 Single-arm debug command:
 
 ```bash
-python scripts/deploy_single_arm.py --arm left --kinematic_carry --use_safe --ds_scale 1.0 --goal_gain 0.0 --done_tol 0.25 --cart_done_tol 0.02 --place_cart_done_tol 0.01 --print_every 25 --debug_ik --log_csv data/results/left_ds_lula_scripted.csv
+python scripts/deploy_single_arm.py --arm left --ckpt_arm left --deploy_config configs/deploy_single_neural_physical.yaml --kinematic_carry --print_every 25 --debug_ik --log_csv data/results/left_ds_lula_scripted.csv
 ```
 
 At startup, the script:
@@ -582,21 +594,19 @@ At every control step:
 3. Normalize the error using checkpoint statistics.
 4. For `reach` and `transport`, call the current primitive's DS model.
 5. Optionally apply Lyapunov safe projection with `--use_safe`.
-6. Optionally add linear goal attraction:
+6. Clip joint velocity.
+7. Integrate one timestep into the persistent command state:
 
    ```python
-   q_dot = q_dot - goal_gain * (q - q_goal)
+   q_cmd_state = q_cmd_state + q_dot * physics_dt
    ```
 
-7. Clip joint velocity.
-8. Integrate one timestep:
+8. Send `q_cmd_state` to Isaac's articulation controller.
+9. Step the simulation.
 
-   ```python
-   q_cmd = q + q_dot * physics_dt
-   ```
-
-9. Send `q_cmd` to Isaac's articulation controller.
-10. Step the simulation.
+The persistent command state is reset from the measured joints at primitive
+transitions, after gripper waits, and after scripted helper motions. This avoids
+the stall caused by repeatedly commanding only `q_measured + q_dot * dt`.
 
 For `grasp`, `lift`, and `place`, the script skips the network call and follows
 the primitive `q_goal` with the clamped Lula joint-space controller.
@@ -623,12 +633,8 @@ Use `--advance_on_timeout` only for debugging phase flow.
   effector until `place`. This isolates motion planning from contact physics.
 - `--use_safe`: project the learned velocity so it satisfies the Lyapunov
   decrease condition.
-- `--goal_gain`: add a direct linear attraction toward `q_goal`. Keep this at
-  `0.0` when evaluating the learned `reach`/`transport` DS.
 - `--ds_scale`: scale the learned DS output. Keep this at `1.0` when
-  evaluating the learned `reach`/`transport` DS. Use `--ds_scale 0
-  --goal_gain 3.0` only as a joint-attractor sanity check when isolating IK or
-  actuation.
+  evaluating the learned `reach`/`transport` DS.
 - `--cart_done_tol`: Cartesian completion tolerance for scripted IK
   primitives.
 - `--place_cart_done_tol`: tighter Cartesian completion tolerance before
@@ -653,23 +659,36 @@ Each arm has its own:
 - DS or scripted Lula velocity
 
 The coordinator reserves stack heights so both arms do not place blocks on the
-same layer. The right arm can also start after a small stagger from the config
-so both arms do not move symmetrically into the shared stack at the same time.
+same layer. Both arms start together by default
+(`coordination.start_stagger_steps: 0`); `--stagger_steps` is available only for
+ablation/debugging.
 
-Dual-arm deployment can use DS modulation from `src/modulation.py` to alter
-joint velocities when end-effectors get close. Because EE-only modulation does
-not protect elbows and forearms, deployment also samples arm link poses and
-holds one arm if the sampled link/link distance drops below
-`--link_safety_radius`. The hold releases after the distance clears
-`--link_safety_radius + --link_safety_hysteresis`.
+Dual-arm deployment uses DS modulation from `src/modulation.py` to alter joint
+velocities when protected points get close. Protected points are built from
+distal Lula FK frames and gripper proxy offsets. The closest point pairs are
+modulated with Huber-style obstacle modulation and mapped back through a damped
+Jacobian pseudoinverse.
+
+The dual-arm script also supports:
+
+- priority/yield modulation weights
+- optional closest-to-stack priority switching
+- lateral-order modulation to keep left/right arms on their own side
+- optional stack keepout for the non-priority arm
+- optional sampled-link hold via `--link_safety_hold`
 
 Important dual-arm flags:
 
-- `--mod_safe_radius`: end-effector modulation radius.
-- `--mod_reactivity`: end-effector modulation strength.
+- `--mod_safe_radius`: protected-point modulation radius.
+- `--mod_reactivity`: protected-point modulation strength.
+- `--priority_mod_weight`: modulation blend weight for the priority arm.
+- `--yield_mod_weight`: modulation blend weight for the yielding arm.
+- `--yield_mod_speed_scale`: extra speed scale for the yielding arm.
+- `--no_lateral_order_modulation`: disables side-order preservation.
 - `--link_safety_radius`: sampled-link hold threshold.
 - `--link_safety_hysteresis`: release margin for sampled-link hold.
-- `--no_link_safety_hold`: disables the sampled-link hold for ablation.
+- `--link_safety_hold`: enables the sampled-link hold.
+- `--no_link_safety_hold`: disables the sampled-link hold.
 - `--no_return_home_after_done`: leaves completed arms where they finish.
 
 ## 11. Evaluation
@@ -720,16 +739,10 @@ The recommended debugging order is:
 1. Run the hybrid controller with `--debug_ik --print_every 25`.
 2. Check whether `reach` converges before timeout.
 3. Check `cos->goal`.
-4. If it fails, run pure attractor mode only as a diagnostic:
-
-   ```bash
-   python scripts/deploy_single_arm.py --arm left --kinematic_carry --ds_scale 0 --goal_gain 3.0 --done_tol 0.25 --print_every 25 --debug_ik
-   ```
-
-5. If pure attractor works, IK and actuation are likely fine, and the learned DS
-   needs tuning or retraining.
-6. If pure attractor fails, investigate IK goals, asset setup, joint limits, or
-   Isaac articulation control.
+4. If the DS points toward the goal but stalls, inspect command tracking and the
+   integrated command state.
+5. If the IK primitives fail too, investigate IK goals, asset setup, joint
+   limits, or Isaac articulation control.
 
 ## 13. Typical End-to-End Commands
 
@@ -755,25 +768,26 @@ bash scripts/train_all.sh
 Run single-arm DS + Lula deployment:
 
 ```bash
-python scripts/deploy_single_arm.py --arm left --kinematic_carry --use_safe --ds_scale 1.0 --goal_gain 0.0 --done_tol 0.25 --cart_done_tol 0.02 --place_cart_done_tol 0.01 --print_every 25 --debug_ik --log_csv data/results/left_ds_lula_scripted.csv
+python scripts/deploy_single_arm.py --arm left --ckpt_arm left --deploy_config configs/deploy_single_neural_physical.yaml --kinematic_carry --print_every 25 --debug_ik --log_csv data/results/left_ds_lula_scripted.csv
 ```
 
 Run left-only deployment after left-only retraining:
 
 ```bash
-python scripts/deploy_single_arm.py --arm left --ckpt_arm left --kinematic_carry --use_safe --ds_scale 1.0 --goal_gain 0.0 --done_tol 0.25 --cart_done_tol 0.02 --place_cart_done_tol 0.01 --print_every 25 --debug_ik --log_csv data/results/left_ds_lula_scripted.csv
+python scripts/deploy_single_arm.py --arm left --ckpt_arm left --deploy_config configs/deploy_single_neural_physical.yaml --kinematic_carry --print_every 25 --debug_ik --log_csv data/results/left_ds_lula_scripted.csv
 ```
 
 Run dual-arm deployment:
 
 ```bash
-python scripts/deploy_dual_arm.py --kinematic_carry --use_safe --ds_scale 1.0 --goal_gain 0.0 --done_tol 0.25 --cart_done_tol 0.02 --place_cart_done_tol 0.01 --mod_safe_radius 0.25 --mod_reactivity 2.0 --link_safety_radius 0.20
+python scripts/deploy_dual_arm.py --deploy_config configs/deploy_neural_physical.yaml
 ```
 
 Plot learned DS fields:
 
 ```bash
-python scripts/plot_ds.py --all --ckpt_arm both --use_safe --joints 0 1 --out_dir data/results/ds_plots
+python scripts/plot_ds.py --all --ckpt_arm left --use_safe --joints 0 1 --out_dir data/results/ds_plots/left
+python scripts/plot_ds.py --all --ckpt_arm right --use_safe --joints 0 1 --out_dir data/results/ds_plots/right
 ```
 
 For each checkpoint, this writes:
@@ -783,12 +797,12 @@ For each checkpoint, this writes:
 - `03_lyapunov.png`
 - `04_rollouts.png`
 
-Use `--ckpt_arm left` after left-only retraining. Use different `--joints a b`
-pairs to inspect different 2D slices through the 7D error-space DS.
+Use different `--joints a b` pairs to inspect different 2D slices through the
+7D error-space DS.
 
-Diagnostic commands such as `--ds_scale 0`, `--ds_scale 0.2`, or
-`--goal_gain > 0` are useful for isolating IK, actuation, or data issues. They
-are not the learned `reach`/`transport` DS setting.
+Diagnostic commands such as `--ds_scale 0` or `--ds_scale 0.2` are useful for
+isolating DS contribution. They are not the learned `reach`/`transport` DS
+setting.
 
 ## 14. Mental Model
 

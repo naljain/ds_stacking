@@ -48,8 +48,9 @@ The system is organized as a hybrid manipulation pipeline:
   attractors `q_goal`.
 - Learned Neural DS controllers for `reach` and `transport`.
 - Scripted Lula joint-space controller for `grasp`, `lift`, and `place`.
-- Dual-arm deployment layer with end-effector modulation, optional sampled-link
-  safety, staggered starts, kinematic-carry debugging, and return-home parking.
+- Dual-arm deployment layer with protected-point modulation, optional
+  sampled-link safety, priority/yield behavior near the shared stack,
+  kinematic-carry debugging, and return-home parking.
 
 ### Arm Setup
 
@@ -131,12 +132,12 @@ f(0) = 0
 The stable skip term provides a linear convergent prior, while the residual
 learns the demonstrated nonlinear correction.
 
-### Lyapunov Network
+### Lyapunov Function
 
-A separate Lyapunov network learns a positive-definite scalar candidate:
+The current Lyapunov candidate is a fixed quadratic:
 
 ```text
-V(e) = ||g_phi(e) - g_phi(0)||^2 + epsilon ||e||^2
+V(e_n) = ||e_n||^2
 ```
 
 Training combines imitation loss with a stability hinge loss:
@@ -149,19 +150,24 @@ L = ||f_theta(e) - q_dot_demo||^2
 At deployment, an optional safe projection can project the learned velocity
 onto the half-space that satisfies Lyapunov decrease.
 
+This replaced an earlier learned Lyapunov feature network. The current training
+uses a uniform state normalization scale across joints so decreasing `V`
+corresponds to decreasing unnormalized joint-space error.
+
 ### Modulation Design
 
-Dual-arm collision avoidance uses end-effector DS modulation based on the
-Huber, Billard, and Slotine obstacle modulation framework. The other arm's
-end-effector is treated as a moving spherical obstacle. The nominal Cartesian
-end-effector velocity is modulated by a state-dependent matrix and then mapped
-back into joint space through a damped Jacobian pseudoinverse.
+Dual-arm collision avoidance uses Huber, Billard, and Slotine obstacle
+modulation. The current implementation uses protected points rather than only
+the end effector: distal arm frames and gripper proxy offsets define point
+sets, the closest point pairs are modulated, and the Cartesian correction is
+mapped back into joint space through a damped Jacobian pseudoinverse.
 
 In practice, modulation was useful for high-level reactive avoidance, but it
 was not sufficient to solve all dual-arm conflicts. End-effector-only
-modulation does not account for elbow or forearm collisions, and symmetric
-modulation can produce stalemates near the shared stack. This became one of the
-main lessons of the project.
+modulation did not account for wrists, gripper bodies, elbows, or forearms, so
+the code now includes protected-point modulation, lateral-order modulation, and
+optional sampled-link holds. Priority/yield weights and stack keepout options
+are available for difficult shared-stack cases.
 
 ### Deployment Design
 
@@ -178,9 +184,10 @@ For each primitive:
 6. The stack slot is reserved before transport/place so both arms do not target
    the same height.
 
-Dual-arm deployment also supports staggered starts. In later experiments,
-staggering was a more reliable coordination strategy than trying to resolve all
-shared-stack conflicts through continuous modulation alone.
+Dual-arm deployment starts both arms together by default. A start stagger is
+still available as an ablation/debug flag, but the current default relies on
+per-arm checkpoints, protected-point modulation, priority/yield behavior, and
+return-home parking.
 
 ### Task Coordinator
 
@@ -267,7 +274,8 @@ The evaluation cases should include:
 - nominal single-arm deployment,
 - nominal dual-arm deployment,
 - dual-arm deployment with modulation disabled,
-- dual-arm deployment with staggered starts,
+- dual-arm deployment with protected-point modulation,
+- dual-arm deployment with optional start stagger,
 - block position jitter,
 - perturbations to block positions,
 - timing mismatch between arms.
@@ -284,8 +292,8 @@ src/
   env.py             Isaac Sim environment
   primitives.py      primitive definitions and targets
   franka_ik.py       Lula IK wrapper
-  neural_ds.py       Neural DS and Lyapunov networks
-  modulation.py      Huber-style DS modulation
+  neural_ds.py       Neural DS and quadratic Lyapunov helper
+  modulation.py      Huber-style protected-point DS modulation
   coordinator.py     task sequencing and stack-slot reservation
   perturbations.py   evaluation perturbations
 
@@ -308,7 +316,7 @@ The pipeline is:
 4. Train Neural DS models for `reach` and `transport`.
 5. Plot vector fields, Lyapunov landscapes, and rollouts.
 6. Deploy a single arm.
-7. Deploy two arms with staggered coordination and modulation.
+7. Deploy two arms with protected-point modulation and return-home parking.
 8. Evaluate task success and safety metrics.
 
 The README documents the current commands, file layout, and training/deployment
@@ -332,9 +340,9 @@ robot has redundant configurations.
 Modulation was also more complicated than expected. End-effector modulation can
 help avoid direct gripper conflicts, but it does not fully solve whole-arm
 collision avoidance. Applying modulation symmetrically to both arms can create
-stalemates near the stack. For this task, staggered coordination and simple
-task-level scheduling were often more reliable than relying only on continuous
-modulation.
+stalemates near the stack. The current code therefore uses protected points,
+lateral-order modulation, priority/yield weighting, and optional sampled-link
+holds rather than relying only on the raw end-effector modulation.
 
 What worked well:
 
@@ -361,4 +369,3 @@ Future work:
 - Explore Cartesian or task-space DS formulations with better null-space
   handling.
 - Add held-out evaluation sets and more systematic perturbation trials.
-
