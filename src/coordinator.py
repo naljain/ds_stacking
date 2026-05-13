@@ -101,6 +101,10 @@ class TaskSequencer:
             lift_h =self.cfg["heights"]["lift"],
             grasp_h=self.cfg["heights"]["grasp"],
         )
+        if task.current_primitive in ("reach", "grasp"):
+            offset = self.cfg.get("block", {}).get("grasp_xy_offset", {})
+            offset = np.asarray(offset.get(arm, [0.0, 0.0]), dtype=float)
+            target[:2] += offset
         if task.current_primitive == "transport":
             target[2] = max(target[2], self.stack_clearance_z_for_task(task))
         return target

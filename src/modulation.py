@@ -86,16 +86,23 @@ class HuberModulation:
     """
 
     def __init__(self, safe_radius=0.15, reactivity=2.0,
-                 tail_effect=True, eta_min=0.05):
+                 tail_effect=True, eta_min=0.05, preserve_speed=True,
+                 isoline=1.0, max_pairs=4):
         self.safe_radius = safe_radius
         self.reactivity  = reactivity
         self.tail_effect = tail_effect
         self.eta_min     = eta_min
+        self.preserve_speed = preserve_speed
+        self.isoline = max(float(isoline), 1e-6)
+        self.max_pairs = None if max_pairs is None else max(1, int(max_pairs))
 
     # ── Level-set Γ and reference direction ────────────────────────────────
     def gamma(self, x, x_obs):
         d = np.linalg.norm(x - x_obs)
         return (d / self.safe_radius) ** self.reactivity
+
+    def gamma_eff(self, x, x_obs):
+        return self.gamma(x, x_obs) / self.isoline
 
     def reference_direction(self, x, x_obs):
         diff = x - x_obs
@@ -104,13 +111,46 @@ class HuberModulation:
     # ── Construct E(x), the basis aligned with reference direction ─────────
     def _build_basis(self, r):
         """Return a 3x3 orthonormal matrix whose first column is r."""
-        # Use SVD of (I - r r^T) to get an orthonormal complement
-        P = np.eye(3) - np.outer(r, r)
-        U, _, _ = np.linalg.svd(P)
-        # First two columns of U span the tangent plane to r
-        t1 = U[:, 0]
-        t2 = U[:, 1]
+        r = r / (np.linalg.norm(r) + 1e-12)
+        helper = np.array([1.0, 0.0, 0.0])
+        if abs(np.dot(helper, r)) > 0.9:
+            helper = np.array([0.0, 1.0, 0.0])
+        t1 = helper - np.dot(helper, r) * r
+        t1 = t1 / (np.linalg.norm(t1) + 1e-12)
+        t2 = np.cross(r, t1)
+        t2 = t2 / (np.linalg.norm(t2) + 1e-12)
         return np.column_stack([r, t1, t2])
+
+    def _eigenvalues(self, gamma, r, v_nom=None):
+        if gamma > 1.0:
+            lambda_r = 1.0 - 1.0 / gamma
+            lambda_t = 1.0 + 1.0 / gamma
+        else:
+            lambda_r = self.eta_min
+            lambda_t = 2.0
+
+        tail_active = False
+        if self.tail_effect and v_nom is not None and np.dot(v_nom, r) >= 0.0:
+            lambda_r = 1.0
+            tail_active = True
+
+        return lambda_r, lambda_t, tail_active
+
+    def components(self, x, x_obs, v_nom=None):
+        gamma = self.gamma(x, x_obs)
+        gamma_eff = gamma / self.isoline
+        r = self.reference_direction(x, x_obs)
+        lambda_r, lambda_t, tail_active = self._eigenvalues(gamma_eff, r, v_nom)
+        return {
+            "gamma": float(gamma),
+            "gamma_eff": float(gamma_eff),
+            "isoline": float(self.isoline),
+            "reference_direction": r,
+            "lambda_r": float(lambda_r),
+            "lambda_t": float(lambda_t),
+            "tail_active": bool(tail_active),
+            "preserve_speed": bool(self.preserve_speed),
+        }
 
     # ── Modulation matrix M(x) = E D E^T ────────────────────────────────────
     def modulation_matrix(self, x, x_obs, v_nom=None):
@@ -119,28 +159,14 @@ class HuberModulation:
         If v_nom is provided and tail_effect is enabled, suppress radial
         damping when the velocity already points outward.
         """
-        Γ = self.gamma(x, x_obs)
+        Γ = self.gamma_eff(x, x_obs)
         # Far away → no modulation
-        if Γ > 50.0:
+        if Γ > 100.0:
             return np.eye(3)
 
         r = self.reference_direction(x, x_obs)
         E = self._build_basis(r)
-
-        # Default Huber eigenvalues
-        if Γ >= 1.0:
-            λ_r = 1.0 - 1.0 / Γ
-            λ_t = 1.0 + 1.0 / Γ
-        else:
-            # Inside the safety sphere — push out, but clamp for numerics
-            λ_r = self.eta_min
-            λ_t = 2.0  # full tangential boost
-
-        # Tail effect: if v_nom is already heading outward (positive component
-        # along r), no need to damp the radial component
-        if self.tail_effect and v_nom is not None:
-            if np.dot(v_nom, r) >= 0.0:
-                λ_r = 1.0
+        λ_r, λ_t, _ = self._eigenvalues(Γ, r, v_nom)
 
         D = np.diag([λ_r, λ_t, λ_t])
         return E @ D @ E.T
@@ -148,7 +174,57 @@ class HuberModulation:
     # ── Apply modulation to a Cartesian velocity ───────────────────────────
     def modulate_cartesian(self, v_cart, ee_self, ee_other):
         M = self.modulation_matrix(ee_self, ee_other, v_nom=v_cart)
-        return M @ v_cart
+        v_mod = M @ v_cart
+        if self.preserve_speed:
+            nom_norm = np.linalg.norm(v_cart)
+            mod_norm = np.linalg.norm(v_mod)
+            if nom_norm > 1e-9 and mod_norm > 1e-9:
+                v_mod = v_mod * (nom_norm / mod_norm)
+        return v_mod
+
+    def modulate_cartesian_points(self, v_cart, self_points, obstacle_points,
+                                  max_pairs=None):
+        """Apply sequential modulation from the closest protected point pairs."""
+        self_points = np.asarray(self_points, dtype=float).reshape(-1, 3)
+        obstacle_points = np.asarray(obstacle_points, dtype=float).reshape(-1, 3)
+        if len(self_points) == 0 or len(obstacle_points) == 0:
+            return v_cart
+
+        pairs = []
+        for i, p_self in enumerate(self_points):
+            for j, p_obs in enumerate(obstacle_points):
+                pairs.append((self.gamma_eff(p_self, p_obs), i, j))
+        pairs.sort(key=lambda item: item[0])
+
+        pair_limit = self.max_pairs if max_pairs is None else max_pairs
+        active_pairs = pairs if pair_limit is None else pairs[:max(1, int(pair_limit))]
+        v_mod = np.asarray(v_cart, dtype=float).copy()
+        for _, i, j in active_pairs:
+            v_mod = self.modulate_cartesian(v_mod, self_points[i], obstacle_points[j])
+        return v_mod
+
+    def closest_components(self, self_points, obstacle_points, v_nom=None):
+        """Diagnostics for the closest protected sphere pair."""
+        self_points = np.asarray(self_points, dtype=float).reshape(-1, 3)
+        obstacle_points = np.asarray(obstacle_points, dtype=float).reshape(-1, 3)
+        best = None
+        for i, p_self in enumerate(self_points):
+            for j, p_obs in enumerate(obstacle_points):
+                gamma_eff = self.gamma_eff(p_self, p_obs)
+                if best is None or gamma_eff < best[0]:
+                    best = (gamma_eff, i, j, p_self, p_obs)
+        if best is None:
+            return None
+        _, i, j, p_self, p_obs = best
+        comp = self.components(p_self, p_obs, v_nom=v_nom)
+        comp.update({
+            "self_point_index": int(i),
+            "obstacle_point_index": int(j),
+            "self_point": p_self,
+            "obstacle_point": p_obs,
+            "distance": float(np.linalg.norm(p_self - p_obs)),
+        })
+        return comp
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -158,12 +234,16 @@ class InterArmModulation:
     """Compose Huber modulation with a Jacobian projection to act on q̇."""
 
     def __init__(self, safe_radius=0.15, reactivity=2.0,
-                 tail_effect=True, eta_min=0.05, jac_damping=0.05):
+                 tail_effect=True, eta_min=0.05, jac_damping=0.05,
+                 preserve_speed=True, isoline=1.0, max_pairs=4):
         self.huber = HuberModulation(
             safe_radius=safe_radius,
             reactivity=reactivity,
             tail_effect=tail_effect,
             eta_min=eta_min,
+            preserve_speed=preserve_speed,
+            isoline=isoline,
+            max_pairs=max_pairs,
         )
         self.jac_damping = jac_damping
 
@@ -191,6 +271,88 @@ class InterArmModulation:
 
         return q_dot_nominal + J_pinv @ Δv
 
+    def modulate_joint_velocity_points(self, q_dot_nominal,
+                                       self_points, obstacle_points,
+                                       jacobian):
+        """Joint-space wrapper for EE plus wrist/gripper proxy spheres."""
+        J_trans = jacobian[:3, :]
+        v_nom = J_trans @ q_dot_nominal
+        v_mod = self.huber.modulate_cartesian_points(
+            v_nom, self_points, obstacle_points
+        )
+        delta_v = v_mod - v_nom
+
+        JJt = J_trans @ J_trans.T
+        damp = (self.jac_damping ** 2) * np.eye(JJt.shape[0])
+        J_pinv = J_trans.T @ np.linalg.inv(JJt + damp)
+
+        return q_dot_nominal + J_pinv @ delta_v
+
+    def modulate_joint_velocity_lateral_order(self, q_dot_nominal,
+                                              self_points, obstacle_points,
+                                              jacobian, side_axis,
+                                              min_separation=0.08,
+                                              reactivity=None,
+                                              lambda_floor=-0.75):
+        """Modulate qdot to preserve a left/right ordering between arms.
+
+        The normal obstacle modulation above keeps points away from each other
+        radially, but in the shared-stack geometry it can route one arm over or
+        through the other.  This adds a virtual separating plane: for the left
+        arm, protected points should remain to the left of the right arm; for
+        the right arm, they should remain to the right of the left arm.
+
+        `side_axis` points from the other arm toward the safe side of this arm,
+        e.g. [-1, 0, 0] for the left arm and [1, 0, 0] for the right arm.
+        """
+        self_points = np.asarray(self_points, dtype=float).reshape(-1, 3)
+        obstacle_points = np.asarray(obstacle_points, dtype=float).reshape(-1, 3)
+        if len(self_points) == 0 or len(obstacle_points) == 0:
+            return q_dot_nominal
+
+        side_axis = np.asarray(side_axis, dtype=float)
+        side_axis = side_axis / (np.linalg.norm(side_axis) + 1e-12)
+        min_separation = max(float(min_separation), 1e-6)
+        p = self.huber.reactivity if reactivity is None else float(reactivity)
+
+        # Most critical pair: smallest signed distance to the separating plane.
+        separation = float("inf")
+        for p_self in self_points:
+            for p_obs in obstacle_points:
+                sep = float(np.dot(p_self - p_obs, side_axis))
+                if sep < separation:
+                    separation = sep
+
+        # Far from the virtual plane, the modulation is identity.
+        gamma = (max(separation, 1e-6) / min_separation) ** p
+        if gamma > 100.0:
+            return q_dot_nominal
+
+        J_trans = jacobian[:3, :]
+        v_nom = J_trans @ q_dot_nominal
+        v_side = float(np.dot(v_nom, side_axis))
+
+        # Tail effect: outward motion is safe and should not be disturbed.
+        if v_side >= 0.0:
+            return q_dot_nominal
+
+        if gamma > 1.0:
+            lambda_side = 1.0 - 1.0 / gamma
+        else:
+            # Inside the separating margin, allow a bounded negative eigenvalue
+            # so inward velocity is reflected back toward the arm's own side.
+            lambda_side = max(float(lambda_floor), 1.0 - 1.0 / max(gamma, 1e-6))
+
+        v_normal = v_side * side_axis
+        v_tangent = v_nom - v_normal
+        v_mod = v_tangent + lambda_side * v_normal
+        delta_v = v_mod - v_nom
+
+        JJt = J_trans @ J_trans.T
+        damp = (self.jac_damping ** 2) * np.eye(JJt.shape[0])
+        J_pinv = J_trans.T @ np.linalg.inv(JJt + damp)
+        return q_dot_nominal + J_pinv @ delta_v
+
     # ── Diagnostics: useful for the writeup ────────────────────────────────
     def diagnostics(self, q_dot_nominal, ee_pos_self, ee_pos_other, jacobian):
         """Return scalar quantities for plotting/logging:
@@ -204,8 +366,14 @@ class InterArmModulation:
         v_nom   = J_trans @ q_dot_nominal
         v_mod   = self.huber.modulate_cartesian(v_nom, ee_pos_self, ee_pos_other)
         r       = self.huber.reference_direction(ee_pos_self, ee_pos_other)
+        comp = self.huber.components(ee_pos_self, ee_pos_other, v_nom=v_nom)
         return {
-            "gamma":           self.huber.gamma(ee_pos_self, ee_pos_other),
+            "gamma":           comp["gamma"],
+            "gamma_eff":       comp["gamma_eff"],
+            "isoline":         comp["isoline"],
+            "lambda_r":        comp["lambda_r"],
+            "lambda_t":        comp["lambda_t"],
+            "tail_active":     comp["tail_active"],
             "v_cart_norm_nom": float(np.linalg.norm(v_nom)),
             "v_cart_norm_mod": float(np.linalg.norm(v_mod)),
             "radial_dot_nom":  float(np.dot(v_nom, r)),

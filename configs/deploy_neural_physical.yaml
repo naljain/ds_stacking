@@ -1,0 +1,67 @@
+deploy:
+  config: configs/default.yaml
+
+  # Checkpoint selection
+  ckpt_arm: per_arm
+
+  # Neural DS inference
+  use_safe: true
+  ds_scale: 1.0
+  max_steps: 30000
+  done_tol: 0.05
+  joint_done_tol: 0.05
+  place_cart_done_tol: 0.03
+
+  # Use kinematic carry while debugging dual-arm trajectories/modulation. Set
+  # this false only when tuning physical contact and grasp calibration.
+  kinematic_carry: true
+
+  # Do not skip failed primitives by moving to the next phase.
+  advance_on_timeout: false
+
+  # Physical pickup path:
+  # - reach is a deterministic pre-pick hover directly over the cube
+  # - grasp then descends vertically from that pre-pick pose
+  # - transport remains the learned neural DS
+  ik_primitives: reach,grasp,lift,place
+  ik_goal_gain: 3.0
+  grasp_z_offset: 0.0
+  gripper_steps: 120
+
+  # Use the stephen/testing-style weighted protected-point modulation.
+  no_modulation: false
+  priority_arm: left
+  priority_policy: fixed
+  priority_mod_weight: 0.15
+  yield_mod_weight: 0.55
+  yield_mod_speed_scale: 0.65
+  mod_reactivity: 4.0
+  mod_isoline: 0.85
+  mod_max_pairs: 2
+  no_preserve_mod_speed: true
+  no_lateral_order_modulation: false
+  lateral_order_min_separation: 0.10
+  lateral_order_reactivity: 2.0
+  lateral_order_mod_weight: 1.0
+  lateral_order_lambda_floor: -0.75
+  stack_keepout_radius: 0.0
+  stack_keepout_wait_x: 0.28
+  no_link_safety_hold: true
+
+  # Return finished arms to their calibrated defaults so they clear the shared
+  # stack for the other arm's remaining placements.
+  no_return_home_after_done: false
+
+  # Visibility/runtime
+  headless: false
+  show_proxy_spheres: true
+  debug_ik: false
+
+  # Optional offscreen recording. Set video=true for the default path, or set
+  # gif_out explicitly.
+  video: false
+  video_dir: data/results
+  gif_out: ""
+  gif_fps: 20
+  gif_stride: 4
+  gif_size: 640x480

@@ -128,3 +128,50 @@ class FrankaIK:
         raise RuntimeError(
             "Unsupported Lula FK return type from compute_forward_kinematics"
         )
+
+    def get_frame_world_pose(self, frame_name, q=None):
+        """Return a named Lula frame pose in world coordinates.
+
+        Used by the dual-arm modulation layer to build protected proxy points
+        on distal links such as panda_link5, panda_link6, panda_link7, and the
+        right_gripper frame.
+        """
+        if q is None:
+            q = self.franka.get_joint_positions()[:7]
+
+        base_pos, base_rot = self.franka.get_world_pose()
+        self.solver.set_robot_base_pose(base_pos, base_rot)
+
+        try:
+            pose = self.solver.compute_forward_kinematics(
+                frame_name=frame_name,
+                joint_positions=q,
+            )
+        except TypeError:
+            pose = self.solver.compute_forward_kinematics(frame_name, q)
+
+        if isinstance(pose, tuple):
+            pos = np.asarray(pose[0], dtype=float).copy()
+            rot = pose[1] if len(pose) > 1 else None
+        elif hasattr(pose, "p"):
+            pos = np.asarray(pose.p, dtype=float).copy()
+            rot = getattr(pose, "R", None)
+        elif hasattr(pose, "translation"):
+            pos = np.asarray(pose.translation, dtype=float).copy()
+            rot = getattr(pose, "rotation", None)
+        else:
+            raise RuntimeError(
+                "Unsupported Lula FK return type from compute_forward_kinematics"
+            )
+
+        quat_wxyz = None
+        if rot is not None:
+            try:
+                from scipy.spatial.transform import Rotation
+                quat_xyzw = Rotation.from_matrix(rot).as_quat()
+                quat_wxyz = np.array([
+                    quat_xyzw[3], quat_xyzw[0], quat_xyzw[1], quat_xyzw[2]
+                ])
+            except Exception:
+                quat_wxyz = None
+        return pos, quat_wxyz

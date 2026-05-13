@@ -15,10 +15,11 @@ this module — the imports below depend on it being live.
 import numpy as np
 import yaml
 from pathlib import Path
-from pxr import Gf, UsdGeom, UsdLux
+from pxr import Gf, UsdGeom, UsdLux, UsdPhysics, UsdShade
 
 from isaacsim.core.api import World
 from isaacsim.core.api.objects import FixedCuboid, DynamicCuboid
+from isaacsim.core.api.materials.physics_material import PhysicsMaterial
 from isaacsim.robot.manipulators.examples.franka import Franka
 
 
@@ -39,6 +40,9 @@ class DualArmEnv:
         self.blocks     = {}  # block_name -> DynamicCuboid object
         self.block_init = {}  # block_name -> initial position (np.array)
         self.goals      = {}  # arm_name -> (x, y) goal location
+        self._default_joints = {}
+        self._block_physics_material = None
+        self._gripper_physics_material = None
 
         self._build_lighting()
         self._build_camera()
@@ -47,14 +51,24 @@ class DualArmEnv:
         self._build_arms()
         self._build_blocks()
         self._build_goal_markers()
+        self._apply_gripper_physics_material()
 
         self.world.reset()
+        self._apply_default_joints(settle_steps=30)
         self._configure_viewport_camera()
 
     # ── Loading ───────────────────────────────────────────────────────────────
     @staticmethod
     def _load_config(path):
-        with open(path, "r") as f:
+        p = Path(path)
+        if not p.is_absolute() and not p.exists():
+            # Allow running from subdirectories (e.g. cwd=scripts/) by resolving
+            # relative paths against the repository root (parent of src/).
+            repo_root = Path(__file__).resolve().parent.parent
+            candidate = repo_root / p
+            if candidate.exists():
+                p = candidate
+        with open(p, "r") as f:
             return yaml.safe_load(f)
 
     # ── Scene construction ────────────────────────────────────────────────────
@@ -74,11 +88,6 @@ class DualArmEnv:
         camera = UsdGeom.Camera.Define(stage, "/World/Camera")
         camera.CreateFocalLengthAttr(24.0)
         camera.CreateClippingRangeAttr(Gf.Vec2f(0.01, 1000.0))
-        xform = UsdGeom.Xformable(camera.GetPrim())
-        # Head-on table-side view: camera is across the table looking back at
-        # the arms, so the shared stack and both grippers stay visible.
-        xform.AddTranslateOp().Set(Gf.Vec3d(0.0, 1.65, 1.45))
-        xform.AddRotateXYZOp().Set(Gf.Vec3f(62.0, 0.0, 180.0))
         stage.SetDefaultPrim(stage.GetPrimAtPath("/World"))
 
     def _configure_viewport_camera(self):
@@ -92,12 +101,29 @@ class DualArmEnv:
             from isaacsim.core.utils.viewports import set_camera_view
             from omni.kit.viewport.utility import get_active_viewport
 
+            camera_cfg = self.cfg.get("sim", {}).get("camera", {})
+            eye = np.array(camera_cfg.get("eye", [0.0, 2.25, 1.45]), dtype=float)
+            target = np.array(camera_cfg.get("target", [0.0, 0.25, 0.80]), dtype=float)
+
+            try:
+                set_camera_view(
+                    eye=eye,
+                    target=target,
+                    camera_prim_path="/World/Camera",
+                )
+            except TypeError:
+                set_camera_view(
+                    eye=eye.tolist(),
+                    target=target.tolist(),
+                    camera_prim_path="/World/Camera",
+                )
+
             viewport = get_active_viewport()
             if viewport is None:
                 return
             set_camera_view(
-                eye=np.array([0.0, 1.65, 1.45]),
-                target=np.array([0.0, 0.05, 0.82]),
+                eye=eye,
+                target=target,
                 camera_prim_path="/OmniverseKit_Persp",
                 viewport_api=viewport,
             )
@@ -193,11 +219,36 @@ class DualArmEnv:
                     ) from exc
                 raise
             self.frankas[name] = franka
+            self._default_joints[name] = np.array(a[f"default_joints_{name}"],
+                                                  dtype=float)
 
             # Goal location for this arm
             self.goals[name] = tuple(self.cfg["goals"][name])
 
+    def _apply_default_joints(self, settle_steps=30, render=False):
+        """Reset active arms to the configured trained-home joint posture."""
+        for name, franka in self.frankas.items():
+            q = self._default_joints[name]
+            full = franka.get_joint_positions().copy()
+            full[:7] = q
+            franka.set_joint_positions(full)
+            franka.set_joint_velocities(np.zeros_like(full))
+        for _ in range(settle_steps):
+            self.world.step(render=render)
+
+    def reset_arms(self, settle_steps=60, render=False):
+        """Reset all active arms to their configured default posture."""
+        self._apply_default_joints(settle_steps=settle_steps, render=render)
+
     def _build_blocks(self):
+        block_cfg = self.cfg["block"]
+        self._block_physics_material = PhysicsMaterial(
+            prim_path="/World/PhysicsMaterials/high_friction_blocks",
+            name="high_friction_blocks",
+            static_friction=block_cfg.get("static_friction", 2.0),
+            dynamic_friction=block_cfg.get("dynamic_friction", 1.5),
+            restitution=block_cfg.get("restitution", 0.0),
+        )
         for arm in self.arms_active:
             block_list = self.cfg[f"{arm}_blocks"]
             for b in block_list:
@@ -209,9 +260,73 @@ class DualArmEnv:
                     scale=np.array([self.cfg["block"]["size"]] * 3),
                     color=np.array(b["color"]),
                     mass=self.cfg["block"]["mass"],
+                    physics_material=self._block_physics_material,
                 ))
                 self.blocks[b["name"]]     = obj
                 self.block_init[b["name"]] = pos.copy()
+
+    def _apply_gripper_physics_material(self):
+        """Bind high-friction physics material to Franka finger collision prims.
+
+        Pinch lifting depends on friction at both sides of the contact. Setting
+        the cube material alone is not enough if the referenced Franka USD keeps
+        default low-friction finger collision meshes.
+        """
+        grip_cfg = self.cfg.get("gripper", {})
+        if not grip_cfg.get("high_friction_fingers", True):
+            return
+
+        self._gripper_physics_material = PhysicsMaterial(
+            prim_path="/World/PhysicsMaterials/high_friction_gripper",
+            name="high_friction_gripper",
+            static_friction=grip_cfg.get("static_friction", 2.5),
+            dynamic_friction=grip_cfg.get("dynamic_friction", 2.0),
+            restitution=grip_cfg.get("restitution", 0.0),
+        )
+
+        stage = self.world.stage
+        bound = 0
+        candidates = []
+        for arm in self.arms_active:
+            root = f"/World/Franka_{arm}"
+            for prim in stage.Traverse():
+                path = str(prim.GetPath())
+                lower = path.lower()
+                if not path.startswith(root):
+                    continue
+                if "finger" not in lower:
+                    continue
+                candidates.append((path, prim.GetTypeName()))
+                is_finger_body = (
+                    "panda_leftfinger" in lower
+                    or "panda_rightfinger" in lower
+                )
+                is_finger_joint = prim.IsA(UsdPhysics.Joint)
+                if is_finger_joint:
+                    continue
+                if not (
+                    prim.HasAPI(UsdPhysics.CollisionAPI)
+                    or prim.IsA(UsdGeom.Boundable)
+                    or is_finger_body
+                ):
+                    continue
+                binding = UsdShade.MaterialBindingAPI.Apply(prim)
+                binding.Bind(
+                    self._gripper_physics_material.material,
+                    bindingStrength=UsdShade.Tokens.strongerThanDescendants,
+                    materialPurpose="physics",
+                )
+                bound += 1
+        if bound == 0:
+            print("[WARN] No Franka finger collision prims found for high-friction material")
+            if candidates:
+                preview = ", ".join(
+                    f"{path}<{type_name or 'typeless'}>"
+                    for path, type_name in candidates[:12]
+                )
+                print(f"[WARN] Finger-like prim candidates: {preview}")
+        else:
+            print(f"[ENV] Bound high-friction gripper material to {bound} finger prims")
 
     def _build_goal_markers(self):
         t = self.cfg["table"]
