@@ -1230,10 +1230,9 @@ def main():
                         carry_held_blocks()
                 elif grip == "open":
                     if args.kinematic_carry:
-                        # Match stephen/testing: keep the cube attached while
-                        # the fingers open, then snap onto the reserved stack
-                        # slot. This avoids a "teleport while still grasping"
-                        # artifact.
+                        # Keep the cube attached while the fingers open, then
+                        # snap onto the reserved stack slot. This avoids a
+                        # "teleport while still grasping" artifact.
                         hold_gripper(arm, 0.04, cfg["sim"]["gripper_steps"])
                         snap_held_block_to_stack(arm)
                         held_block[arm] = None

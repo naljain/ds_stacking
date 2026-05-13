@@ -155,8 +155,7 @@ def main():
                              "Lula-controlled primitives.")
     parser.add_argument("--cartesian_ik_primitives", action="store_true",
                         help="Execute IK primitives as straight Cartesian "
-                             "segments, matching the stephen/testing pre-pick "
-                             "and pre-place behavior.")
+                             "segments with pre-pick and pre-place waypoints.")
     parser.add_argument("--grasp_height", type=float, default=None,
                         help="Override config heights.grasp in meters.")
     parser.add_argument("--grasp_z_offset", type=float, default=0.0,

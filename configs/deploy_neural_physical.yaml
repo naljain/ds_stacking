@@ -28,7 +28,7 @@ deploy:
   grasp_z_offset: 0.0
   gripper_steps: 120
 
-  # Use the stephen/testing-style weighted protected-point modulation.
+  # Use weighted protected-point modulation.
   no_modulation: false
   priority_arm: left
   priority_policy: fixed

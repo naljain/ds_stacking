@@ -14,9 +14,8 @@ block:
   static_friction: 2.0
   dynamic_friction: 1.5
   restitution: 0.0
-  # World-frame XY correction applied to reach/grasp targets. This mirrors
-  # the working stephen/testing calibration hook for the controlled Lula
-  # gripper frame vs. the visual cube center.
+  # World-frame XY correction applied to reach/grasp targets. This calibrates
+  # the controlled Lula gripper frame against the visual cube center.
   grasp_xy_offset:
     left:  [0.0, 0.0]
     right: [0.0, 0.0]
@@ -67,8 +66,8 @@ goals:
 
 # ── Motion primitive heights ──────────────────────────────────────────────────
 heights:
-  hover:  0.89    # table_height + 0.15 — pre-pick hover from stephen/testing
-  grasp:  0.75    # table_height + 0.01 — matches working stephen/testing grasp
+  hover:  0.89    # table_height + 0.15 pre-pick hover
+  grasp:  0.75    # table_height + 0.01 grasp height
   lift:   0.99    # table_height + 0.25 — transport altitude
 
 # ── Simulation ────────────────────────────────────────────────────────────────
@@ -76,8 +75,8 @@ sim:
   physics_dt:    0.00833    # 1/120
   rendering_dt:  0.01667    # 1/60
   camera:
-    # Front-of-table view from stephen/testing: camera sits at +Y and looks
-    # back toward the Franka bases, keeping the grippers and stack visible.
+    # Front-of-table view: camera sits at +Y and looks back toward the Franka
+    # bases, keeping the grippers and stack visible.
     eye:    [0.0, 2.25, 1.45]
     target: [0.0, 0.25, 0.80]
   steps_per_primitive:

@@ -1,177 +1,87 @@
-# Reactive Dual-Arm Cube Stacking with Joint-Space Neural DS
+# Reactive Dual-Arm Cube Stacking with Learned DS
 
 MEAM 6230 Final Project — Nalini Jain, Shivank Gupta, Thomas Stephen Felix
 
-## Overview
+This project explores learned dynamical-system (DS) motion primitives for
+dual-arm cube stacking in Isaac Sim. The final system is intentionally hybrid:
+learned joint-space Neural DS controllers handle the long free-space motions
+(`reach` and `transport`), while scripted Lula IK handles the short constrained
+motions (`grasp`, `lift`, and `place`).
 
-This project trains **joint-space Neural Dynamical System (DS)** motion
-primitives from demonstrations to enable two Franka Panda arms to stack cubes
-in a shared workspace. The learned DS is used for the longer free-space
-motions, `reach` and `transport`. The short constrained motions, `grasp`,
-`lift`, and `place`, are executed with a Lula joint-space controller.
+![Dual-arm neural DS stacking](data/results/dual_neural.gif)
 
-Dual-arm deployment combines end-effector DS modulation, a conservative
-sampled-link safety hold, dynamic stack-height clearance, and return-to-home
-parking for completed arms.
+## Story
 
-## Why joint-space DS?
+The first goal was to learn a Neural DS for the full pick-and-place behavior.
+That failed for practical reasons: noisy demonstrations, inconsistent
+primitive boundaries, data processing issues, and spurious attractors in the
+learned vector field. A spurious attractor is a false goal where the robot can
+stall or curve away from the intended target.
 
-The DS is trained directly on `q̇ = f(e)` where
-`e = q - q_goal`, `q` is the 7-DOF Franka joint configuration, and `q_goal`
-is the target joint configuration for the current primitive. At deployment,
-Lula IK is queried at each primitive transition to compute `q_goal`. For
-`reach` and `transport`, the learned network output is integrated as
-joint-position commands. For `grasp`, `lift`, and `place`, the same Lula
-`q_goal` is followed by a clamped joint-space controller.
+The final approach keeps the parts that worked:
 
-The model is parameterized as a stable error-space DS:
+- use Lula IK to produce consistent joint-space goals, `q_goal`;
+- train the DS in joint-error coordinates, `e = q - q_goal`;
+- learn only `reach` and `transport`, where reactive free-space motion helps;
+- script `grasp`, `lift`, and `place`, where contact and precision dominate;
+- use Cartesian modulation so the two arms can share the stack region.
+
+## Results
+
+| Condition | Blocks placed | Completion | Simulated time | Notes |
+|---|---:|---:|---:|---|
+| Modulation on | 6 / 6 | 100% | 14.4 s | Both arms returned home |
+| Modulation off | 0 / 6 | 0% | 37.5 s timeout | Failed in first shared-stack transport |
+
+Other observations:
+
+- Data quality mattered more than the exact neural architecture.
+- Learning all five primitives was unstable and unnecessary.
+- Lyapunov safe projection changed failures from divergence to stall.
+- End-effector modulation was necessary for the shared stack, but sampled-link
+  safety was still useful because elbows and forearms are not protected by an
+  end-effector sphere alone.
+- LPV-DS was a useful stable-by-construction reference for transport, while
+  Neural DS was more expressive in joint space.
+
+The full writeup is in [`report/report.tex`](report/report.tex), with a built
+PDF at [`report/report.pdf`](report/report.pdf).
+
+## Repository Structure
 
 ```text
-f(e_n) = residual_theta(e_n) - stable_skip_gain * e_n
-```
-
-where `e_n` is normalized joint error. The stable skip is part of the learned
-DS architecture and is trained together with the residual; it is different from
-deployment-only `--goal_gain`, which is only a diagnostic controller.
-
-This means:
-  - Lyapunov stability claims hold in the actual control space.
-  - No singularity / null-space issues from a Cartesian DS + Jacobian inverse.
-  - The learned vector field runs only for reach and transport.
-
-## Dual-Arm Safety
-
-The nominal collision-avoidance layer is end-effector modulation. It applies a
-state-dependent matrix `M(x_self, x_other)` that deflects each arm's Cartesian
-end-effector velocity around a safety sphere centred on the other arm's EE,
-then maps that Cartesian correction back to joint space.
-
-We use the **Huber, Billard & Slotine (2019)** modulation framework
-(*"Avoidance of Convex and Concave Obstacles with Convergence Ensured Through
-Contraction"*, IEEE RA-L), which extends Khansari-Zadeh & Billard 2012 with:
-
-  - **Reference-direction basis** — `M = E·D·E^{-1}` is built around the
-    direction from a reference point inside the obstacle to the agent, rather
-    than the surface normal. This eliminates the antipodal saddle-point that
-    can trap agents on the back side of an obstacle.
-  - **Tail-effect gating** — when the nominal velocity already points away
-    from the obstacle, no radial damping is applied, so the agent can leave
-    the contention zone naturally.
-  - **Contraction-based convergence guarantee** — under the construction
-    above, the modulated DS still converges to its attractor.
-
-```
-q̇_self = q̇_nom + J_trans^+ · ( M(ee_self, ee_other) - I ) · J_trans · q̇_nom
-```
-
-When far apart, `M ≈ I` and each arm tracks its nominal DS exactly.
-When close and approaching, `M` damps the radial component and boosts the
-tangential component, deflecting motion around the other arm's EE.
-When close but already moving outward, `M` falls back to identity (tail
-effect), letting the arm separate cleanly.
-
-End-effector modulation alone is not enough for this task because elbows and
-forearms can collide even when grippers avoid each other. Dual-arm deployment
-therefore also samples Franka link poses (`panda_link0..7` plus EE) and pauses
-one arm if sampled link/link distance falls below `--link_safety_radius`. The
-hold uses `--link_safety_hysteresis` to avoid rapid switching. This link hold
-is a pragmatic safety guard, not part of the continuous modulation proof.
-
-## Directory Layout
-
-```
 ds_stacking/
-├── src/
-│   ├── env.py               # Isaac Sim scene with two Frankas + table + blocks
-│   ├── primitives.py        # Primitive Cartesian targets + completion checks
-│   ├── franka_ik.py         # Lula IK wrapper for q_goal lookup
-│   ├── neural_ds.py         # Joint-space Neural DS + Lyapunov network
-│   ├── modulation.py        # DS modulation matrices for collision avoidance
-│   ├── coordinator.py       # Primitive sequencing, stack slots, return-home
-│   └── perturbations.py     # Perturbation injectors for evaluation
-├── scripts/
-│   ├── smoke_test.py        # Verify the scene loads
-│   ├── collect_ik.py        # Generate (q, q_goal, q̇) joint-space demos
-│   ├── audit_demo_labels.py # Check primitive/q_goal label consistency
-│   ├── teleop.py            # Manual demo collection
-│   ├── train_ds.py          # Train Neural DS for one primitive
-│   ├── train_all.sh         # Train reach/transport DS checkpoints
-│   ├── deploy_single_arm.py # One arm with DS + scripted Lula primitives
-│   ├── deploy_dual_arm.py   # Dual arm with modulation + link safety
-│   └── evaluate.py          # Full evaluation suite + ablations
 ├── configs/
-│   └── default.yaml         # All hyperparameters and constants
+│   ├── default.yaml                  # Main scene, controller, and training config
+│   ├── deploy_neural_physical.yaml   # Physical/contact deployment variant
+│   └── deploy_single_neural_physical.yaml
 ├── data/
-│   ├── demonstrations/      # Saved trajectory data (.pkl)
-│   ├── checkpoints/         # Trained model weights (.pt)
-│   └── results/             # Evaluation JSON files
-├── requirements.txt
-└── README.md
+│   ├── demonstrations/               # Saved Lula-labeled demo pickles
+│   ├── checkpoints/                  # Trained Neural DS checkpoints
+│   └── results/                      # Evaluation artifacts and final GIF
+├── report/
+│   ├── report.tex                    # Project report source
+│   └── report.pdf                    # Built report
+├── scripts/
+│   ├── smoke_test.py                 # Verify Isaac Sim scene loads
+│   ├── collect_ik.py                 # Collect joint-space demonstrations
+│   ├── audit_demo_labels.py          # Check q_goal / velocity consistency
+│   ├── train_ds.py                   # Train one DS primitive
+│   ├── train_all.sh                  # Train reach and transport checkpoints
+│   ├── deploy_single_arm.py          # Single-arm hybrid DS + Lula deployment
+│   ├── deploy_dual_arm.py            # Dual-arm deployment with modulation
+│   ├── evaluate.py                   # Evaluation and ablations
+│   ├── plot_ds.py                    # DS diagnostics and rollouts
+│   └── plot_modulation.py            # Modulation diagnostics
+└── src/
+    ├── env.py                        # Isaac Sim scene construction
+    ├── primitives.py                 # Primitive targets and completion checks
+    ├── franka_ik.py                  # Lula IK wrapper
+    ├── neural_ds.py                  # Neural DS and Lyapunov network
+    ├── modulation.py                 # Huber-style DS modulation
+    ├── coordinator.py                # Primitive sequencing and stack slots
+    └── perturbations.py              # Evaluation perturbations
 ```
-
-## Pipeline
-
-```bash
-# 1. Smoke test — confirm scene loads
-python scripts/smoke_test.py
-
-# 2. Collect demos (joint-space)
-python scripts/collect_ik.py --arm left --n_demos 50 --headless --block_xy_jitter 0.02 --start_jitter 0.15
-python scripts/collect_ik.py --arm right --n_demos 50 --headless --block_xy_jitter 0.02 --start_jitter 0.15
-
-# 3. Audit demo labels before training
-python scripts/audit_demo_labels.py data/demonstrations/left_demos.pkl data/demonstrations/right_demos.pkl
-
-# 4. Train reach/transport DS primitives from pooled left+right demos
-bash scripts/train_all.sh
-
-# 5. Hybrid DS + Lula validation on one arm
-python scripts/deploy_single_arm.py --arm left --kinematic_carry --use_safe --ds_scale 1.0 --goal_gain 0.0 --done_tol 0.25 --cart_done_tol 0.02 --place_cart_done_tol 0.01 --print_every 25 --debug_ik --log_csv data/results/left_ds_lula_scripted.csv
-
-# 6. Deploy dual-arm with modulation
-python scripts/deploy_dual_arm.py --kinematic_carry --use_safe --ds_scale 1.0 --goal_gain 0.0 --done_tol 0.25 --cart_done_tol 0.02 --place_cart_done_tol 0.01 --mod_safe_radius 0.25 --mod_reactivity 2.0 --link_safety_radius 0.20
-
-# 7. Run hybrid evaluation
-python scripts/evaluate.py --n_trials 10 --use_safe --ds_scale 1.0 --goal_gain 0.0 --done_tol 0.25
-
-# 8. Plot learned DS fields and rollouts
-python scripts/plot_ds.py --all --ckpt_arm both --use_safe --joints 0 1 --out_dir data/results/ds_plots
-
-# 9. Ablations for the writeup
-python scripts/evaluate.py --no_modulation                # collision-avoidance ablation
-python scripts/evaluate.py --use_safe                     # Lyapunov projection
-```
-
-If collection settings change, rerun from step 2 onward. The trained DS is only
-as good as the saved demonstrations, so demos with missed grasps, target-noise
-artifacts, or jerky primitive transitions should not be reused.
-
-For focused single-arm debugging, train left-only checkpoints before judging the
-learned DS:
-
-```bash
-python scripts/train_ds.py --primitive reach --arm left
-python scripts/train_ds.py --primitive transport --arm left
-
-python scripts/deploy_single_arm.py --arm left --ckpt_arm left --kinematic_carry --use_safe --ds_scale 1.0 --goal_gain 0.0 --done_tol 0.25 --cart_done_tol 0.02 --place_cart_done_tol 0.01 --print_every 25 --debug_ik --log_csv data/results/left_ds_lula_scripted.csv
-```
-
-Timeouts are failures in deployment and evaluation unless
-`--advance_on_timeout` is explicitly passed for phase-flow debugging.
-
-Diagnostic controllers such as `--goal_gain > 0`, `--ds_scale < 1`, or
-`--ds_scale 0` are useful for isolating IK/actuation problems, but they are not
-the learned-DS method and should not be reported as the main result.
-
-To debug the learned vector fields directly, plot the learned DS checkpoints:
-
-```bash
-python scripts/plot_ds.py --all --ckpt_arm both --use_safe --joints 0 1 --out_dir data/results/ds_plots
-```
-
-This creates loss curves, 2D phase portraits, Lyapunov landscapes, and closed-loop
-rollouts for `reach` and `transport`. Use `--ckpt_arm left` after left-only
-retraining.
 
 ## Setup
 
@@ -182,171 +92,87 @@ pip install isaacsim[all,extscache]==5.1.0 --extra-index-url https://pypi.nvidia
 pip install torch numpy pyyaml tqdm matplotlib
 ```
 
-Isaac Sim's Franka helper resolves the robot USD through the configured Isaac
-assets root. If your install cannot reach the default assets root, set a local
-Franka USD in `configs/default.yaml`:
+If Isaac Sim cannot resolve the Franka assets, set a local USD path in
+`configs/default.yaml`:
 
 ```yaml
 assets:
   franka_usd: /path/to/Assets/Isaac/Robots/FrankaRobotics/FrankaPanda/franka.usd
 ```
 
-The ground plane is built from a local cuboid, so it does not require the Isaac
-asset server.
+## Main Pipeline
 
-## Data Collection Notes
-
-`collect_ik.py` computes the same Lula `q_goal` used by deployment, then
-records a joint-space expert trajectory moving toward that attractor. This
-keeps the training label `q_goal` and the demonstrated `q_dot` in the same
-joint-space convention.
-
-Collection defaults are intentionally slower and cleaner than early runs:
-
-- `--joint_goal_gain 2.0`
-- `--collection_max_joint_vel 1.2`
-- `sim.inter_primitive_pause_steps: 120`
-
-The pause is non-recorded. It lets the arm settle between primitives without
-teaching the DS to stop at non-goal states.
-
-The default collection path is conservative: it targets the observed block pose
-directly, uses no block jitter, and uses no target noise. Keep legacy target
-noise `--noise` at `0` for reliable grasp demos; nonzero target noise commands
-the gripper beside the observed block and can produce failed grasps.
-
-After the base grasp is reliable, `--block_xy_jitter` can be used to move the
-physical blocks and widen the data distribution without commanding grasps away
-from the cube.
-
-Collection uses extra joint-space settling steps plus a non-recorded pause
-between primitives. Transport targets use the same dynamic stack clearance as
-deployment:
-
-```text
-transport_z = max(lift_h, existing_stack_top + stack.clearance_above_top)
-```
-
-By default, after `grasp` collection kinematically carries the active block with
-the EE so clean joint-space demos are not discarded because Isaac contact
-grasping is flaky. Use `--physical_grasp` when you explicitly want to test
-whether the parallel gripper/contact setup can lift the cube; in that mode
-failed lifts are discarded.
-
-`q_goal` labels matter as much as primitive labels. The default collection mode
-uses Lula, so each sample's attractor is the same style of joint target used at
-deployment. The
-collector also stores the terminal expert state as metadata (`q_goal_settled`,
-`q_goal_lula_error`) so mismatches can be audited.
-
-Before training, run:
+Run all commands from the repository root.
 
 ```bash
+# 1. Confirm the Isaac Sim scene loads.
+python scripts/smoke_test.py
+
+# 2. Collect Lula-labeled demonstrations.
+python scripts/collect_ik.py --arm left --n_demos 50 --headless --block_xy_jitter 0.02 --start_jitter 0.15
+python scripts/collect_ik.py --arm right --n_demos 50 --headless --block_xy_jitter 0.02 --start_jitter 0.15
+
+# 3. Audit labels before training.
 python scripts/audit_demo_labels.py data/demonstrations/left_demos.pkl data/demonstrations/right_demos.pkl
+
+# 4. Train learned DS checkpoints.
+bash scripts/train_all.sh
+
+# 5. Validate one arm.
+python scripts/deploy_single_arm.py --arm left --kinematic_carry --use_safe --ds_scale 1.0 --goal_gain 0.0 --done_tol 0.25 --cart_done_tol 0.02 --place_cart_done_tol 0.01 --print_every 25 --debug_ik --log_csv data/results/left_ds_lula_scripted.csv
+
+# 6. Deploy both arms with modulation.
+python scripts/deploy_dual_arm.py --kinematic_carry --use_safe --ds_scale 1.0 --goal_gain 0.0 --done_tol 0.25 --cart_done_tol 0.02 --place_cart_done_tol 0.01 --mod_safe_radius 0.25 --mod_reactivity 2.0 --link_safety_radius 0.20
 ```
 
-For each primitive, the final `||q - q_goal||` should be small and
-`cos(q_dot, -error)` should usually be positive. Large final errors or a high
-fraction of negative cosines mean the DS is being trained on inconsistent
-attractor labels.
+For ablations:
 
-## Data Partitioning for DS Training
-
-The demonstration pickle for an arm contains full pick-and-stack trajectories,
-not one file per primitive. Every recorded timestep stores a `primitive` label.
-`scripts/train_ds.py` partitions the data by filtering on that label:
-
-```text
-reach samples     -> *_reach.pt
-transport samples -> *_transport.pt
+```bash
+python scripts/deploy_dual_arm.py --no_modulation --kinematic_carry --use_safe
+python scripts/evaluate.py --n_trials 10 --use_safe --ds_scale 1.0 --goal_gain 0.0 --done_tol 0.25
+python scripts/evaluate.py --n_trials 10 --no_modulation
 ```
 
-`grasp`, `lift`, and `place` remain labeled in the demonstrations for auditing,
-but they are executed with the Lula joint-space controller rather than trained
-as DS checkpoints.
+## Build the Report
 
-The `--arm` flag controls which files are pooled:
+```bash
+cd report
+latexmk -pdf -interaction=nonstopmode report.tex
+```
 
-| Training command | Source demos | Checkpoint prefix |
-|---|---|---|
-| `--arm left` | `left_demos.pkl` | `left_*` |
-| `--arm right` | `right_demos.pkl` | `right_*` |
-| `--arm both` | left + right demos | `both_*` |
+The report source uses robust figure placeholders, so it still builds if a
+local image artifact is missing.
 
-Each checkpoint now stores a `data_manifest` with the primitive label, source
-demo files, total sample count, samples by file, samples by arm, samples by
-block, samples by stack slot, and label-source counts. The same information is
-printed during training so it is explicit which data trained each DS.
+## Useful Diagnostics
 
-## Primitives
+```bash
+# Plot learned vector fields, Lyapunov landscapes, and rollouts.
+python scripts/plot_ds.py --all --ckpt_arm both --use_safe --joints 0 1 --out_dir data/results/ds_plots
 
-Each pick-and-stack sequence decomposes into 5 primitives:
+# Plot modulation diagnostics after an evaluation run.
+python scripts/plot_modulation.py all --diag data/results/diag_<timestamp>.pkl
+```
 
-| Primitive | Cartesian goal | Joint goal |
-|---|---|---|
-| `reach`     | hover above source block | IK of hover pose |
-| `grasp`     | descend to block surface | IK of grasp pose |
-| `lift`      | raise to transport altitude | IK of lift pose |
-| `transport` | move above stacking goal with dynamic stack clearance | IK of transport pose |
-| `place`     | descend onto stack | IK of place pose |
+Important checks:
 
-Only `reach` and `transport` have learned `f_theta` and `V_phi` networks. At a
-primitive transition, Lula IK is queried once to compute the new `q_goal`.
-`reach` and `transport` use the learned DS to drive `q -> q_goal`; `grasp`,
-`lift`, and `place` use the same `q_goal` with a clamped Lula joint-space
-controller. Scripted primitive completion is checked with Cartesian tolerances,
-with a tighter default for `place`.
+- `cos(q_dot, -error)` should usually be positive in demos and deployment.
+- Large final `||q - q_goal||` in `audit_demo_labels.py` means the DS is being
+  trained with inconsistent attractor labels.
+- `--goal_gain > 0`, `--ds_scale < 1`, and `--ds_scale 0` are diagnostics, not
+  the learned-DS method.
+- Deployment timeouts should be treated as failures unless intentionally using
+  `--advance_on_timeout` for debugging.
 
-## Dual-Arm Coordination
+## Implementation Notes
 
-The coordinator remains deliberately slim: it chooses block order, primitive
-order, stack-slot reservations, and return-home transitions. End-effector
-collision avoidance is handled by DS modulation. A separate sampled-link hold
-guards elbow/forearm collisions by pausing one arm until the sampled link
-distance clears the hysteresis band.
-
-Dual-arm deployment starts both arms together by default:
-`coordination.start_stagger_steps: 0`. For ablations, add a right-arm launch
-delay with `--stagger_steps`.
-
-Shared stack layers are reserved before `transport/place`, so both arms cannot
-target the same stack height when they arrive at the goal area concurrently.
-The reserved height is the desired block center height. During kinematic-carry
-debug deployment, the carried block is snapped to that reserved stack slot when
-`place` opens the gripper; otherwise the visual block pose can reflect the EE
-carry offset instead of the coordinator's stack layer.
-
-Transport targets use dynamic stack clearance rather than a fixed carry height.
-As the stack grows, the target rises above the current top of the stack before
-the arm descends for `place`. When an arm finishes its assigned blocks, it
-returns to its initial home pose so it does not remain beside the stack and
-block the other arm.
-
-If a newly trained DS does not converge at deployment, inspect
-`cos->goal` in `deploy_single_arm.py`. Negative values mean the learned vector
-field is pointing away from `q_goal`. The learned-DS setting for `reach` and
-`transport` is `--ds_scale 1.0 --goal_gain 0.0`. Any nonzero `--goal_gain`
-adds a hand-coded linear attractor and is diagnostic only.
-
-Single-arm deployment aborts on primitive timeout by default. This prevents a
-failed `reach` from cascading into a false `grasp`. Use `--advance_on_timeout`
-only for phase-flow debugging.
-
-## Stability
-
-Per-primitive: `V(e)` is positive-definite around `e = q - q_goal = 0` by construction;
-training enforces `dV/dt + α·V <= 0` on the data distribution; inference can
-optionally project `f(x)` onto the half-space where this holds exactly
-(`--use_safe`).
-
-Across primitives: the system is hybrid. We use learned stable DS motion for
-`reach` and `transport`, then switch to scripted Lula joint-space moves for
-`grasp`, `lift`, and `place`. We report empirical primitive convergence and
-stack completion rather than claiming one global Lyapunov proof for the whole
-task.
-
-Across arms: end-effector modulation preserves the nominal DS behavior when
-arms are separated and deflects approaching EE motion near the other arm. The
-sampled-link safety hold and return-home parking are discrete deployment
-guards added for the real geometry of the two Frankas; they should be reported
-separately from the continuous modulation guarantee.
+- The DS is trained on `q_dot = f(e)`, where `e = q - q_goal`.
+- The Neural DS structurally enforces `f(0) = 0` by subtracting the network
+  output at the origin.
+- The Lyapunov network defines
+  `V(e) = ||g(e) - g(0)||^2 + epsilon ||e||^2`.
+- `--use_safe` projects the commanded velocity so `dV/dt <= 0` at deployment.
+- End-effector modulation bends each arm's Cartesian velocity around the other
+  arm, then maps the correction back to joint space through a damped Jacobian
+  pseudoinverse.
+- The sampled-link hold is a practical safety guard for elbow and forearm
+  proximity; it is separate from the continuous modulation guarantee.
