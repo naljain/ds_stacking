@@ -1,0 +1,88 @@
+[
+  {
+    "label": "left_ds_trace",
+    "total_steps": 524,
+    "total_duration_s": 4.364920000000001,
+    "n_ds_primitives": 1,
+    "n_ik_primitives": 0,
+    "ds_convergence_rate": 1.0,
+    "ds_cos_mean": 0.9881009883720929,
+    "ds_cos_neg_frac": 0.0,
+    "ds_proj_active_frac": 0.0,
+    "ds_mean_conv_time_s": 1.6660000000000001,
+    "ds_e_monotone_frac": 0.996116504854369,
+    "per_primitive": {
+      "transport": {
+        "converged": true,
+        "conv_time_s": 1.6660000000000001,
+        "e_start": 2.30522,
+        "e_end": 0.04912,
+        "cos_mean": 0.9881009883720929,
+        "n_steps": 516
+      }
+    },
+    "segment_metrics": [
+      {
+        "primitive": "transport",
+        "is_ds": true,
+        "n_steps": 516,
+        "duration_s": 4.29828,
+        "e_start": 2.30522,
+        "e_end": 0.04912,
+        "e_min": 0.04827,
+        "converged": true,
+        "conv_time_s": 1.6660000000000001,
+        "cos_mean": 0.9881009883720929,
+        "cos_neg_frac": 0.0,
+        "qd_mean": 1.3828496511627906,
+        "qd_max": 2.85395,
+        "proj_active_frac": 0.0,
+        "proj_mean_mag": 0.0,
+        "e_monotone_frac": 0.996116504854369
+      }
+    ]
+  },
+  {
+    "label": "right_ds_trace",
+    "total_steps": 524,
+    "total_duration_s": 4.364920000000001,
+    "n_ds_primitives": 1,
+    "n_ik_primitives": 0,
+    "ds_convergence_rate": 1.0,
+    "ds_cos_mean": 0.9889711821705426,
+    "ds_cos_neg_frac": 0.0,
+    "ds_proj_active_frac": 0.0,
+    "ds_mean_conv_time_s": 1.6576700000000002,
+    "ds_e_monotone_frac": 0.996116504854369,
+    "per_primitive": {
+      "transport": {
+        "converged": true,
+        "conv_time_s": 1.6576700000000002,
+        "e_start": 2.30358,
+        "e_end": 0.04779,
+        "cos_mean": 0.9889711821705426,
+        "n_steps": 516
+      }
+    },
+    "segment_metrics": [
+      {
+        "primitive": "transport",
+        "is_ds": true,
+        "n_steps": 516,
+        "duration_s": 4.29828,
+        "e_start": 2.30358,
+        "e_end": 0.04779,
+        "e_min": 0.04711,
+        "converged": true,
+        "conv_time_s": 1.6576700000000002,
+        "cos_mean": 0.9889711821705426,
+        "cos_neg_frac": 0.0,
+        "qd_mean": 1.3799591860465115,
+        "qd_max": 2.82234,
+        "proj_active_frac": 0.0,
+        "proj_mean_mag": 0.0,
+        "e_monotone_frac": 0.996116504854369
+      }
+    ]
+  }
+]

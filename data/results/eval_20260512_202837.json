@@ -1,0 +1,76 @@
+{
+  "trials": [
+    {
+      "condition": "nominal",
+      "variant": "neural_mod",
+      "trial_idx": 0,
+      "stack_complete": false,
+      "blocks_placed": 0,
+      "time_per_cube": NaN,
+      "grasp_failures": 0,
+      "failure_mode": "incomplete",
+      "ds_convergence_rate": NaN,
+      "ds_median_conv_time": NaN,
+      "modulation_events": 0,
+      "min_ee_distance": NaN,
+      "recovery": false,
+      "trial_duration": 27.13826823234558
+    },
+    {
+      "condition": "nominal",
+      "variant": "neural_nomod",
+      "trial_idx": 0,
+      "stack_complete": false,
+      "blocks_placed": 0,
+      "time_per_cube": NaN,
+      "grasp_failures": 0,
+      "failure_mode": "incomplete",
+      "ds_convergence_rate": NaN,
+      "ds_median_conv_time": NaN,
+      "modulation_events": 0,
+      "min_ee_distance": NaN,
+      "recovery": false,
+      "trial_duration": 42.1130006313324
+    }
+  ],
+  "aggregated": [
+    {
+      "condition": "nominal",
+      "variant": "neural_mod",
+      "n_trials": 1,
+      "scr": 0.0,
+      "bpa_mean": 0.0,
+      "bpa_std": 0.0,
+      "tpc_mean": NaN,
+      "tpc_std": 0.0,
+      "cr_mean": NaN,
+      "cr_std": 0.0,
+      "mct_mean": NaN,
+      "me_mean": 0.0,
+      "me_std": 0.0,
+      "mid_mean": NaN,
+      "mid_std": 0.0,
+      "rr": NaN,
+      "gfr_mean": 0.0
+    },
+    {
+      "condition": "nominal",
+      "variant": "neural_nomod",
+      "n_trials": 1,
+      "scr": 0.0,
+      "bpa_mean": 0.0,
+      "bpa_std": 0.0,
+      "tpc_mean": NaN,
+      "tpc_std": 0.0,
+      "cr_mean": NaN,
+      "cr_std": 0.0,
+      "mct_mean": NaN,
+      "me_mean": 0.0,
+      "me_std": 0.0,
+      "mid_mean": NaN,
+      "mid_std": 0.0,
+      "rr": NaN,
+      "gfr_mean": 0.0
+    }
+  ]
+}

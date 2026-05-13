@@ -1,0 +1,3 @@
+condition,variant,n_trials,scr,bpa_mean,bpa_std,tpc_mean,tpc_std,cr_mean,cr_std,mct_mean,me_mean,me_std,mid_mean,mid_std,rr,gfr_mean
+nominal,neural_mod,1,0.0,0.0,0.0,nan,0.0,nan,0.0,nan,0.0,0.0,nan,0.0,nan,0.0
+nominal,neural_nomod,1,0.0,0.0,0.0,nan,0.0,nan,0.0,nan,0.0,0.0,nan,0.0,nan,0.0

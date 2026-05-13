@@ -43,7 +43,26 @@ def load_checkpoint(ckpt_path, device):
         alpha       = cfg["alpha"],
         stable_skip_gain = cfg.get("stable_skip_gain", 0.0),
     ).to(device)
-    model.load_state_dict(ckpt["state_dict"])
+    incompatible = model.load_state_dict(ckpt["state_dict"], strict=False)
+    unexpected = list(incompatible.unexpected_keys)
+    missing = list(incompatible.missing_keys)
+    if unexpected or missing:
+        only_old_lyap = (
+            unexpected
+            and all(k.startswith("V.g.") for k in unexpected)
+            and not missing
+        )
+        if only_old_lyap:
+            print(
+                "[plot] old learned-Lyapunov checkpoint detected; "
+                "loaded velocity field and will use the current quadratic V "
+                "for Lyapunov/safe plots."
+            )
+        else:
+            print(
+                f"[plot] checkpoint/model key mismatch: "
+                f"missing={missing}, unexpected={unexpected}"
+            )
     model.eval()
     return ckpt, model
 

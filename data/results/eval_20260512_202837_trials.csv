@@ -1,0 +1,3 @@
+condition,variant,trial_idx,stack_complete,blocks_placed,time_per_cube,grasp_failures,failure_mode,ds_convergence_rate,ds_median_conv_time,modulation_events,min_ee_distance,recovery,trial_duration
+nominal,neural_mod,0,False,0,nan,0,incomplete,nan,nan,0,nan,False,27.13826823234558
+nominal,neural_nomod,0,False,0,nan,0,incomplete,nan,nan,0,nan,False,42.1130006313324

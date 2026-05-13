@@ -1,0 +1,87 @@
+{
+  "trials": [
+    {
+      "case": "single_left",
+      "trial_idx": 0,
+      "command": "/home/nalini/miniconda3/envs/franka_isaac/bin/python /home/nalini/Documents/ds_stacking/scripts/deploy_single_arm.py --arm left --ckpt_arm left --deploy_config configs/deploy_single_neural_physical.yaml --config configs/default.yaml --headless",
+      "returncode": 0,
+      "success": false,
+      "blocks_placed": 0,
+      "expected_blocks": 3,
+      "stack_completion_rate": 0.0,
+      "simulated_time_s": 15.067492485046387,
+      "time_per_cube_s": NaN,
+      "min_inter_arm_distance_m": NaN,
+      "modulation_events": 0,
+      "failure_mode": "incomplete",
+      "log_path": "data/results/logs/single_left_trial01.log"
+    },
+    {
+      "case": "single_right",
+      "trial_idx": 0,
+      "command": "/home/nalini/miniconda3/envs/franka_isaac/bin/python /home/nalini/Documents/ds_stacking/scripts/deploy_single_arm.py --arm right --ckpt_arm right --deploy_config configs/deploy_single_neural_physical.yaml --config configs/default.yaml --headless",
+      "returncode": 0,
+      "success": false,
+      "blocks_placed": 0,
+      "expected_blocks": 3,
+      "stack_completion_rate": 0.0,
+      "simulated_time_s": 15.095105648040771,
+      "time_per_cube_s": NaN,
+      "min_inter_arm_distance_m": NaN,
+      "modulation_events": 0,
+      "failure_mode": "incomplete",
+      "log_path": "data/results/logs/single_right_trial01.log"
+    },
+    {
+      "case": "dual_mod",
+      "trial_idx": 0,
+      "command": "/home/nalini/miniconda3/envs/franka_isaac/bin/python /home/nalini/Documents/ds_stacking/scripts/deploy_dual_arm.py --deploy_config configs/deploy_neural_physical.yaml --config configs/default.yaml --headless",
+      "returncode": 0,
+      "success": false,
+      "blocks_placed": 0,
+      "expected_blocks": 6,
+      "stack_completion_rate": 0.0,
+      "simulated_time_s": 27.048781633377075,
+      "time_per_cube_s": NaN,
+      "min_inter_arm_distance_m": NaN,
+      "modulation_events": 0,
+      "failure_mode": "incomplete",
+      "log_path": "data/results/logs/dual_mod_trial01.log"
+    }
+  ],
+  "aggregates": [
+    {
+      "case": "single_left",
+      "n_trials": 1,
+      "success_rate": 0.0,
+      "blocks_placed_mean": 0.0,
+      "blocks_placed_std": 0.0,
+      "completion_rate_mean": 0.0,
+      "time_per_cube_mean": NaN,
+      "min_inter_arm_distance_mean": NaN,
+      "modulation_events_mean": 0.0
+    },
+    {
+      "case": "single_right",
+      "n_trials": 1,
+      "success_rate": 0.0,
+      "blocks_placed_mean": 0.0,
+      "blocks_placed_std": 0.0,
+      "completion_rate_mean": 0.0,
+      "time_per_cube_mean": NaN,
+      "min_inter_arm_distance_mean": NaN,
+      "modulation_events_mean": 0.0
+    },
+    {
+      "case": "dual_mod",
+      "n_trials": 1,
+      "success_rate": 0.0,
+      "blocks_placed_mean": 0.0,
+      "blocks_placed_std": 0.0,
+      "completion_rate_mean": 0.0,
+      "time_per_cube_mean": NaN,
+      "min_inter_arm_distance_mean": NaN,
+      "modulation_events_mean": 0.0
+    }
+  ]
+}

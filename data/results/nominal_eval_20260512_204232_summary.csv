@@ -1,0 +1,4 @@
+case,n_trials,success_rate,blocks_placed_mean,blocks_placed_std,completion_rate_mean,time_per_cube_mean,min_inter_arm_distance_mean,modulation_events_mean
+single_left,3,0.0,0.0,0.0,0.0,nan,nan,0.0
+single_right,3,0.0,0.0,0.0,0.0,nan,nan,0.0
+dual_mod,3,0.0,0.0,0.0,0.0,nan,nan,0.0
